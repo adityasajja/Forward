@@ -12,7 +12,7 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
-from atr.api.main import app
+from forward.api.main import app
 
 LOOPBACK = ("127.0.0.1", 51234)
 
@@ -34,9 +34,9 @@ def owner(fresh_env, master) -> TestClient:
 
 @pytest.fixture()
 def viewer(fresh_env, master, owner) -> TestClient:
-    from atr.appdb.engine import get_app_db
-    from atr.appdb.repositories import UserRepository
-    from atr.auth.passwords import hash_password
+    from forward.appdb.engine import get_app_db
+    from forward.appdb.identity_repository import UserRepository
+    from forward.auth.passwords import hash_password
 
     with get_app_db().session() as session:
         UserRepository.create(
@@ -97,7 +97,6 @@ def test_a_run_without_a_broker_session_is_recorded_not_an_error(owner):
     assert body["severity"] != "ok"
     assert body["error"]
     assert body["mismatches"] >= 1, "an unchecked run must not report zero problems"
-    assert body["differences"] == 0, "nothing disagreed — nothing could be compared"
     assert body["differences"] == 0, "nothing disagreed — nothing could be compared"
     # Every scope is named as not compared, with a reason.
     assert {e["scope"] for e in body["incomparable"]} == {

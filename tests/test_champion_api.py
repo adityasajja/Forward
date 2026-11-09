@@ -13,9 +13,9 @@ CONFIG = {
     "symbols": ["RELIANCE"],
     "exchange": "NSEEQ",
     "timeframe": "1d",
-    "order_value": 250_000.0,
     "lookback_days": 400,
     "max_open_positions": 1,
+    "signal_basis": "closed_bar",
 }
 
 V1 = {
@@ -47,8 +47,8 @@ V2 = {
 
 
 def _owner_id() -> str:
-    from atr.appdb.engine import get_app_db
-    from atr.appdb.repositories import UserRepository
+    from forward.appdb.engine import get_app_db
+    from forward.appdb.identity_repository import UserRepository
 
     with get_app_db().session() as session:
         user = UserRepository.get_by_identifier(session, "owner@example.com")
@@ -57,8 +57,8 @@ def _owner_id() -> str:
 
 
 def _saved_strategy(definitions=(V1, V2), *, name: str = "Breakout live") -> str:
-    from atr.appdb.engine import get_app_db
-    from atr.appdb.repositories import StrategyRepository
+    from forward.appdb.engine import get_app_db
+    from forward.appdb.strategy_repository import StrategyRepository
 
     user_id = _owner_id()
     with get_app_db().session() as session:

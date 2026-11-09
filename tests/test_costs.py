@@ -11,9 +11,9 @@ from __future__ import annotations
 
 import pytest
 
-from atr.backtest.costs import CommissionModel, IndianDeliveryCosts, SlippageModel
-from atr.core.enums import AssetClass, Side
-from atr.core.models import Instrument
+from forward.core.costs import CommissionModel, IndianDeliveryCosts, SlippageModel
+from forward.core.enums import AssetClass, Side
+from forward.core.instrument_models import Instrument
 
 EQ = Instrument(symbol="TEST", asset_class=AssetClass.EQUITY, currency="INR")
 
@@ -56,7 +56,6 @@ def test_costs_scale_with_notional_not_share_count():
 
 def test_ibkr_default_understates_indian_delivery_by_an_order_of_magnitude():
     """The number that motivated this model: ~28x too cheap."""
-    notional = 100_000.0
     old = CommissionModel()
     new = IndianDeliveryCosts()
     old_round_trip = (
@@ -91,10 +90,11 @@ def test_turnover_is_what_makes_costs_dangerous():
     assert heavy_legs * per_leg / (light_legs * per_leg) == pytest.approx(95.0)
 
 
-def test_commission_model_still_ignores_side_by_default():
-    """Backwards compatibility: existing callers pass no side."""
+def test_commission_model_requires_trade_side():
+    """Require an explicit side at every cost-model boundary."""
     model = CommissionModel()
-    assert model.compute(1_000, 100.0, EQ) == model.compute(1_000, 100.0, EQ, side=Side.BUY)
+    with pytest.raises(TypeError):
+        model.compute(1_000, 100.0, EQ)
 
 
 def test_zero_notional_is_free_not_an_error():

@@ -1,6 +1,6 @@
 """The System page's log-out button called a route that did not exist, and got 'Method Not Allowed'."""
 
-from atr.config.settings import get_settings
+from forward.config.settings import get_settings
 
 
 def _session_file():

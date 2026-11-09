@@ -1,0 +1,42 @@
+{
+  "data_directory": "data/iifl_daily/NSEEQ",
+  "minimum_history_bars": 90,
+  "split_quantile": 0.5,
+  "rsi_period": 14,
+  "trend_ema_period": 10,
+  "momentum_days": [5, 20],
+  "trend_average_days": 50,
+  "high_lookback_days": 20,
+  "flat": {
+    "maximum_absolute_return_pct": 2.5,
+    "range_days": 5,
+    "range_baseline_days": 20,
+    "maximum_range_ratio": 0.9
+  },
+  "rsi_roll": {
+    "prior_days": 5,
+    "prior_minimum": 65,
+    "minimum_fall": 4
+  },
+  "volume_dry": {
+    "recent_days": 5,
+    "baseline_days": 20,
+    "maximum_ratio": 0.85
+  },
+  "wick_days": 5,
+  "minimum_upper_wick_ratio": 0.35,
+  "big_run_return_pct": 25,
+  "recent_low_days": 5,
+  "gap_down_multiplier": 0.985,
+  "population": {
+    "minimum_return_20_days_pct": 10,
+    "minimum_extension_50_day_pct": 8,
+    "minimum_off_high_pct": -3.5
+  },
+  "minimum_condition_samples": 0,
+  "edge_threshold_pct": 0.3,
+  "conditions": [
+    "flat", "rsi_roll", "vol_dry", "wicks", "big_run",
+    "below_5d_low", "below_ema10", "down_2d", "gap_down"
+  ]
+}

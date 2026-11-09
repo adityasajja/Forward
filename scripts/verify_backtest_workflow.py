@@ -19,20 +19,20 @@ import tempfile
 import time
 from pathlib import Path
 
-TMP = Path(tempfile.mkdtemp(prefix="atr-backtest-"))
+TMP = Path(tempfile.mkdtemp(prefix="forward-backtest-"))
 os.environ["APP_DB_URL"] = f"sqlite:///{(TMP / 'app.db').as_posix()}"
-os.environ["ATR_SECRET_KEY"] = "probe-key"
+os.environ["FORWARD_SECRET_KEY"] = "probe-key"
 os.environ["ENV"] = "dev"
 
 # Settings read the environment on first use, so the cache must be dropped after
 # the variables are set. Forgetting this is what makes a "throwaway" script write
 # into the real database.
-from atr.config.settings import get_settings  # noqa: E402
+from forward.config.settings import get_settings  # noqa: E402
 
 get_settings.cache_clear()
 
-from atr.appdb.engine import get_app_db, reset_app_db_cache  # noqa: E402
-from atr.appdb.repositories import UserRepository  # noqa: E402
+from forward.appdb.engine import get_app_db, reset_app_db_cache  # noqa: E402
+from forward.appdb.repositories import UserRepository  # noqa: E402
 
 reset_app_db_cache()
 
@@ -59,7 +59,7 @@ def main() -> int:
         )
     user_id = user["user_id"]
 
-    from atr.services.backtests import get_backtest_service, reset_backtest_service
+    from forward.services.backtests import get_backtest_service, reset_backtest_service
 
     service = get_backtest_service()
 

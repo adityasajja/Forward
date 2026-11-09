@@ -1,0 +1,39 @@
+{
+  "history_start_date": "2020-01-01",
+  "out_of_sample_start_date": "2023-05-11",
+  "history_end_date": "2026-09-18",
+  "universe_files": [
+    "data/universe/n50.txt",
+    "data/universe/mid150.txt"
+  ],
+  "benchmark_symbol": "NIFTYBEES",
+  "minimum_symbol_count": 10,
+  "minimum_history_bars": 250,
+  "regime_periods": [50, 200],
+  "momentum_period": 5,
+  "volume_average_period": 20,
+  "gap_return_threshold": 0.015,
+  "volume_ratio_threshold": 1.0,
+  "round_trip_cost_fraction": 0.00283,
+  "log_file": "data/research/paper_trade_log.json",
+  "strategy_runs": [
+    {
+      "name": "gap_vol/dual/sl10/tp20/mh20/k3/vt0.2",
+      "stop_pct": 10,
+      "target_pct": 20,
+      "maximum_holding_days": 20,
+      "top_positions": 3,
+      "rebalance_step": 5,
+      "annual_volatility_target": 0.2
+    },
+    {
+      "name": "gap_vol/dual/sl15/tp30/mh30/k3/vt0.2",
+      "stop_pct": 15,
+      "target_pct": 30,
+      "maximum_holding_days": 30,
+      "top_positions": 3,
+      "rebalance_step": 5,
+      "annual_volatility_target": 0.2
+    }
+  ]
+}

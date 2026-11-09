@@ -22,7 +22,7 @@ about the parquet cache. The entry fires because a live tick genuinely satisfies
 the stored breakout rule and the exit fires because the price genuinely breaches
 the stored stop; both are consequences of the definition, not of an instruction.
 
-**The definition is the shipped example.** ``atr.strategy.example`` is what a
+**The definition is the shipped example.** ``forward.strategy.example`` is what a
 fresh installation seeds, so if the example stops being deployable this test
 fails. A worked example that does not work is worse than none, because it is the
 first thing anyone tries.
@@ -43,12 +43,34 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import pytest
 
-from atr.research.learning_evidence import (
+from forward.appdb.daily_learning_storage import SqlDailyLearningStorage
+from forward.appdb.learning_storage import SqlLearningStorage
+from forward.appdb.order_storage import SqlOrderStorage
+from forward.appdb.paper_ledger_storage import SqlPaperLedgerStorage
+from forward.appdb.paper_runner_storage import SqlPaperRunnerStorage
+from forward.appdb.portfolio_storage import SqlPortfolioStorage
+from forward.appdb.risk_state_storage import SqlRiskStateStorage
+from forward.appdb.system_state_storage import SqlSystemStateStorage
+from forward.appdb.trade_journal_storage import SqlTradeJournalStorage
+from forward.config.settings import get_settings
+from forward.core.learning_evidence import (
     CLASS_PAPER_FORWARD,
     GRADE_FORWARD,
     GRADE_IN_SAMPLE,
 )
-from atr.strategy.example import EXAMPLE_DEFINITION, EXAMPLE_NAME
+from forward.data.cached_market_frames import CachedMarketFramesAdapter
+from forward.data.learning_artifacts import LocalLearningArtifactsAdapter
+from forward.data.vwap_liquidity import NseBhavcopyLiquidityAdapter
+from forward.market_calendar import get_market_calendar
+from forward.services.paper_ledger import PaperLedger
+from forward.services.risk import RiskStateService
+from forward.strategy.example import EXAMPLE_DEFINITION, EXAMPLE_NAME
+from tests.market_data_fakes import (
+    InMemoryMarketFramesPort,
+    NoopSignalContextEnricher,
+)
+from tests.order_fakes import order_instrument_lookup
+from tests.paper_price_fakes import StaticRunnerVenueProvider, no_live_price
 
 SYMBOL = "RELIANCE"
 EXCHANGE = "NSEEQ"
@@ -57,7 +79,6 @@ EXCHANGE = "NSEEQ"
 #: depend on where the test runs.
 SESSION = datetime(2026, 9, 14, 10, 0, tzinfo=ZoneInfo("Asia/Kolkata"))
 CAPITAL = 500_000.0
-ORDER_VALUE = 200_000.0
 
 BASE = "/api/v1/strategies"
 
@@ -83,23 +104,6 @@ def _daily(n: int = 300, start: float = 1000.0) -> pd.DataFrame:
             "volume": volumes,
         }
     )
-
-
-@pytest.fixture(autouse=True)
-def _no_live_seams():
-    """Leave the process-wide feed seams clear.
-
-    A subscriber installed by another file would have this suite's runner reaching
-    for a broadcaster that is not there. The subject here is the trading chain, not
-    the feed wiring.
-    """
-    from atr.services import paper as paper_service
-
-    paper_service.install_live_source(None)
-    paper_service.install_live_subscriber(None)
-    yield
-    paper_service.install_live_source(None)
-    paper_service.install_live_subscriber(None)
 
 
 class Chain:
@@ -133,11 +137,10 @@ def chain(auth_client, app_db, monkeypatch) -> Chain:
     not run the app's lifespan (which would warm the real breadth cache and start
     the real background task) — the loop object itself is the production one.
     """
-    from atr.services import paper as paper_service
-    from atr.services.runner import PaperRunner
+    from forward.services.runner import PaperRunner
 
     monkeypatch.setattr(
-        "atr.signals.engine.load_daily",
+        "forward.data.cached_market_frames.load_daily_from_cache",
         lambda symbol, exchange="NSEEQ", **kw: _daily(),
     )
 
@@ -168,9 +171,7 @@ def chain(auth_client, app_db, monkeypatch) -> Chain:
     assert version_body["version"] == 1
 
     # --- Validate Version 1 ------------------------------------------------
-    report = auth_client.post(
-        f"{BASE}/{strategy['strategy_id']}/validate", json={"version": 1}
-    )
+    report = auth_client.post(f"{BASE}/{strategy['strategy_id']}/validate", json={"version": 1})
     assert report.status_code == 200, report.text
     report_body = report.json()
     assert report_body["ok"] is True, report_body
@@ -187,8 +188,9 @@ def chain(auth_client, app_db, monkeypatch) -> Chain:
             "mode": "PAPER",
             "config": {
                 "symbols": [SYMBOL],
-                "exchange": EXCHANGE, "signal_basis": "live",
-                "order_value": ORDER_VALUE,
+                "exchange": EXCHANGE,
+                "signal_basis": "live",
+                "timeframe": "1d",
                 "lookback_days": 400,
                 "max_open_positions": 1,
             },
@@ -212,25 +214,34 @@ def chain(auth_client, app_db, monkeypatch) -> Chain:
     tick = round(high_20 * 0.995, 2)
 
     prices = {SYMBOL: tick}
-    # The live tick, through the seam the API wires at startup — not a patch on
-    # the venue. ``default_price_source`` reads the live source *first* and falls
-    # back to the daily cache only when it returns nothing, so a fill priced here
-    # is a fill priced off the tick; and because the fallback stays reachable, the
-    # assertion that the fill is *not* at the cached close is a real assertion.
-    #
-    # Installed *before* the runner is built, deliberately: the venue captures
-    # whatever source exists when it is first constructed, so installing after
-    # would leave it reading a source that never prices.
-    paper_service.install_live_source(
-        lambda symbol, exchange: prices.get(symbol.upper())
+    runner = PaperRunner(
+        interval_seconds=get_settings().runner_interval_seconds,
+        lookback_days=get_settings().runner_lookback_days,
+        minimum_sleep_seconds=get_settings().runner_min_sleep_seconds,
+        market_wait_seconds=get_settings().runner_market_wait_seconds,
+        symbol_retry_seconds=get_settings().deployment_symbol_retry_seconds,
+        signal_context=NoopSignalContextEnricher(),
+        calendar=get_market_calendar(),
+        venue_provider=StaticRunnerVenueProvider(
+            prices=lambda symbol, exchange: prices.get(symbol.upper()),
+            instruments=order_instrument_lookup,
+        ),
+        daily_history=CachedMarketFramesAdapter(),
+        vwap_liquidity=NseBhavcopyLiquidityAdapter(get_settings().research_data_directory),
+        sector_table={},
+        instrument_lookup=order_instrument_lookup,
+        journal_storage=SqlTradeJournalStorage(app_db),
+        portfolio_storage=SqlPortfolioStorage(app_db),
+        ledger=PaperLedger(storage=SqlPaperLedgerStorage(app_db), price_source=no_live_price),
+        order_storage=SqlOrderStorage(app_db),
+        runner_storage=SqlPaperRunnerStorage(app_db),
+        state_storage=SqlSystemStateStorage(app_db),
+        risk_state=RiskStateService(SqlRiskStateStorage(app_db), get_settings()),
     )
-
-    runner = PaperRunner(db=app_db)
     runner.sync_loops()
     loop = runner._loops[deployment_body["deployment_id"]]
     assert loop.venue.prices(SYMBOL, EXCHANGE) == tick, (
-        "the venue is not reading the live tick, so nothing below would be a "
-        "live-price result"
+        "the venue is not reading the live tick, so nothing below would be a live-price result"
     )
 
     return Chain(
@@ -260,7 +271,7 @@ def _orders(app_db) -> list[dict]:
 
 
 def _events(app_db, order_id: str) -> list[dict]:
-    from atr.appdb.repositories import OrderEventRepository
+    from forward.appdb.order_event_repository import OrderEventRepository
 
     with app_db.session() as session:
         return OrderEventRepository.history(session, order_id)
@@ -271,7 +282,7 @@ def _raw(event: dict) -> dict:
     if isinstance(raw, str):
         try:
             return json.loads(raw)
-        except (ValueError, TypeError):
+        except ValueError, TypeError:
             return {}
     return raw or {}
 
@@ -289,9 +300,14 @@ def _journal_rows(app_db) -> list[dict]:
 
 
 def _dataset(app_db, tmp_path):
-    from atr.services.learning import LearningDatasetBuilder
+    from forward.services.learning_dataset import LearningDatasetBuilder
 
-    return LearningDatasetBuilder(db=app_db, cache_root=tmp_path, frames={}).build()
+    return LearningDatasetBuilder(
+        portfolio_storage=SqlPortfolioStorage(app_db),
+        storage=SqlLearningStorage(app_db),
+        artifacts=LocalLearningArtifactsAdapter(tmp_path),
+        market_history=InMemoryMarketFramesPort({}),
+    ).build()
 
 
 def _open_then_close(chain: Chain) -> None:
@@ -368,9 +384,15 @@ def test_the_forward_row_is_attributed_to_the_authored_version(chain, app_db, tm
 
 def test_the_learning_service_reports_it_without_being_told(chain, app_db, tmp_path):
     """The learning pipeline reads the journal the runner wrote; nothing points it there."""
-    from atr.services.learning import LearningService
+    from forward.services.learning import LearningService
 
-    service = LearningService(db=app_db, cache_root=tmp_path)
+    service = LearningService(
+        market_history=InMemoryMarketFramesPort({}),
+        portfolio_storage=SqlPortfolioStorage(app_db),
+        storage=SqlLearningStorage(app_db),
+        daily_learning_storage=SqlDailyLearningStorage(app_db),
+        artifacts=LocalLearningArtifactsAdapter(tmp_path),
+    )
     before = service.status()
     assert before["counts"]["trade_journal"] == 0
     assert before["forward_available"] == 0
@@ -435,7 +457,7 @@ def test_the_entry_order_carries_the_execution_time_provenance_stamp(chain, app_
     A timestamp cannot do this job — a backfill harness writes those too — which is
     why the OMS writes the provenance on the order's ``NEW`` event at creation.
     """
-    from atr.execution.oms import PROVENANCE_FORWARD, PROVENANCE_KEY, RECORDED_AT_KEY
+    from forward.execution.oms import PROVENANCE_FORWARD, PROVENANCE_KEY, RECORDED_AT_KEY
 
     chain.runner.pass_once(now=SESSION)
     buy = [o for o in _orders(app_db) if o["side"] == "BUY"][0]
@@ -455,9 +477,7 @@ def test_a_closed_market_produces_no_trade_and_no_evidence(chain, app_db, tmp_pa
     A paper fill at 20:15 IST is a fill at a price no exchange offered, and it
     would arrive in the dataset as forward evidence — worse than not trading.
     """
-    tick = chain.runner.pass_once(
-        now=datetime(2026, 9, 14, 20, 0, tzinfo=ZoneInfo("Asia/Kolkata"))
-    )
+    tick = chain.runner.pass_once(now=datetime(2026, 9, 14, 20, 0, tzinfo=ZoneInfo("Asia/Kolkata")))
 
     assert tick.signals == 0 and tick.orders == 0
     assert _orders(app_db) == []
@@ -465,9 +485,7 @@ def test_a_closed_market_produces_no_trade_and_no_evidence(chain, app_db, tmp_pa
     assert len(_dataset(app_db, tmp_path)) == 0
 
 
-def test_the_seeded_example_is_the_same_definition_the_chain_authored(
-    chain, auth_client
-):
+def test_the_seeded_example_is_the_same_definition_the_chain_authored(chain, auth_client):
     """The shipped example and the authored version are one thing, not two.
 
     If they drifted, the test above would be proving that *some* definition works

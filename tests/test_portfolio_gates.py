@@ -22,17 +22,20 @@ from __future__ import annotations
 
 import pytest
 
-from atr.execution.oms import OrderDraft
-from atr.services.portfolio import (
+from forward.appdb.portfolio_storage import SqlPortfolioStorage
+from forward.execution.oms import OrderDraft
+from forward.services.portfolio import PortfolioService
+from forward.services.portfolio_models import (
     BookPosition,
     DeploymentSlice,
-    PolicyError,
     PortfolioBook,
-    PortfolioService,
+)
+from forward.services.portfolio_policy import (
+    PolicyError,
     default_policy,
-    evaluate_order,
     policy_from_dict,
 )
+from forward.services.portfolio_risk import evaluate_order
 
 
 def _draft(**over: object) -> OrderDraft:
@@ -50,8 +53,12 @@ def _draft(**over: object) -> OrderDraft:
 
 def _position(symbol: str, qty: float, price: float, dep: str = "dep-a") -> BookPosition:
     return BookPosition(
-        symbol=symbol, qty=qty, avg_price=price, last_price=price,
-        deployment_id=dep, strategy_id="strat-a",
+        symbol=symbol,
+        qty=qty,
+        avg_price=price,
+        last_price=price,
+        deployment_id=dep,
+        strategy_id="strat-a",
     )
 
 
@@ -107,13 +114,16 @@ def test_default_policy_is_pass_through_with_reject_conflicts():
     assert policy.max_total_exposure is None
     assert policy.conflict_mode == "reject"
     decision = evaluate_order(
-        _draft(), book=_book(), policy=policy, price=100.0,
+        _draft(),
+        book=_book(),
+        policy=policy,
+        price=100.0,
     )
     assert decision.allowed is True
 
 
 def _user(app_db) -> str:
-    from atr.appdb.repositories import UserRepository
+    from forward.appdb.identity_repository import UserRepository
 
     with app_db.session() as session:
         user = UserRepository.create(
@@ -128,21 +138,22 @@ def _user(app_db) -> str:
 
 def test_setting_policy_without_a_reason_is_refused(app_db):
     user_id = _user(app_db)
-    service = PortfolioService(db=app_db)
+    service = PortfolioService(storage=SqlPortfolioStorage(app_db))
     with pytest.raises(PolicyError):
-        service.set_policy(
-            user_id, {"max_total_exposure": 1.0}, actor="tester", reason="  "
-        )
+        service.set_policy(user_id, {"max_total_exposure": 1.0}, actor="tester", reason="  ")
 
 
 def test_policy_round_trips_through_the_store(app_db):
     user_id = _user(app_db)
-    service = PortfolioService(db=app_db)
+    service = PortfolioService(storage=SqlPortfolioStorage(app_db))
     assert service.get_policy(user_id) is None
     stored = service.set_policy(
         user_id,
-        {"max_total_exposure": 100_000.0, "conflict_mode": "priority",
-         "strategy_priorities": {"strat-a": 5}},
+        {
+            "max_total_exposure": 100_000.0,
+            "conflict_mode": "priority",
+            "strategy_priorities": {"strat-a": 5},
+        },
         actor="tester",
         reason="acceptance setup",
     )
@@ -162,7 +173,10 @@ def test_an_exit_passes_whatever_the_limits_say():
     policy = policy_from_dict({"max_total_exposure": 1.0})
     book = _book(_dep("dep-a", _position("RELIANCE", 10.0, 100.0)))
     decision = evaluate_order(
-        _draft(side="SELL", quantity=10.0), book=book, policy=policy, price=100.0,
+        _draft(side="SELL", quantity=10.0),
+        book=book,
+        policy=policy,
+        price=100.0,
     )
     assert decision.allowed is True
     assert any(c.check == "exit_exempt" for c in decision.checks)
@@ -175,7 +189,10 @@ def test_a_flip_past_flat_is_an_opener_not_an_exit():
     policy = policy_from_dict({"max_total_exposure": 10**12})
     book = _book(_dep("dep-a", _position("RELIANCE", 10.0, 100.0)))
     decision = evaluate_order(
-        _draft(side="SELL", quantity=25.0), book=book, policy=policy, price=100.0,
+        _draft(side="SELL", quantity=25.0),
+        book=book,
+        policy=policy,
+        price=100.0,
     )
     assert decision.allowed is False
     assert decision.code == "portfolio_conflict"
@@ -185,7 +202,10 @@ def test_total_exposure_blocks_before_the_oms():
     policy = policy_from_dict({"max_total_exposure": 15_000.0})
     book = _book(_dep("dep-a", _position("RELIANCE", 100.0, 100.0)))
     decision = evaluate_order(
-        _draft(quantity=100.0), book=book, policy=policy, price=100.0,
+        _draft(quantity=100.0),
+        book=book,
+        policy=policy,
+        price=100.0,
     )
     assert decision.allowed is False
     assert decision.code == "portfolio_total_exposure"
@@ -196,7 +216,10 @@ def test_unpriceable_orders_skip_notional_checks_said_so():
     policy = policy_from_dict({"max_total_exposure": 15_000.0})
     book = _book()
     decision = evaluate_order(
-        _draft(), book=book, policy=policy, price=None,
+        _draft(),
+        book=book,
+        policy=policy,
+        price=None,
     )
     assert decision.allowed is True
     skipped = [c for c in decision.checks if c.check == "total_exposure"]
@@ -219,7 +242,9 @@ def test_same_direction_aggregates_without_conflict():
     policy = policy_from_dict({})
     decision = evaluate_order(
         _draft(deployment_id="dep-c", strategy_id="strat-c"),
-        book=_opposed_book(), policy=policy, price=100.0,
+        book=_opposed_book(),
+        policy=policy,
+        price=100.0,
     )
     assert decision.allowed is True
     assert any(c.check == "conflict" and c.allowed for c in decision.checks)
@@ -228,21 +253,26 @@ def test_same_direction_aggregates_without_conflict():
 def test_opposite_direction_rejects_by_default():
     decision = evaluate_order(
         _draft(deployment_id="dep-c", strategy_id="strat-c", side="SELL", quantity=10.0),
-        book=_opposed_book(), policy=default_policy(), price=100.0,
+        book=_opposed_book(),
+        policy=default_policy(),
+        price=100.0,
     )
     assert decision.allowed is False
     assert decision.code == "portfolio_conflict"
 
 
 def test_priority_needs_a_strict_win_ties_fail_closed():
-    policy = policy_from_dict({
-        "conflict_mode": "priority",
-        "strategy_priorities": {"strat-a": 5, "strat-c": 5},
-    })
+    policy = policy_from_dict(
+        {
+            "conflict_mode": "priority",
+            "strategy_priorities": {"strat-a": 5, "strat-c": 5},
+        }
+    )
     tied = evaluate_order(
         _draft(deployment_id="dep-c", strategy_id="strat-c", side="SELL", quantity=1.0),
         book=_book(_dep("dep-a", _position("RELIANCE", 100.0, 100.0), strategy="strat-a")),
-        policy=policy, price=100.0,
+        policy=policy,
+        price=100.0,
     )
     assert tied.allowed is False
     assert tied.code == "portfolio_conflict_priority"
@@ -250,23 +280,29 @@ def test_priority_needs_a_strict_win_ties_fail_closed():
     winning = evaluate_order(
         _draft(deployment_id="dep-c", strategy_id="strat-c", side="SELL", quantity=1.0),
         book=_book(_dep("dep-a", _position("RELIANCE", 100.0, 100.0), strategy="strat-a")),
-        policy=policy_from_dict({
-            "conflict_mode": "priority",
-            "strategy_priorities": {"strat-a": 5, "strat-c": 9},
-        }),
+        policy=policy_from_dict(
+            {
+                "conflict_mode": "priority",
+                "strategy_priorities": {"strat-a": 5, "strat-c": 9},
+            }
+        ),
         price=100.0,
     )
     assert winning.allowed is True
 
 
 def test_net_mode_allows_but_still_counts_gross_size():
-    policy = policy_from_dict({
-        "conflict_mode": "net", "max_total_exposure": 1.0,
-    })
+    policy = policy_from_dict(
+        {
+            "conflict_mode": "net",
+            "max_total_exposure": 1.0,
+        }
+    )
     decision = evaluate_order(
         _draft(deployment_id="dep-c", strategy_id="strat-c", side="SELL", quantity=1.0),
         book=_book(_dep("dep-a", _position("RELIANCE", 100.0, 100.0), strategy="strat-a")),
-        policy=policy, price=100.0,
+        policy=policy,
+        price=100.0,
     )
     # Allowed past the conflict — then stopped by the gross size limit, which
     # netting does not switch off.
@@ -280,35 +316,57 @@ def test_net_mode_allows_but_still_counts_gross_size():
 
 
 def test_stock_sector_and_correlated_limits():
-    policy = policy_from_dict({
-        "max_stock_exposure": 15_000.0,
-        "max_sector_exposure_pct": 0.05,
-        "max_correlated_exposure_pct": 0.05,
-    })
+    policy = policy_from_dict(
+        {
+            "max_stock_exposure": 15_000.0,
+            "max_sector_exposure_pct": 0.05,
+            "max_correlated_exposure_pct": 0.05,
+        }
+    )
     book = _book(_dep("dep-a", _position("RELIANCE", 100.0, 100.0)), capital=500_000.0)
-    assert evaluate_order(
-        _draft(quantity=100.0), book=book, policy=policy, price=100.0,
-        sector_of=_sectors,
-    ).code == "portfolio_stock_exposure"
+    assert (
+        evaluate_order(
+            _draft(quantity=100.0),
+            book=book,
+            policy=policy,
+            price=100.0,
+            sector_of=_sectors,
+        ).code
+        == "portfolio_stock_exposure"
+    )
 
-    stock_ok = policy_from_dict({
-        "max_sector_exposure_pct": 0.05, "max_correlated_exposure_pct": 0.50,
-    })
+    stock_ok = policy_from_dict(
+        {
+            "max_sector_exposure_pct": 0.05,
+            "max_correlated_exposure_pct": 0.50,
+        }
+    )
     # 10,000 held + 20,000 incoming = 30,000 of Energy against a 25,000 cap.
-    assert evaluate_order(
-        _draft(quantity=200.0), book=book, policy=stock_ok, price=100.0,
-        sector_of=_sectors,
-    ).code == "portfolio_sector_exposure"
+    assert (
+        evaluate_order(
+            _draft(quantity=200.0),
+            book=book,
+            policy=stock_ok,
+            price=100.0,
+            sector_of=_sectors,
+        ).code
+        == "portfolio_sector_exposure"
+    )
 
-    correlated = policy_from_dict({
-        "max_correlated_exposure_pct": 0.05,
-        "correlation_groups": [["RELIANCE", "ONGC"]],
-    })
+    correlated = policy_from_dict(
+        {
+            "max_correlated_exposure_pct": 0.05,
+            "correlation_groups": [["RELIANCE", "ONGC"]],
+        }
+    )
     # 10,000 held in the shared cluster + 20,000 incoming = 30,000 against
     # a 25,000 cap.
     decision = evaluate_order(
-        _draft(symbol="ONGC", quantity=200.0), book=book, policy=correlated,
-        price=100.0, sector_of=_sectors,
+        _draft(symbol="ONGC", quantity=200.0),
+        book=book,
+        policy=correlated,
+        price=100.0,
+        sector_of=_sectors,
     )
     assert decision.code == "portfolio_correlated_exposure"
     assert "group:" in (decision.reason or "")
@@ -318,7 +376,10 @@ def test_open_positions_counts_distinct_symbols_after_the_order():
     policy = policy_from_dict({"max_open_positions": 1})
     book = _book(_dep("dep-a", _position("RELIANCE", 10.0, 100.0)))
     decision = evaluate_order(
-        _draft(symbol="TCS", quantity=5.0), book=book, policy=policy, price=100.0,
+        _draft(symbol="TCS", quantity=5.0),
+        book=book,
+        policy=policy,
+        price=100.0,
     )
     assert decision.allowed is False
     assert decision.code == "portfolio_open_positions"
@@ -328,8 +389,11 @@ def test_a_breached_daily_loss_refuses_new_risk_not_exits():
     policy = policy_from_dict({"max_daily_loss": 1_000.0})
     book = _book(_dep("dep-a", _position("RELIANCE", 10.0, 100.0)))
     opener = evaluate_order(
-        _draft(symbol="TCS", quantity=1.0), book=book, policy=policy,
-        price=100.0, daily_pnl=-1_500.0,
+        _draft(symbol="TCS", quantity=1.0),
+        book=book,
+        policy=policy,
+        price=100.0,
+        daily_pnl=-1_500.0,
     )
     assert opener.allowed is False
     assert opener.code == "portfolio_daily_loss"
@@ -337,6 +401,7 @@ def test_a_breached_daily_loss_refuses_new_risk_not_exits():
 
 def test_bad_quantities_are_refused_not_measured():
     policy = default_policy()
-    assert evaluate_order(
-        _draft(quantity=0), book=_book(), policy=policy, price=100.0
-    ).code == "portfolio_bad_order"
+    assert (
+        evaluate_order(_draft(quantity=0), book=_book(), policy=policy, price=100.0).code
+        == "portfolio_bad_order"
+    )

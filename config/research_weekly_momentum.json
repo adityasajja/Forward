@@ -1,0 +1,46 @@
+{
+  "daily_data_directory": "data/iifl_daily/NSEEQ",
+  "universe_directory": "data/universe",
+  "universes": {
+    "nifty50": "n50.txt",
+    "midcap150": "mid150.txt",
+    "smallcap250": "smallcap250.txt"
+  },
+  "universe_names": ["nifty50", "midcap150", "smallcap250"],
+  "history_start_date": "2015-01-01",
+  "history_end_date": "2026-09-11",
+  "week_period": "W-FRI",
+  "minimum_raw_history_bars": 300,
+  "minimum_window_bars": 250,
+  "minimum_weekly_bars_per_symbol": 100,
+  "minimum_symbols_per_week": 10,
+  "minimum_metric_weeks": 30,
+  "trading_weeks_per_year": 52,
+  "target_weekly_return_fraction": 0.05,
+  "downside_weekly_return_fraction": -0.05,
+  "reported_return_thresholds": [0.05, 0.02, 0.01],
+  "reported_downside_thresholds": [-0.05, -0.02],
+  "momentum_grid": {
+    "lookback_weeks": [1, 2, 4, 12, 26],
+    "skip_weeks": [0, 1],
+    "top_n": [5, 10, 20]
+  },
+  "control_seeds": [0, 1, 2, 3, 4, 5, 6, 7],
+  "execution_lag_weeks": 0,
+  "delivery_costs": {
+    "name": "NSE delivery share",
+    "stt_buy": 0.001,
+    "stt_sell": 0.001,
+    "stamp_buy": 0.00015,
+    "exchange": 0.0000297,
+    "sebi": 0.000001,
+    "gst": 0.18,
+    "brokerage_pct": 0.0003,
+    "brokerage_cap": 20.0,
+    "slippage": 0.0005
+  },
+  "target_weekly_return_pct": 5.0,
+  "borrow_rate_pct": 11.0,
+  "control_significance_z": 1.895,
+  "output_file": "data/self_learning/weekly_momentum.json"
+}

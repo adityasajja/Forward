@@ -4,9 +4,8 @@ from datetime import date
 
 import numpy as np
 import pandas as pd
-import pytest
 
-from atr.research import forward_tracker as ft
+from forward.research import forward_tracker as ft
 
 
 def _frame(closes, start="2026-08-03"):
@@ -86,7 +85,7 @@ def test_the_summary_refuses_a_verdict_until_there_is_enough_to_judge(tmp_path):
         {"symbol": str(i), "entry_date": "2026-09-04", "status": "closed", "hit": True, "ret_pct": 5.0} for i in range(10)
     ]})
 
-    s = ft.summary(store)
+    s = ft.summary(store.read())
 
     assert s["state"] == "collecting"  # ten straight wins still prove nothing
     assert s["hit_rate_pct"] == 100.0
@@ -100,7 +99,7 @@ def test_a_clear_result_gets_a_clear_verdict(tmp_path):
             {"symbol": str(i), "entry_date": "d", "status": "closed", "hit": i < hits, "ret_pct": 3.0 if i < hits else -2.0}
             for i in range(n)
         ]})
-        return ft.summary(store)["state"]
+        return ft.summary(store.read())["state"]
 
     assert run(150, 200) == "working"  # 75%: far above the ordinary 32%
     assert run(40, 200) == "not_working"  # 20%: well under the claimed 45%

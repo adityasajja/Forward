@@ -17,7 +17,9 @@ from datetime import time
 
 import pytest
 
-from atr.services.risk import (
+from forward.appdb.risk_state_storage import SqlRiskStateStorage
+from forward.config.settings import get_settings
+from forward.services.risk import (
     CONFIGURABLE_LIMITS,
     RiskStateError,
     RiskStateService,
@@ -27,7 +29,7 @@ from atr.services.risk import (
 
 @pytest.fixture()
 def risk(app_db) -> RiskStateService:
-    return RiskStateService(app_db)
+    return RiskStateService(SqlRiskStateStorage(app_db), get_settings())
 
 
 # =========================================================================== defaults
@@ -66,7 +68,7 @@ def test_the_kill_switch_requires_a_reason_in_both_directions(risk):
 
 def test_the_kill_switch_records_who_and_why(risk):
     """An operator action with no actor is not an audit trail."""
-    from atr.appdb.repositories import SystemStateRepository
+    from forward.appdb.system_state_repository import SystemStateRepository
 
     risk.set_kill_switch(True, reason="daily loss breached", actor="alice")
     with risk.db.session() as session:
@@ -78,7 +80,7 @@ def test_the_kill_switch_records_who_and_why(risk):
 def test_the_kill_switch_survives_a_restart(app_db, risk):
     """The bug the in-memory dict had: a bounce silently re-armed trading."""
     risk.set_kill_switch(True, reason="market dislocation", actor="operator")
-    restarted = RiskStateService(app_db)
+    restarted = RiskStateService(SqlRiskStateStorage(app_db), get_settings())
     assert restarted.kill_switch_engaged() is True
 
 
@@ -115,7 +117,7 @@ def test_the_mode_change_records_the_previous_value(risk):
 
 def test_the_execution_mode_survives_a_restart(app_db, risk):
     risk.set_execution_mode("live", reason="session start", actor="operator")
-    assert RiskStateService(app_db).execution_mode() == "live"
+    assert RiskStateService(SqlRiskStateStorage(app_db), get_settings()).execution_mode() == "live"
 
 
 # =========================================================================== limits
@@ -164,7 +166,7 @@ def test_an_invalid_limit_value_is_refused_before_it_is_stored(risk):
 
 def test_limits_survive_a_restart(app_db, risk):
     risk.set_limits({"max_order_notional": 100_000}, actor="operator")
-    assert RiskStateService(app_db).limits().max_order_notional == 100_000
+    assert RiskStateService(SqlRiskStateStorage(app_db), get_settings()).limits().max_order_notional == 100_000
 
 
 def test_a_trading_window_round_trips(risk):
@@ -173,17 +175,20 @@ def test_a_trading_window_round_trips(risk):
     assert risk.snapshot().as_dict()["limits"]["trading_window"] == ["09:15:00", "15:30:00"]
 
 
-def test_an_unparseable_trading_window_is_dropped_not_fatal():
-    """A bad window must not take the whole risk state down with it."""
-    assert limits_from_dict({"trading_window": "09:15-15:30"}).trading_window is None
-    assert limits_from_dict({"trading_window": ["nonsense", "15:30"]}).trading_window is None
-    assert limits_from_dict({"trading_window": ["15:30", "09:15"]}).trading_window is None
+def test_an_unparseable_trading_window_is_rejected():
+    """A bad window cannot silently remove a time-based order limit."""
+    with pytest.raises(TypeError):
+        limits_from_dict({"trading_window": "09:15-15:30"})
+    with pytest.raises(ValueError):
+        limits_from_dict({"trading_window": ["nonsense", "15:30"]})
+    with pytest.raises(ValueError):
+        limits_from_dict({"trading_window": ["15:30", "09:15"]})
 
 
-def test_a_stored_key_that_no_longer_exists_is_ignored():
-    """Otherwise a stale row would raise on construction and lose the whole state."""
-    limits = limits_from_dict({"max_daily_loss": 1000, "max_something_removed": 5})
-    assert limits.max_daily_loss == 1000
+def test_an_unknown_stored_limit_is_rejected():
+    """A stale key cannot be silently dropped from persisted risk state."""
+    with pytest.raises(ValueError, match="unknown risk limit"):
+        limits_from_dict({"max_daily_loss": 1000, "max_something_removed": 5})
 
 
 def test_none_means_no_limit_rather_than_zero():
@@ -195,7 +200,7 @@ def test_none_means_no_limit_rather_than_zero():
 
 def test_every_configurable_limit_is_a_real_field():
     """The allowlist and the dataclass cannot drift apart."""
-    from atr.execution.risk import RiskLimits
+    from forward.execution.risk import RiskLimits
 
     fields = set(RiskLimits.__dataclass_fields__)
     assert set(CONFIGURABLE_LIMITS) <= fields
@@ -215,14 +220,14 @@ class _Portfolio:
 
 
 def _instruments(symbol: str, exchange: str):
-    from atr.core.models import Instrument
+    from forward.core.instrument_models import Instrument
 
     return Instrument(symbol=symbol, exchange=exchange, multiplier=1.0)
 
 
 def test_the_gate_refuses_everything_while_the_kill_switch_is_engaged(risk):
     """The fix for defect 4.2: the kill switch reaches the order path."""
-    from atr.execution.oms import OrderDraft
+    from forward.execution.oms import OrderDraft
 
     risk.set_kill_switch(True, reason="testing", actor="operator")
     gate = risk.gate(portfolio=_Portfolio(), instruments=_instruments)
@@ -234,7 +239,7 @@ def test_the_gate_refuses_everything_while_the_kill_switch_is_engaged(risk):
 
 
 def test_the_gate_allows_an_order_when_nothing_is_wrong(risk):
-    from atr.execution.oms import OrderDraft
+    from forward.execution.oms import OrderDraft
 
     gate = risk.gate(portfolio=_Portfolio(), instruments=_instruments)
     decision = gate(
@@ -244,7 +249,7 @@ def test_the_gate_allows_an_order_when_nothing_is_wrong(risk):
 
 
 def test_the_gate_applies_the_configured_limits(risk):
-    from atr.execution.oms import OrderDraft
+    from forward.execution.oms import OrderDraft
 
     risk.set_limits({"max_order_notional": 10_000}, actor="operator")
     gate = risk.gate(portfolio=_Portfolio(), instruments=_instruments)
@@ -257,7 +262,7 @@ def test_the_gate_applies_the_configured_limits(risk):
 
 
 def test_the_gate_respects_a_symbol_restriction(risk):
-    from atr.execution.oms import OrderDraft
+    from forward.execution.oms import OrderDraft
 
     risk.set_limits({"allowed_symbols": ["TCS"]}, actor="operator")
     gate = risk.gate(portfolio=_Portfolio(), instruments=_instruments)

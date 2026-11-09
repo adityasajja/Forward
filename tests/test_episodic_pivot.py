@@ -19,12 +19,13 @@ from datetime import datetime, timedelta
 import pandas as pd
 import pytest
 
-from atr.backtest.costs import SlippageModel
-from atr.backtest.engine import BacktestConfig, BacktestEngine
-from atr.core.enums import AssetClass, OrderStatus, OrderType, Side
-from atr.core.models import Bar, Instrument, MarketSnapshot
-from atr.data.base import ListFeed
-from atr.strategy.strategies.episodic_pivot import (
+from forward.backtest.engine import BacktestConfig, BacktestEngine
+from forward.core.costs import SlippageModel
+from forward.core.enums import AssetClass, OrderStatus, OrderType, Side
+from forward.core.feeds import ListFeed
+from forward.core.instrument_models import Instrument
+from forward.core.market_models import Bar, MarketSnapshot
+from forward.strategy.strategies.episodic_pivot import (
     EpisodicPivot9M,
     EpisodicPivotBase,
     EpisodicPivotDay1,
@@ -358,7 +359,7 @@ def test_finite_prefers_a_real_number_over_a_nan():
     It reached the sizer as `int(nan)` and read like a sizing bug rather than a
     missing price, which is why it is worth pinning down.
     """
-    from atr.strategy.strategies.episodic_pivot import _finite
+    from forward.strategy.strategies.episodic_pivot import _finite
 
     assert _finite(float("nan"), 12.5) == 12.5
     assert _finite(None, 12.5) == 12.5

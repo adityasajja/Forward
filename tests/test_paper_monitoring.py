@@ -39,6 +39,25 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import pytest
 
+from forward.appdb.forward_check_storage import SqlForwardCheckStorage
+from forward.appdb.order_storage import SqlOrderStorage
+from forward.appdb.paper_deployment_storage import SqlPaperDeploymentStorage
+from forward.appdb.paper_ledger_storage import SqlPaperLedgerStorage
+from forward.appdb.paper_runner_storage import SqlPaperRunnerStorage
+from forward.appdb.portfolio_storage import SqlPortfolioStorage
+from forward.appdb.risk_state_storage import SqlRiskStateStorage
+from forward.appdb.system_state_storage import SqlSystemStateStorage
+from forward.appdb.trade_journal_storage import SqlTradeJournalStorage
+from forward.config.settings import get_settings
+from forward.data.cached_market_frames import CachedMarketFramesAdapter
+from forward.data.vwap_liquidity import NseBhavcopyLiquidityAdapter
+from forward.market_calendar import get_market_calendar
+from forward.services.paper_ledger import PaperLedger
+from forward.services.risk import RiskStateService
+from tests.market_data_fakes import NoopSignalContextEnricher
+from tests.order_fakes import order_instrument_lookup
+from tests.paper_price_fakes import StaticRunnerVenueProvider, no_live_price
+
 SYMBOL = "RELIANCE"
 EXCHANGE = "NSEEQ"
 #: A Monday, 10:00 IST — inside the cash session. Aware on purpose: a naive
@@ -78,7 +97,7 @@ def _daily(n: int = 300, start: float = 1000.0, *, ramp: bool = False) -> pd.Dat
 
 @pytest.fixture()
 def user(app_db):
-    from atr.appdb.schema import users
+    from forward.appdb.account_schema import users
 
     with app_db.session() as session:
         session.execute(
@@ -100,12 +119,10 @@ def user(app_db):
 
 
 def _strategy(app_db, *, definition: dict, name: str = "Monitor rules") -> tuple[str, int]:
-    from atr.appdb.repositories import StrategyRepository
+    from forward.appdb.strategy_repository import StrategyRepository
 
     with app_db.session() as session:
-        strategy = StrategyRepository.create(
-            session, user_id="u1", name=name, kind="rules"
-        )
+        strategy = StrategyRepository.create(session, user_id="u1", name=name, kind="rules")
         version = StrategyRepository.create_version(
             session,
             strategy_id=strategy["strategy_id"],
@@ -131,16 +148,22 @@ BREAKOUT = {
 }
 
 
-def _deploy(app_db, *, strategy_id: str, version: int, capital: float = 500_000.0,
-            config: dict | None = None, status: str = "RUNNING") -> dict:
-    from atr.appdb.repositories import DeploymentRepository
+def _deploy(
+    app_db,
+    *,
+    strategy_id: str,
+    version: int,
+    capital: float = 500_000.0,
+    config: dict | None = None,
+    status: str = "RUNNING",
+) -> dict:
+    from forward.appdb.deployment_repository import DeploymentRepository
 
     payload = {
         "symbols": [SYMBOL],
         "exchange": EXCHANGE,
         "timeframe": "1d",
         "signal_basis": "live",
-        "order_value": 250_000.0,
         "lookback_days": 400,
         "max_open_positions": 1,
     }
@@ -167,10 +190,10 @@ def wired(app_db, user, monkeypatch):
     than of a number the test liked.
     """
     monkeypatch.setattr(
-        "atr.signals.engine.load_daily",
+        "forward.data.cached_market_frames.load_daily_from_cache",
         lambda symbol, exchange="NSEEQ", **kw: _daily(ramp=True),
     )
-    from atr.services.runner import PaperRunner
+    from forward.services.runner import PaperRunner
 
     strategy_id, version = _strategy(app_db, definition=BREAKOUT)
     row = _deploy(app_db, strategy_id=strategy_id, version=version)
@@ -179,7 +202,29 @@ def wired(app_db, user, monkeypatch):
     high_63 = float(frame["close"].tail(63).max())
     tick = round(high_63 * 0.995, 2)
 
-    runner = PaperRunner(db=app_db)
+    runner = PaperRunner(
+        interval_seconds=get_settings().runner_interval_seconds,
+        lookback_days=get_settings().runner_lookback_days,
+        minimum_sleep_seconds=get_settings().runner_min_sleep_seconds,
+        market_wait_seconds=get_settings().runner_market_wait_seconds,
+        symbol_retry_seconds=get_settings().deployment_symbol_retry_seconds,
+        signal_context=NoopSignalContextEnricher(),
+        daily_history=CachedMarketFramesAdapter(),
+        vwap_liquidity=NseBhavcopyLiquidityAdapter(get_settings().research_data_directory),
+        sector_table={},
+        instrument_lookup=order_instrument_lookup,
+        journal_storage=SqlTradeJournalStorage(app_db),
+        portfolio_storage=SqlPortfolioStorage(app_db),
+        ledger=PaperLedger(storage=SqlPaperLedgerStorage(app_db), price_source=no_live_price),
+        order_storage=SqlOrderStorage(app_db),
+        runner_storage=SqlPaperRunnerStorage(app_db),
+        state_storage=SqlSystemStateStorage(app_db),
+        risk_state=RiskStateService(SqlRiskStateStorage(app_db), get_settings()),
+        calendar=get_market_calendar(),
+        venue_provider=StaticRunnerVenueProvider(
+            prices=no_live_price, instruments=order_instrument_lookup
+        ),
+    )
     runner.sync_loops()
     loop = runner._loops[row["deployment_id"]]
     loop.venue.prices = lambda s, e: tick
@@ -200,18 +245,36 @@ def monitor(app_db, user, wired):
     ``users``, and a fixture that only asked for ``app_db`` would race the user
     insert and fail on the FK rather than on anything real.
     """
-    from atr.services.monitoring import DeploymentMonitor
+    from forward.services.monitoring import DeploymentMonitor
+    from forward.services.paper_ledger import PaperLedger
 
     runner, _deployment_id, _tick = wired
-    return DeploymentMonitor(db=app_db, runner=runner)
+    return DeploymentMonitor(
+        portfolio_storage=SqlPortfolioStorage(app_db),
+        order_storage=SqlOrderStorage(app_db),
+        ledger=PaperLedger(storage=SqlPaperLedgerStorage(app_db), price_source=no_live_price),
+        runner=runner,
+        risk_state=RiskStateService(SqlRiskStateStorage(app_db), get_settings()),
+        calendar=get_market_calendar(),
+    )
 
 
 @pytest.fixture()
 def idle_monitor(app_db, user):
-    """A monitor with no runner of its own, for deployments nothing is driving."""
-    from atr.services.monitoring import DeploymentMonitor
+    """A monitor whose runner reports no attached deployment loops."""
+    from unittest.mock import Mock
 
-    return DeploymentMonitor(db=app_db)
+    from forward.services.monitoring import DeploymentMonitor
+    from forward.services.paper_ledger import PaperLedger
+
+    return DeploymentMonitor(
+        portfolio_storage=SqlPortfolioStorage(app_db),
+        order_storage=SqlOrderStorage(app_db),
+        ledger=PaperLedger(storage=SqlPaperLedgerStorage(app_db), price_source=no_live_price),
+        risk_state=RiskStateService(SqlRiskStateStorage(app_db), get_settings()),
+        runner=Mock(running=False, deployment_status=Mock(return_value=None)),
+        calendar=get_market_calendar(),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -289,9 +352,7 @@ def test_a_position_and_its_pnl_follow_from_the_fill(app_db, wired, monitor):
     assert pnl["complete"] is True
 
 
-def test_a_rejected_order_is_reported_as_rejected_not_as_a_trade(
-    app_db, wired, monitor
-):
+def test_a_rejected_order_is_reported_as_rejected_not_as_a_trade(app_db, wired, monitor):
     """A risk rejection is an outcome, and the screen must show it as one.
 
     The gate is closed by a kill switch, which is the cheapest way to make the
@@ -299,9 +360,9 @@ def test_a_rejected_order_is_reported_as_rejected_not_as_a_trade(
     """
     runner, deployment_id, _ = wired
 
-    from atr.services.risk import RiskStateService
+    from forward.services.risk import RiskStateService
 
-    RiskStateService(db=app_db).set_kill_switch(
+    RiskStateService(SqlRiskStateStorage(app_db), get_settings()).set_kill_switch(
         True, reason="test: gate closed", actor="test"
     )
 
@@ -345,13 +406,11 @@ def test_todays_pnl_appears_once_a_prior_day_has_equity(app_db, wired, monitor):
     runner.pass_once(now=SESSION)
 
     # Backdate the fills to yesterday, so the boundary has something before it.
-    from atr.appdb.schema import order_events
+    from forward.appdb.execution_schema import order_events
 
     yesterday = datetime.now(UTC) - timedelta(days=1)
     with app_db.session() as session:
-        session.execute(
-            order_events.update().values(ts=yesterday, fill_ts=yesterday)
-        )
+        session.execute(order_events.update().values(ts=yesterday, fill_ts=yesterday))
 
     pnl = monitor.pnl("u1", deployment_id, prices={SYMBOL: tick})
     assert pnl["today_pnl"] is not None, "a boundary existed but today's P&L was null"
@@ -376,11 +435,12 @@ def test_a_blocked_deployment_says_why_it_is_not_trading(app_db, user, monkeypat
     This is the field that distinguishes "the market is quiet" from "this
     deployment is silently inert", and it has no other way to be seen.
     """
-    from atr.services.monitoring import DeploymentMonitor
-    from atr.services.runner import PaperRunner
+    from forward.services.monitoring import DeploymentMonitor
+    from forward.services.paper_ledger import PaperLedger
+    from forward.services.runner import PaperRunner
 
     monkeypatch.setattr(
-        "atr.signals.engine.load_daily",
+        "forward.data.cached_market_frames.load_daily_from_cache",
         lambda symbol, exchange="NSEEQ", **kw: _daily(),
     )
     # A version whose rules cannot be parsed into usable numeric values.
@@ -391,7 +451,29 @@ def test_a_blocked_deployment_says_why_it_is_not_trading(app_db, user, monkeypat
     )
     row = _deploy(app_db, strategy_id=strategy_id, version=version)
 
-    runner = PaperRunner(db=app_db)
+    runner = PaperRunner(
+        interval_seconds=get_settings().runner_interval_seconds,
+        lookback_days=get_settings().runner_lookback_days,
+        minimum_sleep_seconds=get_settings().runner_min_sleep_seconds,
+        market_wait_seconds=get_settings().runner_market_wait_seconds,
+        symbol_retry_seconds=get_settings().deployment_symbol_retry_seconds,
+        signal_context=NoopSignalContextEnricher(),
+        daily_history=CachedMarketFramesAdapter(),
+        vwap_liquidity=NseBhavcopyLiquidityAdapter(get_settings().research_data_directory),
+        sector_table={},
+        instrument_lookup=order_instrument_lookup,
+        journal_storage=SqlTradeJournalStorage(app_db),
+        portfolio_storage=SqlPortfolioStorage(app_db),
+        ledger=PaperLedger(storage=SqlPaperLedgerStorage(app_db), price_source=no_live_price),
+        order_storage=SqlOrderStorage(app_db),
+        runner_storage=SqlPaperRunnerStorage(app_db),
+        state_storage=SqlSystemStateStorage(app_db),
+        risk_state=RiskStateService(SqlRiskStateStorage(app_db), get_settings()),
+        calendar=get_market_calendar(),
+        venue_provider=StaticRunnerVenueProvider(
+            prices=no_live_price, instruments=order_instrument_lookup
+        ),
+    )
     runner.sync_loops()
     loop = runner._loops.get(row["deployment_id"])
     assert loop is not None
@@ -400,7 +482,14 @@ def test_a_blocked_deployment_says_why_it_is_not_trading(app_db, user, monkeypat
 
     # The monitor must be pointed at this runner: the default is the process-wide
     # one, which knows nothing about a runner a caller built for itself.
-    monitor = DeploymentMonitor(db=app_db, runner=runner)
+    monitor = DeploymentMonitor(
+        portfolio_storage=SqlPortfolioStorage(app_db),
+        order_storage=SqlOrderStorage(app_db),
+        ledger=PaperLedger(storage=SqlPaperLedgerStorage(app_db), price_source=no_live_price),
+        runner=runner,
+        risk_state=RiskStateService(SqlRiskStateStorage(app_db), get_settings()),
+        calendar=get_market_calendar(),
+    )
     status = monitor.status("u1", row["deployment_id"])
     assert status["trading"] is False
     assert status["blocked_reason"], status
@@ -412,7 +501,7 @@ def test_monitoring_is_owner_scoped(app_db, idle_monitor):
     strategy_id, version = _strategy(app_db, definition=BREAKOUT)
     row = _deploy(app_db, strategy_id=strategy_id, version=version)
 
-    from atr.services.monitoring import MonitoringError
+    from forward.services.monitoring import MonitoringError
 
     with pytest.raises(MonitoringError) as caught:
         idle_monitor.status("someone-else", row["deployment_id"])
@@ -427,8 +516,15 @@ def test_the_overview_is_one_consistent_read(app_db, wired, monitor):
 
     overview = monitor.overview("u1", deployment_id)
     for key in (
-        "status", "pnl", "positions", "orders", "fills",
-        "signals", "trades", "risk", "timeline",
+        "status",
+        "pnl",
+        "positions",
+        "orders",
+        "fills",
+        "signals",
+        "trades",
+        "risk",
+        "timeline",
     ):
         assert key in overview, f"{key} missing from overview"
 
@@ -466,7 +562,7 @@ def test_a_deployment_with_no_activity_reports_empty_not_fabricated(app_db, idle
 # ---------------------------------------------------------------------------
 def test_pause_and_stop_detach_the_loop(app_db, wired):
     """Pause and stop are DB-driven: the runner drops the loop on the next pass."""
-    from atr.appdb.repositories import DeploymentRepository
+    from forward.appdb.deployment_repository import DeploymentRepository
 
     runner, deployment_id, _ = wired
     assert deployment_id in runner._loops
@@ -488,8 +584,9 @@ def test_stop_is_terminal_and_reset_replaces_rather_than_revives(app_db, wired):
     reviving it would leave "why is this still trading?" with no answer. The old
     row must remain readable, because ``order_events`` is append-only.
     """
-    from atr.appdb.repositories import DeploymentRepository
-    from atr.services.paper import DeploymentService
+    from forward.appdb.deployment_repository import DeploymentRepository
+    from forward.services.deployments import DeploymentService
+    from forward.services.paper_ledger import PaperLedger
 
     runner, deployment_id, _ = wired
     with app_db.session() as session:
@@ -498,9 +595,14 @@ def test_stop_is_terminal_and_reset_replaces_rather_than_revives(app_db, wired):
     with app_db.session() as session:
         assert DeploymentRepository.start(session, deployment_id, "u1") == 0
 
-    replacement = DeploymentService(db=app_db).reset(
-        "u1", deployment_id, reason="fresh account"
-    )
+    replacement = DeploymentService(
+        runner_interval_seconds=get_settings().runner_interval_seconds,
+        runner_lookback_days=get_settings().runner_lookback_days,
+        portfolio_storage=SqlPortfolioStorage(app_db),
+        storage=SqlPaperDeploymentStorage(app_db),
+        ledger=PaperLedger(storage=SqlPaperLedgerStorage(app_db), price_source=no_live_price),
+        forward_trade_storage=SqlForwardCheckStorage(app_db),
+    ).reset("u1", deployment_id, reason="fresh account")
     assert replacement["deployment_id"] != deployment_id
     assert replacement["reset_from"] == deployment_id
     assert float(replacement["capital"]) == 500_000.0
@@ -516,13 +618,35 @@ def test_a_running_deployment_is_recovered_after_a_restart(app_db, wired):
     This is requirement 6 — persistence across an application restart — and the
     mechanism is that the *database* is the source of truth, not the process.
     """
-    from atr.services.runner import PaperRunner
+    from forward.services.runner import PaperRunner
 
     _first, deployment_id, _tick = wired
     assert deployment_id in _first._loops
 
     # Simulate a restart: a brand new runner, no loops, same database.
-    revived = PaperRunner(db=app_db)
+    revived = PaperRunner(
+        interval_seconds=get_settings().runner_interval_seconds,
+        lookback_days=get_settings().runner_lookback_days,
+        minimum_sleep_seconds=get_settings().runner_min_sleep_seconds,
+        market_wait_seconds=get_settings().runner_market_wait_seconds,
+        symbol_retry_seconds=get_settings().deployment_symbol_retry_seconds,
+        signal_context=NoopSignalContextEnricher(),
+        daily_history=CachedMarketFramesAdapter(),
+        vwap_liquidity=NseBhavcopyLiquidityAdapter(get_settings().research_data_directory),
+        sector_table={},
+        instrument_lookup=order_instrument_lookup,
+        journal_storage=SqlTradeJournalStorage(app_db),
+        portfolio_storage=SqlPortfolioStorage(app_db),
+        ledger=PaperLedger(storage=SqlPaperLedgerStorage(app_db), price_source=no_live_price),
+        order_storage=SqlOrderStorage(app_db),
+        runner_storage=SqlPaperRunnerStorage(app_db),
+        state_storage=SqlSystemStateStorage(app_db),
+        risk_state=RiskStateService(SqlRiskStateStorage(app_db), get_settings()),
+        calendar=get_market_calendar(),
+        venue_provider=StaticRunnerVenueProvider(
+            prices=no_live_price, instruments=order_instrument_lookup
+        ),
+    )
     assert revived._loops == {}
     revived.sync_loops()
 
@@ -531,7 +655,7 @@ def test_a_running_deployment_is_recovered_after_a_restart(app_db, wired):
     # And it must recover the *rules*, not just the row: a loop that attaches
     # without resolvable rules is a deployment that looks recovered and trades
     # nothing.
-    resolved = revived.resolve_rules(loop)
+    resolved = revived.resolve_rules(loop.row)
     assert resolved is not None, loop.blocked_reason
     assert float(resolved[1].stop_loss_pct) == 3.0
 
@@ -552,13 +676,15 @@ def test_the_journal_opens_an_episode_from_the_fold(app_db, wired):
     # then find nothing to do rather than open a duplicate.
     runner.pass_once(now=SESSION)
 
-    from atr.services.journal import TradeJournalService
+    from forward.services.journal import TradeJournalService
 
-    result = TradeJournalService(db=app_db).reconcile("u1", deployment_id)
+    result = TradeJournalService(
+        storage=SqlTradeJournalStorage(app_db), ledger=runner.ledger
+    ).reconcile("u1", deployment_id)
     assert result["opened"] == [], result
     assert result["open_now"] == 1, result
 
-    from atr.appdb.repositories import TradeJournalRepository
+    from forward.appdb.trade_journal_repository import TradeJournalRepository
 
     with app_db.session() as session:
         rows, total = TradeJournalRepository.list_for_user(
@@ -582,18 +708,16 @@ def test_reconciling_is_idempotent(app_db, wired):
     runner, deployment_id, _ = wired
     runner.pass_once(now=SESSION)
 
-    from atr.services.journal import TradeJournalService
+    from forward.services.journal import TradeJournalService
 
-    from atr.services.journal import TradeJournalService
-
-    service = TradeJournalService(db=app_db)
+    service = TradeJournalService(storage=SqlTradeJournalStorage(app_db), ledger=runner.ledger)
     for _ in range(3):
         result = service.reconcile("u1", deployment_id)
         # Never a second episode for one position, however many times it runs.
         assert result["opened"] == [], result
         assert result["open_now"] == 1, result
 
-    from atr.appdb.repositories import TradeJournalRepository
+    from forward.appdb.trade_journal_repository import TradeJournalRepository
 
     with app_db.session() as session:
         rows, total = TradeJournalRepository.list_for_user(
@@ -607,31 +731,44 @@ def test_the_journal_closes_an_episode_when_the_book_goes_flat(app_db, wired):
     runner, deployment_id, tick = wired
     runner.pass_once(now=SESSION)
 
-    from atr.services.journal import TradeJournalService
+    from forward.services.journal import TradeJournalService
 
-    journal = TradeJournalService(db=app_db)
+    journal = TradeJournalService(storage=SqlTradeJournalStorage(app_db), ledger=runner.ledger)
     journal.reconcile("u1", deployment_id)
 
     # Flatten through the same pipeline, at a gain.
-    from atr.execution.oms import OrderDraft
-    from atr.services import paper as paper_service
-    from atr.services.execution import ExecutionService
-    from atr.services.orders import get_order_service
-    from atr.services.paper import PaperLedger
+    from forward.execution.oms import OrderDraft
+    from forward.services import paper_venue as paper_service
+    from forward.services.execution import ExecutionService
+    from forward.services.orders import get_order_service
+    from forward.services.paper_ledger import PaperLedger
 
-    ledger = PaperLedger(db=app_db)
+    ledger = PaperLedger(storage=SqlPaperLedgerStorage(app_db), price_source=no_live_price)
     portfolio = ledger.portfolio("u1", deployment_id=deployment_id)
     quantity = abs(float(portfolio.position(SYMBOL).quantity))
     assert quantity > 0
 
     exit_price = round(tick * 1.02, 2)
     ExecutionService(
-        orders=get_order_service(portfolio=portfolio),
-        venue=paper_service.paper_venue(lambda s, e: exit_price),
+        orders=get_order_service(
+            instruments=order_instrument_lookup,
+            storage=SqlOrderStorage(app_db),
+            risk=RiskStateService(SqlRiskStateStorage(app_db), get_settings()),
+            portfolio=portfolio,
+        ),
+        venue=paper_service.paper_venue(
+            lambda s, e: exit_price,
+            instruments=order_instrument_lookup,
+        ),
     ).place(
         OrderDraft(
-            user_id="u1", symbol=SYMBOL, side="SELL", quantity=quantity,
-            mode="PAPER", exchange=EXCHANGE, requested_price=exit_price,
+            user_id="u1",
+            symbol=SYMBOL,
+            side="SELL",
+            quantity=quantity,
+            mode="PAPER",
+            exchange=EXCHANGE,
+            requested_price=exit_price,
             deployment_id=deployment_id,
         )
     )
@@ -639,7 +776,7 @@ def test_the_journal_closes_an_episode_when_the_book_goes_flat(app_db, wired):
     result = journal.reconcile("u1", deployment_id)
     assert len(result["closed"]) == 1, result
 
-    from atr.appdb.repositories import TradeJournalRepository
+    from forward.appdb.trade_journal_repository import TradeJournalRepository
 
     with app_db.session() as session:
         rows, _ = TradeJournalRepository.list_for_user(
@@ -666,10 +803,12 @@ def test_the_journal_is_owner_scoped(app_db, wired):
     runner, deployment_id, _ = wired
     runner.pass_once(now=SESSION)
 
-    from atr.appdb.repositories import TradeJournalRepository
-    from atr.services.journal import TradeJournalService
+    from forward.appdb.trade_journal_repository import TradeJournalRepository
+    from forward.services.journal import TradeJournalService
 
-    TradeJournalService(db=app_db).reconcile("u1", deployment_id)
+    TradeJournalService(storage=SqlTradeJournalStorage(app_db), ledger=runner.ledger).reconcile(
+        "u1", deployment_id
+    )
 
     with app_db.session() as session:
         rows, total = TradeJournalRepository.list_for_user(
@@ -681,142 +820,52 @@ def test_the_journal_is_owner_scoped(app_db, wired):
 
 # ---------------------------------------------------------------------------
 # the trade journal
-# ---------------------------------------------------------------------------
-def test_the_journal_opens_an_episode_from_the_fold(app_db, wired):
-    """A position appearing in the fold must open exactly one episode.
+def test_overview_reuses_book_and_log_and_matches_individual_views(wired, monitor, monkeypatch):
+    from unittest.mock import Mock
 
-    The journal is a projection of the position fold rather than a second record
-    of trades — two records can disagree, and a journal that disagrees with the
-    account is worse than none because it looks like evidence.
-    """
-    runner, deployment_id, _ = wired
-    # ``pass_once`` reconciles the journal itself, so the episode exists by the
-    # time this returns — that is the point of the hook. A second reconcile must
-    # then find nothing to do rather than open a duplicate.
-    runner.pass_once(now=SESSION)
+    from forward.services import monitoring
 
-    from atr.services.journal import TradeJournalService
-
-    result = TradeJournalService(db=app_db).reconcile("u1", deployment_id)
-    assert result["opened"] == [], result
-    assert result["open_now"] == 1, result
-
-    from atr.appdb.repositories import TradeJournalRepository
-
-    with app_db.session() as session:
-        rows, total = TradeJournalRepository.list_for_user(
-            session, "u1", deployment_id=deployment_id
-        )
-    assert total == 1, rows
-    row = rows[0]
-    assert row["symbol"] == SYMBOL
-    assert row["side"] == "BUY"
-    assert row["quantity"] > 0
-    assert row["entry_price"] > 0
-    assert row["exit_ts"] is None
-    # Attribution and the reason survive into the journal, which is what makes a
-    # trade explainable a week later.
-    assert row["strategy_id"]
-    assert row["signal_reason"] and "breakout" in row["signal_reason"].lower()
-
-
-def test_reconciling_is_idempotent(app_db, wired):
-    """Running it twice must not open a second episode for the same position."""
-    runner, deployment_id, _ = wired
-    runner.pass_once(now=SESSION)
-
-    from atr.services.journal import TradeJournalService
-
-    from atr.services.journal import TradeJournalService
-
-    service = TradeJournalService(db=app_db)
-    for _ in range(3):
-        result = service.reconcile("u1", deployment_id)
-        # Never a second episode for one position, however many times it runs.
-        assert result["opened"] == [], result
-        assert result["open_now"] == 1, result
-
-    from atr.appdb.repositories import TradeJournalRepository
-
-    with app_db.session() as session:
-        rows, total = TradeJournalRepository.list_for_user(
-            session, "u1", deployment_id=deployment_id
-        )
-    assert total == 1, f"{total} episodes for one position"
-
-
-def test_the_journal_closes_an_episode_when_the_book_goes_flat(app_db, wired):
-    """Closing must record exit, P&L and duration rather than leaving it open."""
     runner, deployment_id, tick = wired
     runner.pass_once(now=SESSION)
-
-    from atr.services.journal import TradeJournalService
-
-    journal = TradeJournalService(db=app_db)
-    journal.reconcile("u1", deployment_id)
-
-    # Flatten through the same pipeline, at a gain.
-    from atr.execution.oms import OrderDraft
-    from atr.services import paper as paper_service
-    from atr.services.execution import ExecutionService
-    from atr.services.orders import get_order_service
-    from atr.services.paper import PaperLedger
-
-    ledger = PaperLedger(db=app_db)
-    portfolio = ledger.portfolio("u1", deployment_id=deployment_id)
-    quantity = abs(float(portfolio.position(SYMBOL).quantity))
-    assert quantity > 0
-
-    exit_price = round(tick * 1.02, 2)
-    ExecutionService(
-        orders=get_order_service(portfolio=portfolio),
-        venue=paper_service.paper_venue(lambda s, e: exit_price),
-    ).place(
-        OrderDraft(
-            user_id="u1", symbol=SYMBOL, side="SELL", quantity=quantity,
-            mode="PAPER", exchange=EXCHANGE, requested_price=exit_price,
-            deployment_id=deployment_id,
-        )
-    )
-
-    result = journal.reconcile("u1", deployment_id)
-    assert len(result["closed"]) == 1, result
-
-    from atr.appdb.repositories import TradeJournalRepository
-
-    with app_db.session() as session:
-        rows, _ = TradeJournalRepository.list_for_user(
-            session, "u1", deployment_id=deployment_id, closed_only=True
-        )
-    assert len(rows) == 1
-    closed = rows[0]
-    assert closed["exit_ts"] is not None
-    # The journal records the price that actually filled, not the quote asked of
-    # the venue: a paper fill carries slippage, and restating it as the requested
-    # price would understate every cost in the book by the slippage it ignored.
-    assert closed["exit_price"] == pytest.approx(exit_price, rel=0.01)
-    assert closed["exit_price"] != exit_price
-    # The exit is above the entry, so the episode is a gain — and net is below
-    # gross by the commission, which is the only pair worth showing together.
-    assert closed["gross_pnl"] > 0
-    assert closed["net_pnl"] < closed["gross_pnl"]
-    assert closed["mfe"] is not None
-    assert closed["mae"] is not None
+    snapshot = Mock(wraps=monitor.ledger.snapshot_and_fills)
+    fill_read = Mock(wraps=monitor.ledger.fills)
+    log = Mock(wraps=monitoring._read_log)
+    monkeypatch.setattr(monitor.ledger, "snapshot_and_fills", snapshot)
+    monkeypatch.setattr(monitor.ledger, "fills", fill_read)
+    monkeypatch.setattr(monitoring, "_read_log", log)
+    overview = monitor.overview("u1", deployment_id, prices={SYMBOL: tick})
+    assert snapshot.call_count == 1
+    assert fill_read.call_count == 1
+    assert log.call_count == 1
+    assert overview["fills"] == monitor.fills("u1", deployment_id)
+    assert overview["pnl"] == monitor.pnl("u1", deployment_id, prices={SYMBOL: tick})
+    assert overview["positions"] == overview["pnl"]["positions"]
+    assert overview["risk"]["observed"]["equity"] == overview["pnl"]["equity"]
+    assert overview["status"]["equity"] == overview["pnl"]["equity"]
+    assert overview["orders"] == monitor.orders("u1", deployment_id, limit=300)
+    assert overview["signals"] == monitor.signals("u1", deployment_id, limit=300)
+    timeline = monitor.timeline("u1", deployment_id, limit=300)
+    assert [row["summary"] for row in overview["timeline"]] == [entry.summary for entry in timeline]
+    monitor.overview("u1", deployment_id, prices={SYMBOL: tick + 10})
+    assert snapshot.call_count == 3
 
 
-def test_the_journal_is_owner_scoped(app_db, wired):
-    """One user's journal must not be visible to another."""
+def test_journal_reads_fills_once_per_reconcile(app_db, wired, monkeypatch):
+    from unittest.mock import Mock
+
+    from forward.services.journal import TradeJournalService
+    from forward.services.paper_ledger import PaperLedger
+
     runner, deployment_id, _ = wired
     runner.pass_once(now=SESSION)
-
-    from atr.appdb.repositories import TradeJournalRepository
-    from atr.services.journal import TradeJournalService
-
-    TradeJournalService(db=app_db).reconcile("u1", deployment_id)
-
-    with app_db.session() as session:
-        rows, total = TradeJournalRepository.list_for_user(
-            session, "not-the-owner", deployment_id=deployment_id
-        )
-    assert total == 0
-    assert rows == []
+    ledger = PaperLedger(storage=SqlPaperLedgerStorage(app_db), price_source=no_live_price)
+    read = Mock(wraps=ledger.fills)
+    monkeypatch.setattr(ledger, "fills", read)
+    journal = TradeJournalService(storage=SqlTradeJournalStorage(app_db), ledger=ledger)
+    first = journal.reconcile("u1", deployment_id)
+    assert read.call_count == 1
+    read.assert_called_once_with("u1", deployment_id=deployment_id, mode=None)
+    second = journal.reconcile("u1", deployment_id)
+    assert read.call_count == 2  # each reconcile reads current events
+    assert first == second
+    assert first["open_now"] == 1

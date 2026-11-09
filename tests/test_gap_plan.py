@@ -5,7 +5,7 @@ from datetime import date, timedelta
 import numpy as np
 import pytest
 
-from atr.research import gap_plan as gp
+from forward.research import gap_plan as gp
 
 MON = date(2026, 9, 21)  # a Monday
 
@@ -126,7 +126,7 @@ def test_a_market_that_did_not_rise_is_flagged_so_it_never_counts_as_the_strateg
 
     trade = store.read()["trades"][0]
     assert trade["market_ok"] is False
-    assert gp.summary(store, bars)["live"]["graded"] == 0  # and it is not in the strategy's own numbers
+    assert gp.summary(store.read(), bars)["live"]["graded"] == 0  # and it is not in the strategy's own numbers
 
 
 def test_recording_twice_does_not_duplicate_and_marks_replay_versus_live(tmp_path):
@@ -153,7 +153,7 @@ def test_the_summary_refuses_a_verdict_until_there_are_enough_live_trades(tmp_pa
     store = gp.Store(tmp_path / "gp.json")
     gp.update(store, bars, today=MON - timedelta(days=1))
 
-    s = gp.summary(store, bars)
+    s = gp.summary(store.read(), bars)
 
     assert s["verdict"].startswith("Too early")
     assert s["needed"] == gp.MIN_LIVE_TRADES

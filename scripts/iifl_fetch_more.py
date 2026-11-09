@@ -1,103 +1,113 @@
-"""Fetch 1-min data for additional liquid NIFTY stocks."""
-import sys, time
-from pathlib import Path
+"""Fetch configured additional IIFL minute history."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import time
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import pandas as pd
 
+from forward.brokers.iifl.auth import SessionStore
+from forward.brokers.iifl.client import IiflClient, _fmt_date
+from forward.brokers.iifl.contracts import InstrumentMaster
+from forward.brokers.iifl.feeds import candles_to_frame
+from forward.config.settings import get_settings
+
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "src"))
+CONFIG_PATH = ROOT / "config" / "fetch_iifl_additional_symbols.json"
 
-from atr.brokers.iifl.auth import SessionStore
-from atr.brokers.iifl.client import IiflClient, _fmt_date
-from atr.brokers.iifl.contracts import InstrumentMaster
-from atr.brokers.iifl.feeds import _candles, _candle_row
-from atr.config.settings import get_settings
 
-p = print
-def P(*a, **kw): kw.setdefault("flush", True); p(*a, **kw)
-
-MORE_SYMS = ["AXISBANK", "SBIN", "BAJFINANCE", "BAJAJFINSV",
-             "DRREDDY", "ASIANPAINT", "SUNPHARMA", "HCLTECH",
-             "ITC", "JSWSTEEL", "ADANIPORTS", "CIPLA",
-             "POWERGRID", "NTPC", "ONGC", "M&M"]
-
-def main():
-    s = get_settings()
-    store = SessionStore(s.iifl_session_cache)
+def main() -> int:
+    """Fetch the symbols and date range defined by the supplied config."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", type=Path, default=CONFIG_PATH)
+    config_path = parser.parse_args().config
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    print(f"Configuration: {config_path.resolve()}", flush=True)
+    settings = get_settings()
+    store = SessionStore(settings.iifl_session_cache)
     session = store.load()
-    if not session:
-        P("NO SESSION"); return 1
-    P(f"Session: {session.client_id}, expires {session.expires_at}")
+    if session is None:
+        print("No cached IIFL session. Run `forward login` first.", flush=True)
+        return 1
 
     client = IiflClient(
-        app_key=s.iifl_app_key, app_secret=s.iifl_app_secret,
-        session_store=store, timeout=30,
+        app_key=settings.iifl_app_key,
+        app_secret=settings.iifl_app_secret,
+        session_store=store,
     )
     client.set_session(session)
+    profile = client.profile()
+    print(f"Session: {session.client_id}, expires {session.expires_at}", flush=True)
+    print(f"Profile: {profile['result']['clientId']}", flush=True)
 
-    P("Profile:", client.profile().get("result", {}).get("clientId", "???"))
-
+    exchange = config["exchange"]
     master = InstrumentMaster(client)
-    P("Syncing instrument master...")
-    master.sync(["NSEEQ"])
+    master.sync([exchange])
 
-    cache = ROOT / "data" / "iifl_1min"
-    from_dt = datetime(2025, 9, 1)
-    to_dt = datetime(2026, 9, 15)
-
-    fetched = []
-    for sym in MORE_SYMS:
-        fpath = cache / f"{sym}.parquet"
-        if fpath.exists():
-            df = pd.read_parquet(fpath)
-            P(f"  {sym}: already cached ({len(df)} bars)")
-            fetched.append(sym)
+    cache_directory = ROOT / config["cache_directory"]
+    cache_directory.mkdir(parents=True, exist_ok=True)
+    from_date = datetime.fromisoformat(config["from_date"])
+    to_date = datetime.fromisoformat(config["to_date"])
+    fetched: list[str] = []
+    for symbol in config["symbols"]:
+        cache_path = cache_directory / f"{symbol}.parquet"
+        if config["skip_existing_cache"] and cache_path.exists():
+            frame = pd.read_parquet(cache_path)
+            print(f"  {symbol}: already cached ({len(frame)} bars)", flush=True)
+            fetched.append(symbol)
             continue
 
-        inst = master.search(sym, exchange="NSEEQ")
-        if inst.empty:
-            P(f"  {sym}: NOT FOUND"); continue
-        conid = str(inst.iloc[0]["conid"])
+        instruments = master.search(symbol, exchange=exchange)
+        if instruments.empty:
+            print(f"  {symbol}: not found in instrument master", flush=True)
+            continue
+        instrument_id = str(instruments.iloc[0]["conid"])
 
-        rows = []
-        cur = from_dt
-        n_chunks = 0
-        while cur < to_dt:
-            end = min(cur + timedelta(days=45), to_dt)
-            payload = client.historical_data(
-                "NSEEQ", conid, "1m", _fmt_date(cur), _fmt_date(end),
+        chunks: list[pd.DataFrame] = []
+        cursor = from_date
+        chunk_count = 0
+        while cursor < to_date:
+            chunk_end = min(
+                cursor + timedelta(days=config["chunk_days"]),
+                to_date,
             )
-            candles = _candles(payload)
-            for raw in candles:
-                row = _candle_row(raw)
-                if row:
-                    rows.append({
-                        "ts": pd.to_datetime(row["ts"]),
-                        "symbol": sym,
-                        "open": float(row["open"] or 0),
-                        "high": float(row["high"] or 0),
-                        "low": float(row["low"] or 0),
-                        "close": float(row["close"] or 0),
-                        "volume": float(row["volume"] or 0),
-                    })
-            n_chunks += 1
-            cur = end + timedelta(days=1)
-            time.sleep(0.05)
+            payload = client.historical_data(
+                exchange,
+                instrument_id,
+                config["interval"],
+                _fmt_date(cursor),
+                _fmt_date(chunk_end),
+            )
+            frame = candles_to_frame(payload)
+            if not frame.empty:
+                frame["symbol"] = symbol
+                chunks.append(frame)
+            chunk_count += 1
+            cursor = chunk_end + timedelta(days=1)
+            time.sleep(config["pause_between_chunks_seconds"])
 
-        if not rows:
-            P(f"  {sym}: no data"); continue
+        if not chunks:
+            print(f"  {symbol}: no data", flush=True)
+            continue
 
-        df = pd.DataFrame(rows).sort_values("ts").reset_index(drop=True)
-        df.to_parquet(fpath, index=False)
-        fetched.append(sym)
-        P(f"  {sym}: {len(df)} bars ({n_chunks} chunks)")
-        time.sleep(1.0)  # be kind to the API
+        frame = pd.concat(chunks, ignore_index=True).sort_values("ts").reset_index(drop=True)
+        frame.to_parquet(cache_path, index=False)
+        fetched.append(symbol)
+        print(f"  {symbol}: {len(frame)} bars ({chunk_count} chunks)", flush=True)
+        time.sleep(config["pause_between_symbols_seconds"])
 
-    P(f"\nFetched: {fetched}")
-    P(f"Total cached stocks: {len(list(cache.glob('*.parquet')))}")
+    print(f"\nFetched or cached: {fetched}", flush=True)
+    print(
+        f"Total cached stocks: {len(list(cache_directory.glob('*.parquet')))}",
+        flush=True,
+    )
     client.close()
     return 0
+
 
 if __name__ == "__main__":
     raise SystemExit(main())

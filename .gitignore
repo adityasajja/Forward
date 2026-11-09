@@ -4,7 +4,7 @@ __pycache__/
 *.egg-info/
 .eggs/
 
-# Anchored: an unanchored `data/` also matches src/atr/data/, which silently
+# Anchored: an unanchored `data/` also matches src/forward/data/, which silently
 # kept the whole data layer (base, csv_feed, history, store, synthetic,
 # aggregator) out of every commit. Anchor it to the repo root.
 /data/
@@ -22,6 +22,8 @@ uv.lock.bak
 # Frontend build output and dependencies
 node_modules/
 web/dist/
+# The web project uses its tracked Bun lockfile, not npm's duplicate lock.
+/web/package-lock.json
 
 # Verification artifacts: headless-browser screenshots and the throwaway
 # Chromium profiles they leave behind. Useful to look at, not to version —
@@ -53,3 +55,5 @@ web/dist/
 # Local editor and agent settings (per-machine, not part of the project)
 /.claude/
 /.commandcode/
+/reports
+/research

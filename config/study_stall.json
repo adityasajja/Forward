@@ -1,0 +1,13 @@
+{
+  "data_directory": "data/iifl_daily/NSEEQ",
+  "minimum_history_bars": 90,
+  "forward_horizons": [5, 10],
+  "feature_config": "config/stall_features.json",
+  "recent_run_return_pct": 10.0,
+  "recent_run_extension_pct": 8.0,
+  "near_high_distance_pct": 3.5,
+  "flat_return_pct": 2.5,
+  "stall_episode_days": 10,
+  "low_progress_thresholds_pct": [1.0, 2.0],
+  "drawdown_threshold_pct": -3.0
+}

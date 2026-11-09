@@ -19,23 +19,22 @@ from __future__ import annotations
 
 import pytest
 
-from atr.appdb.repositories import (
-    BacktestRunRepository,
-    DeploymentRepository,
-    DuplicateDefinition,
+from forward.appdb.backtest_repository import BacktestRunRepository
+from forward.appdb.deployment_repository import DeploymentRepository
+from forward.appdb.identity_repository import UserRepository
+from forward.appdb.order_event_repository import OrderEventRepository
+from forward.appdb.order_intent_repository import (
     IdempotencyConflict,
-    OrderEventRepository,
     OrderIntentRepository,
-    OrderRepository,
-    ReconciliationRepository,
-    ScreenerRepository,
-    StrategyRepository,
-    TradeJournalRepository,
-    UserRepository,
-    canonical_definition,
-    definition_hash,
 )
-from atr.execution.oms import idempotency_key_for
+from forward.appdb.order_repository import OrderRepository
+from forward.appdb.reconciliation_repository import ReconciliationRepository
+from forward.appdb.screener_repository import ScreenerRepository
+from forward.appdb.strategy_repository import StrategyRepository
+from forward.appdb.trade_journal_repository import TradeJournalRepository
+from forward.core.errors import DuplicateDefinition
+from forward.execution.oms import idempotency_key_for
+from forward.strategy.definition_identity import canonical_definition, definition_hash
 
 
 @pytest.fixture()

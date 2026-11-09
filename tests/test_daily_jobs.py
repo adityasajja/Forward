@@ -2,7 +2,7 @@
 
 from datetime import datetime
 
-from atr.jobs.daily import DailyJob, JobStore, is_due, run_if_due
+from forward.jobs.daily import DailyJob, JobStore, is_due, run_if_due
 
 MON_1AM = datetime(2026, 9, 21, 1, 0)
 MON_3AM = datetime(2026, 9, 21, 3, 0)

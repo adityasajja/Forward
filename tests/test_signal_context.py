@@ -15,21 +15,23 @@ bug if it drifted:
 from __future__ import annotations
 
 from datetime import timedelta
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import pytest
 
-from atr.appdb.engine import utcnow
-from atr.appdb.repositories import (
+from forward.appdb.backtest_repository import (
     BacktestArtefactRepository,
     BacktestRunRepository,
-    OrderRepository,
-    TradeJournalRepository,
-    UserRepository,
 )
-from atr.signal_context.engine import SignalContextEngine
-from atr.signal_context.service import SignalContextService
+from forward.appdb.engine import utcnow
+from forward.appdb.identity_repository import UserRepository
+from forward.appdb.order_repository import OrderRepository
+from forward.appdb.trade_journal_repository import TradeJournalRepository
+from forward.config.settings import get_settings
+from forward.signal_context.engine import SignalContextEngine
+from tests.market_data_fakes import signal_context_service_for_test
 
 CRITERIA = {
     "market_bullish_trend",
@@ -168,11 +170,13 @@ def _make_user(app_db, *, username: str = "owner") -> str:
 
 def test_record_list_get_roundtrip(app_db):
     user_id = _make_user(app_db)
-    service = SignalContextService(db=app_db)
+    service = signal_context_service_for_test(
+        app_db,
+        data_root=Path(get_settings().research_data_directory),
+    )
     context = _context(service.engine, signal_id="TCS:2024-06-03")
 
-    with app_db.session() as session:
-        assert service.record(session, context, user_id=user_id) == 1
+    assert service.record(context, user_id) == 1
 
     listing = service.list_signals(user_id)
     assert listing["total"] == 1
@@ -188,19 +192,24 @@ def test_record_list_get_roundtrip(app_db):
 
 def test_a_repeated_signal_does_not_double_record(app_db):
     user_id = _make_user(app_db)
-    service = SignalContextService(db=app_db)
+    service = signal_context_service_for_test(
+        app_db,
+        data_root=Path(get_settings().research_data_directory),
+    )
     context = _context(service.engine, signal_id="TCS:2024-06-03")
 
-    with app_db.session() as session:
-        assert service.record(session, context, user_id=user_id) == 1
-        assert service.record(session, context, user_id=user_id) == 0
+    assert service.record(context, user_id) == 1
+    assert service.record(context, user_id) == 0
 
     assert service.list_signals(user_id)["total"] == 1
 
 
 def test_backtest_outcomes_are_in_sample_and_suppressed(app_db):
     user_id = _make_user(app_db)
-    service = SignalContextService(db=app_db)
+    service = signal_context_service_for_test(
+        app_db,
+        data_root=Path(get_settings().research_data_directory),
+    )
 
     with app_db.session() as session:
         run = BacktestRunRepository.create(
@@ -234,8 +243,7 @@ def test_backtest_outcomes_are_in_sample_and_suppressed(app_db):
         trade_id = BacktestArtefactRepository.trades(session, run_id)[0]["trade_id"]
 
     context = _context(service.engine, signal_id=f"{run_id}:0", source="BACKTEST")
-    with app_db.session() as session:
-        service.record(session, context, user_id=user_id, run_id=run_id, trade_id=trade_id)
+    service.record(context, user_id, run_id=run_id, trade_id=trade_id)
 
     data = service.analytics(user_id, dimension="score_band")
     buckets = data["buckets"]
@@ -250,7 +258,10 @@ def test_backtest_outcomes_are_in_sample_and_suppressed(app_db):
 
 def test_live_outcomes_resolve_to_forward_evidence(app_db):
     user_id = _make_user(app_db)
-    service = SignalContextService(db=app_db)
+    service = signal_context_service_for_test(
+        app_db,
+        data_root=Path(get_settings().research_data_directory),
+    )
     signal_id = "TCS:2024-06-03"
 
     with app_db.session() as session:
@@ -285,8 +296,7 @@ def test_live_outcomes_resolve_to_forward_evidence(app_db):
         )
 
     context = _context(service.engine, signal_id=signal_id, source="PAPER")
-    with app_db.session() as session:
-        service.record(session, context, user_id=user_id)
+    service.record(context, user_id)
 
     data = service.analytics(user_id, dimension="context_class")
     buckets = data["buckets"]
@@ -301,7 +311,7 @@ def test_live_outcomes_resolve_to_forward_evidence(app_db):
 def test_enrich_run_computes_point_in_time_contexts(fresh_env, market_cache, app_db):
     """A completed run's trades get contexts computed from data up to each entry."""
     user_id = _make_user(app_db)
-    service = SignalContextService(db=app_db, data_root=market_cache)
+    service = signal_context_service_for_test(app_db, data_root=market_cache)
 
     daily = market_cache / "iifl_daily" / "NSEEQ"
     frame = pd.read_parquet(daily / "RELIANCE-EQ.parquet")
@@ -349,7 +359,10 @@ def test_enrich_run_computes_point_in_time_contexts(fresh_env, market_cache, app
 def test_enrichment_failure_never_propagates(app_db, monkeypatch):
     """A broken annotation is a logged miss, not an exception in the caller."""
     user_id = _make_user(app_db)
-    service = SignalContextService(db=app_db)
+    service = signal_context_service_for_test(
+        app_db,
+        data_root=Path(get_settings().research_data_directory),
+    )
 
     def _boom(*_args, **_kwargs):
         raise RuntimeError("scan unavailable")

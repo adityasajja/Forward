@@ -23,7 +23,7 @@ TEST_SCENARIOS = [
         "state": {
             "symbol": "NIFTY50",
             "price_action": "Breaking out to all-time highs above 20-day high with expanding volume",
-            "atr_pct": 1.1,
+            "forward_pct": 1.1,
             "adx": 34.5,
             "rsi": 68.2,
             "return_20d_pct": 5.4,
@@ -36,7 +36,7 @@ TEST_SCENARIOS = [
         "state": {
             "symbol": "BANKNIFTY",
             "price_action": "Sustained selling, trading below 20, 50, and 200 daily moving averages with heavy distribution volume",
-            "atr_pct": 2.4,
+            "forward_pct": 2.4,
             "adx": 38.0,
             "rsi": 28.5,
             "return_20d_pct": -7.2,
@@ -49,7 +49,7 @@ TEST_SCENARIOS = [
         "state": {
             "symbol": "RELIANCE",
             "price_action": "Consolidating inside a tight 2% band over the last 30 sessions, low volume, flat moving averages",
-            "atr_pct": 0.8,
+            "forward_pct": 0.8,
             "adx": 12.4,
             "rsi": 49.0,
             "return_20d_pct": 0.3,
@@ -62,7 +62,7 @@ TEST_SCENARIOS = [
         "state": {
             "symbol": "INDIAVIX",
             "price_action": "Massive gap downs, sudden 4% intraday swings, emergency rate hike and geopolitical shock",
-            "atr_pct": 5.8,
+            "forward_pct": 5.8,
             "adx": 22.0,
             "rsi": 32.0,
             "return_20d_pct": -8.5,

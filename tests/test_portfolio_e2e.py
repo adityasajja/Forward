@@ -14,26 +14,28 @@ Verifies:
 
 from __future__ import annotations
 
-from typing import Any
 import pytest
 
-from atr.appdb.engine import AppDatabase
-from atr.execution.oms import OrderDraft, idempotency_key_for
-from atr.services.execution import ExecutionService
-from atr.services.orders import get_order_service
-from atr.services.paper import DeploymentError, DeploymentService, PaperLedger, PaperVenue
-from atr.services.portfolio import (
-    BookPosition,
-    DeploymentSlice,
-    PortfolioBook,
-    PortfolioPolicy,
-    PortfolioService,
-    check_strategy_capital,
-    evaluate_order,
-    policy_from_dict,
-    portfolio_gate_for,
-    sector_resolver,
-)
+from forward.appdb.engine import AppDatabase
+from forward.appdb.forward_check_storage import SqlForwardCheckStorage
+from forward.appdb.order_storage import SqlOrderStorage
+from forward.appdb.paper_deployment_storage import SqlPaperDeploymentStorage
+from forward.appdb.paper_ledger_storage import SqlPaperLedgerStorage
+from forward.appdb.portfolio_storage import SqlPortfolioStorage
+from forward.appdb.risk_state_storage import SqlRiskStateStorage
+from forward.config.settings import get_settings
+from forward.execution.oms import OrderDraft, idempotency_key_for
+from forward.services.deployments import DeploymentError, DeploymentService
+from forward.services.execution import ExecutionService
+from forward.services.orders import get_order_service
+from forward.services.paper_ledger import PaperLedger
+from forward.services.portfolio import PortfolioService
+from forward.services.portfolio_policy import policy_from_dict
+from forward.services.portfolio_risk import portfolio_gate_for
+from forward.services.risk import RiskStateService
+from tests.order_fakes import order_instrument_lookup
+from tests.paper_price_fakes import no_live_price
+from tests.paper_venue_factory import configured_paper_venue as PaperVenue
 
 
 @pytest.fixture
@@ -43,7 +45,7 @@ def test_db(tmp_path) -> AppDatabase:
 
 
 def _create_user(db: AppDatabase, username: str = "user_e2e") -> str:
-    from atr.appdb.repositories import UserRepository
+    from forward.appdb.identity_repository import UserRepository
 
     with db.session() as session:
         user = UserRepository.create(
@@ -59,7 +61,7 @@ def _create_user(db: AppDatabase, username: str = "user_e2e") -> str:
 def test_strategy_capital_cap_and_isolation(test_db: AppDatabase) -> None:
     """1 & 2: Capital allocation per deployment and strategy limit enforcement."""
     user_id = _create_user(test_db, "user_cap_iso")
-    port_service = PortfolioService(db=test_db)
+    port_service = PortfolioService(storage=SqlPortfolioStorage(test_db))
 
     # Set portfolio policy with max 200,000 per strategy
     policy = policy_from_dict(
@@ -70,7 +72,14 @@ def test_strategy_capital_cap_and_isolation(test_db: AppDatabase) -> None:
     )
     port_service.set_policy(user_id, policy, actor="tester", reason="initial test policy")
 
-    dep_service = DeploymentService(db=test_db)
+    dep_service = DeploymentService(
+        runner_interval_seconds=get_settings().runner_interval_seconds,
+        runner_lookback_days=get_settings().runner_lookback_days,
+        portfolio_storage=SqlPortfolioStorage(test_db),
+        storage=SqlPaperDeploymentStorage(test_db),
+        ledger=PaperLedger(storage=SqlPaperLedgerStorage(test_db), price_source=no_live_price),
+        forward_trade_storage=SqlForwardCheckStorage(test_db),
+    )
 
     # Strategy 1: Momentum V3 - allocate 150,000 (passes)
     dep1 = dep_service.create(
@@ -132,11 +141,18 @@ def test_three_strategies_pipeline_and_conflict_handling(test_db: AppDatabase) -
     - Idempotent order execution (no duplicates)
     """
     user_id = _create_user(test_db, "user_e2e_3strat")
-    port_service = PortfolioService(db=test_db)
-    ledger = PaperLedger(db=test_db)
+    port_service = PortfolioService(storage=SqlPortfolioStorage(test_db))
+    ledger = PaperLedger(storage=SqlPaperLedgerStorage(test_db), price_source=no_live_price)
 
     # 3 deployments
-    dep_service = DeploymentService(db=test_db, ledger=ledger)
+    dep_service = DeploymentService(
+        runner_interval_seconds=get_settings().runner_interval_seconds,
+        runner_lookback_days=get_settings().runner_lookback_days,
+        portfolio_storage=SqlPortfolioStorage(test_db),
+        storage=SqlPaperDeploymentStorage(test_db),
+        ledger=ledger,
+        forward_trade_storage=SqlForwardCheckStorage(test_db),
+    )
     d1 = dep_service.create(user_id, strategy_id="strat_mom", strategy_version=1, capital=200_000.0)
     d2 = dep_service.create(user_id, strategy_id="strat_brk", strategy_version=1, capital=150_000.0)
     d3 = dep_service.create(user_id, strategy_id="strat_rev", strategy_version=1, capital=100_000.0)
@@ -146,7 +162,11 @@ def test_three_strategies_pipeline_and_conflict_handling(test_db: AppDatabase) -
     dep3_id = d3["deployment_id"]
 
     prices = {"RELIANCE": 2500.0, "TCS": 3500.0, "INFY": 1500.0}
-    venue = PaperVenue(prices=lambda s, e: prices.get(s, 2500.0))
+    venue = PaperVenue(
+        prices=lambda s, e: prices.get(s, 2500.0),
+        instruments=order_instrument_lookup,
+        max_tick_age_seconds=None,
+    )
 
     # Configure Portfolio Policy:
     # - max_stock_exposure: 100,000 (at 2,500/share, max 40 shares across whole portfolio)
@@ -169,8 +189,19 @@ def test_three_strategies_pipeline_and_conflict_handling(test_db: AppDatabase) -
 
     def make_executor(dep_id: str) -> ExecutionService:
         portfolio = ledger.portfolio(user_id, deployment_id=dep_id, prices=prices)
-        port_gate = portfolio_gate_for(user_id, dep_id, ledger=ledger, prices=prices, db=test_db)
-        orders = get_order_service(portfolio=portfolio, portfolio_gate=port_gate, db=test_db)
+        port_gate = portfolio_gate_for(
+            user_id,
+            prices=prices,
+            storage=SqlPortfolioStorage(test_db),
+            sector_table={},
+        )
+        orders = get_order_service(
+            instruments=order_instrument_lookup,
+            storage=SqlOrderStorage(test_db),
+            risk=RiskStateService(SqlRiskStateStorage(test_db), get_settings()),
+            portfolio=portfolio,
+            portfolio_gate=port_gate,
+        )
         return ExecutionService(orders=orders, venue=venue)
 
     # 1. Strategy 1 (strat_mom) buys 20 RELIANCE @ 2,500 (50,000 exposure) -> ALLOWED & FILLED
@@ -217,7 +248,6 @@ def test_three_strategies_pipeline_and_conflict_handling(test_db: AppDatabase) -
         strategy_version=1,
     )
     res2 = exec2.place(draft2)
-    print("RES2 REJECT REASON:", res2.order.get("reject_reason"))
     assert res2.order["status"] == "FILLED"
 
     # 3. Strategy 3 (strat_rev) tries to SELL RELIANCE (short) while Strategies 1 & 2 are LONG
@@ -295,7 +325,7 @@ def test_three_strategies_pipeline_and_conflict_handling(test_db: AppDatabase) -
     assert "would exceed 100,000" in res1_excess.order["reject_reason"]
 
     # 7. Verify Portfolio Control Center aggregation
-    cc = port_service.control_center(user_id, prices=prices)
+    cc = port_service.control_center(user_id, prices=prices, sector_table={})
     assert cc["policy_configured"] is True
     assert cc["capital"]["total"] == 450_000.0
     assert cc["exposure"]["gross"] > 0
@@ -323,7 +353,7 @@ def test_realized_today_buckets_by_ist_not_utc(test_db: AppDatabase) -> None:
     from datetime import datetime
     from zoneinfo import ZoneInfo
 
-    from atr.appdb.repositories import TradeJournalRepository
+    from forward.appdb.trade_journal_repository import TradeJournalRepository
 
     IST = ZoneInfo("Asia/Kolkata")
     user_id = _create_user(test_db, "today_user")
@@ -331,15 +361,24 @@ def test_realized_today_buckets_by_ist_not_utc(test_db: AppDatabase) -> None:
     exit_ts = datetime(2026, 9, 26, 19, 0)
     with test_db.session() as session:
         trade = TradeJournalRepository.open_trade(
-            session, user_id=user_id, symbol="RELIANCE", side="BUY",
-            quantity=10, entry_price=2500.0,
+            session,
+            user_id=user_id,
+            symbol="RELIANCE",
+            side="BUY",
+            quantity=10,
+            entry_price=2500.0,
         )
         TradeJournalRepository.close_trade(
-            session, trade["trade_id"], user_id,
-            exit_price=2510.0, gross_pnl=100.0, net_pnl=95.0, exit_ts=exit_ts,
+            session,
+            trade["trade_id"],
+            user_id,
+            exit_price=2510.0,
+            gross_pnl=100.0,
+            net_pnl=95.0,
+            exit_ts=exit_ts,
         )
 
-    service = PortfolioService(db=test_db)
+    service = PortfolioService(storage=SqlPortfolioStorage(test_db))
     morning_ist = datetime(2026, 9, 27, 8, 0, tzinfo=IST)
     assert service.realized_today(user_id, now=morning_ist) == pytest.approx(95.0)
     # And the evening before (Sep 26 IST) must not claim a trade that

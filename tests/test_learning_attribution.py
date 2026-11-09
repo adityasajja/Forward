@@ -1,7 +1,7 @@
 """Reading structure out of ``signal_reason`` without inventing any.
 
 The strings in this file are copied verbatim from the f-string templates in
-``atr.signals.rules.eval_entry`` and ``SmaCrossoverStrategy.describe_signal``.
+``forward.signals.rules.eval_entry`` and ``SmaCrossoverStrategy.describe_signal``.
 That matters: a parser tested against a hand-written example that resembles the
 real format will pass while the real format fails, which is the class of bug
 that puts a wrong number in a features column and leaves it there.
@@ -14,8 +14,7 @@ from __future__ import annotations
 
 import pytest
 
-from atr.research import learning_attribution as attribution
-
+from forward.research import learning_attribution as attribution
 
 TREND_PULLBACK = "uptrend (SMA20 1,431.82 > SMA50 1,420.55) with RSI 47"
 BREAKOUT = "within 2.0% of the 63-bar high 1,431.82 on 2.4x average volume"

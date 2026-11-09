@@ -7,15 +7,30 @@ from datetime import date, datetime
 import numpy as np
 import pandas as pd
 
-from atr.market_calendar import IST, NSEMarketCalendar
-from atr.signals.models import EntryRules, ExitRules, SessionContext
-from atr.signals.rules import eval_entry, eval_exit
-from atr.signals.session import (
+from forward.appdb.order_storage import SqlOrderStorage
+from forward.appdb.paper_ledger_storage import SqlPaperLedgerStorage
+from forward.appdb.paper_runner_storage import SqlPaperRunnerStorage
+from forward.appdb.portfolio_storage import SqlPortfolioStorage
+from forward.appdb.risk_state_storage import SqlRiskStateStorage
+from forward.appdb.system_state_storage import SqlSystemStateStorage
+from forward.appdb.trade_journal_storage import SqlTradeJournalStorage
+from forward.config.settings import get_settings
+from forward.data.cached_market_frames import CachedMarketFramesAdapter
+from forward.data.vwap_liquidity import NseBhavcopyLiquidityAdapter
+from forward.market_calendar import IST, NSEMarketCalendar, get_market_calendar
+from forward.services.paper_ledger import PaperLedger
+from forward.services.risk import RiskStateService
+from forward.signals.models import EntryRules, ExitRules, SessionContext
+from forward.signals.rules import eval_entry, eval_exit
+from forward.signals.session import (
     build_context,
     is_last_session_of_week,
     prior_session,
     week_end_close,
 )
+from tests.market_data_fakes import NoopSignalContextEnricher
+from tests.order_fakes import order_instrument_lookup
+from tests.paper_price_fakes import StaticRunnerVenueProvider, no_live_price
 
 MONDAY = date(2026, 9, 21)
 FRIDAY_AFTER = date(2026, 9, 25)
@@ -25,7 +40,13 @@ FRIDAY = date(2026, 9, 18)
 def _frame(prior_close: float, live: float, with_ts: bool = False) -> pd.DataFrame:
     closes = np.append(np.full(60, prior_close), live)
     frame = pd.DataFrame(
-        {"open": closes, "high": closes, "low": closes, "close": closes, "volume": np.full(61, 1000.0)}
+        {
+            "open": closes,
+            "high": closes,
+            "low": closes,
+            "close": closes,
+            "volume": np.full(61, 1000.0),
+        }
     )
     if with_ts:
         days = pd.bdate_range(end=pd.Timestamp(FRIDAY), periods=60)
@@ -34,13 +55,25 @@ def _frame(prior_close: float, live: float, with_ts: bool = False) -> pd.DataFra
 
 
 def _rules(**kw) -> EntryRules:
-    base = dict(setup="gap_down", gap_down_pct=1.0, gap_market_min_pct=1.0, gap_weekday=0, gap_entry_minutes=15.0)
+    base = dict(
+        setup="gap_down",
+        gap_down_pct=1.0,
+        gap_market_min_pct=1.0,
+        gap_weekday=0,
+        gap_entry_minutes=15.0,
+    )
     base.update(kw)
     return EntryRules(**base)
 
 
 def _ctx(**kw) -> SessionContext:
-    base = dict(today=MONDAY, prior_session=FRIDAY, open_price=98.0, minutes_since_open=1.0, market_week_pct=1.5)
+    base = dict(
+        today=MONDAY,
+        prior_session=FRIDAY,
+        open_price=98.0,
+        minutes_since_open=1.0,
+        market_week_pct=1.5,
+    )
     base.update(kw)
     return SessionContext(**base)
 
@@ -86,7 +119,9 @@ def test_stale_history_is_refused():
 
 
 def test_a_backtest_cannot_use_the_filters_it_cannot_see():
-    assert eval_entry("X", _frame(100, 98.0), _rules(gap_market_min_pct=None, gap_weekday=None), None)
+    assert eval_entry(
+        "X", _frame(100, 98.0), _rules(gap_market_min_pct=None, gap_weekday=None), None
+    )
     assert not eval_entry("X", _frame(100, 98.0), _rules(), None)
 
 
@@ -97,8 +132,14 @@ def test_a_strategy_without_the_setup_never_gap_trades():
 
 # ---- exits ---------------------------------------------------------------
 def _exits() -> ExitRules:
-    return ExitRules(stop_loss_pct=5.0, take_profit_pct=3.0, trailing_stop_pct=None, trend_sma=0,
-                     rsi_overbought=None, exit_at_week_end=True)
+    return ExitRules(
+        stop_loss_pct=5.0,
+        take_profit_pct=3.0,
+        trailing_stop_pct=None,
+        trend_sma=0,
+        rsi_overbought=None,
+        exit_at_week_end=True,
+    )
 
 
 def _names(signals):
@@ -106,21 +147,35 @@ def _names(signals):
 
 
 def test_sells_at_the_target_and_at_the_stop():
-    assert "take_profit" in _names(eval_exit("X", _frame(100, 103.2), 100.0, _exits(), context=_ctx()))
+    assert "take_profit" in _names(
+        eval_exit("X", _frame(100, 103.2), 100.0, _exits(), context=_ctx())
+    )
     assert "stop_loss" in _names(eval_exit("X", _frame(100, 94.9), 100.0, _exits(), context=_ctx()))
     assert _names(eval_exit("X", _frame(100, 101.0), 100.0, _exits(), context=_ctx())) == []
 
 
 def test_sells_at_the_close_of_the_weeks_last_session_only():
     friday_close = _ctx(today=FRIDAY, week_end_close=True)
-    assert "week_end" in _names(eval_exit("X", _frame(100, 101.0), 100.0, _exits(), context=friday_close))
-    assert "week_end" not in _names(eval_exit("X", _frame(100, 101.0), 100.0, _exits(), context=_ctx()))
+    assert "week_end" in _names(
+        eval_exit("X", _frame(100, 101.0), 100.0, _exits(), context=friday_close)
+    )
+    assert "week_end" not in _names(
+        eval_exit("X", _frame(100, 101.0), 100.0, _exits(), context=_ctx())
+    )
 
 
 def test_week_end_is_off_unless_asked_for():
-    plain = ExitRules(stop_loss_pct=5.0, take_profit_pct=None, trailing_stop_pct=None, trend_sma=0, rsi_overbought=None)
+    plain = ExitRules(
+        stop_loss_pct=5.0,
+        take_profit_pct=None,
+        trailing_stop_pct=None,
+        trend_sma=0,
+        rsi_overbought=None,
+    )
     friday_close = _ctx(today=FRIDAY, week_end_close=True)
-    assert "week_end" not in _names(eval_exit("X", _frame(100, 101.0), 100.0, plain, context=friday_close))
+    assert "week_end" not in _names(
+        eval_exit("X", _frame(100, 101.0), 100.0, plain, context=friday_close)
+    )
 
 
 # ---- the calendar --------------------------------------------------------
@@ -145,8 +200,13 @@ def test_week_end_close_starts_at_quarter_past_three():
 
 
 def test_the_market_reading_is_left_out_unless_asked_for():
-    ctx = build_context(datetime(2026, 9, 21, 9, 20, tzinfo=IST), NSEMarketCalendar(), None,
-                        open_price=99.0, minutes_since_open=5.0)
+    ctx = build_context(
+        datetime(2026, 9, 21, 9, 20, tzinfo=IST),
+        NSEMarketCalendar(),
+        None,
+        open_price=99.0,
+        minutes_since_open=5.0,
+    )
     assert ctx.market_week_pct is None and ctx.today == MONDAY and ctx.prior_session == FRIDAY
 
 
@@ -156,54 +216,120 @@ import pytest  # noqa: E402
 SYMBOL = "TESTCO"
 DEFINITION = {
     "rules": {
-        "entry": {"setup": "gap_down", "gap_down_pct": 1.0, "gap_market_min_pct": 1.0, "gap_weekday": 0,
-                  "gap_entry_minutes": 15.0, "min_history_bars": 60},
-        "exit": {"stop_loss_pct": 5.0, "take_profit_pct": 3.0, "trailing_stop_pct": None, "trend_sma": 0,
-                 "rsi_overbought": None, "exit_at_week_end": True, "min_history_bars": 60},
+        "entry": {
+            "setup": "gap_down",
+            "gap_down_pct": 1.0,
+            "gap_market_min_pct": 1.0,
+            "gap_weekday": 0,
+            "gap_entry_minutes": 15.0,
+            "min_history_bars": 60,
+        },
+        "exit": {
+            "stop_loss_pct": 5.0,
+            "take_profit_pct": 3.0,
+            "trailing_stop_pct": None,
+            "trend_sma": 0,
+            "rsi_overbought": None,
+            "exit_at_week_end": True,
+            "min_history_bars": 60,
+        },
     },
 }
 
 
 def _history() -> pd.DataFrame:
     days = pd.bdate_range(end=pd.Timestamp(FRIDAY), periods=300)
-    return pd.DataFrame({"ts": days, "open": 100.0, "high": 100.5, "low": 99.5, "close": 100.0,
-                         "volume": 1000.0})
+    return pd.DataFrame(
+        {"ts": days, "open": 100.0, "high": 100.5, "low": 99.5, "close": 100.0, "volume": 1000.0}
+    )
 
 
 @pytest.fixture()
 def gap_run(app_db, monkeypatch):
-    from atr.appdb.repositories import DeploymentRepository, StrategyRepository
-    from atr.appdb.schema import users
-    from atr.services import paper as paper_service
-    from atr.services import runner as runner_module
+    from forward.appdb.account_schema import users
+    from forward.appdb.deployment_repository import DeploymentRepository
+    from forward.appdb.strategy_repository import StrategyRepository
+    from forward.services import runner as runner_module
 
-    paper_service.install_live_source(None)
-    monkeypatch.setattr("atr.signals.engine.load_daily", lambda symbol, exchange="NSEEQ", **kw: _history())
+    monkeypatch.setattr(
+        "forward.data.cached_market_frames.load_daily_from_cache",
+        lambda symbol, exchange="NSEEQ", **kw: _history(),
+    )
     monkeypatch.setattr(runner_module._MARKET_WEEK, "pct", lambda today, prior: 1.5)
 
     with app_db.session() as session:
-        session.execute(users.insert().values(
-            user_id="u_gap", email="gap@example.com", username="gap", display_name="Gap",
-            password_hash="x", role="owner", is_active=True, mfa_enabled=False, failed_logins=0,
-            created_at=datetime(2026, 1, 1), updated_at=datetime(2026, 1, 1)))
-        strategy = StrategyRepository.create(session, user_id="u_gap", name="Monday gap", kind="rules")
+        session.execute(
+            users.insert().values(
+                user_id="u_gap",
+                email="gap@example.com",
+                username="gap",
+                display_name="Gap",
+                password_hash="x",
+                role="owner",
+                is_active=True,
+                mfa_enabled=False,
+                failed_logins=0,
+                created_at=datetime(2026, 1, 1),
+                updated_at=datetime(2026, 1, 1),
+            )
+        )
+        strategy = StrategyRepository.create(
+            session, user_id="u_gap", name="Monday gap", kind="rules"
+        )
         version = StrategyRepository.create_version(
-            session, strategy_id=strategy["strategy_id"], author_user_id="u_gap", definition=DEFINITION)
+            session,
+            strategy_id=strategy["strategy_id"],
+            author_user_id="u_gap",
+            definition=DEFINITION,
+        )
         deployment = DeploymentRepository.create(
-            session, user_id="u_gap", strategy_id=strategy["strategy_id"], strategy_version=int(version["version"]),
-            mode="PAPER", capital=500_000.0, status="RUNNING",
-            config={"symbols": [SYMBOL], "exchange": "NSEEQ", "signal_basis": "live", "order_value": 25_000.0, "lookback_days": 400,
-                    "max_open_positions": 20})
+            session,
+            user_id="u_gap",
+            strategy_id=strategy["strategy_id"],
+            strategy_version=int(version["version"]),
+            mode="PAPER",
+            capital=500_000.0,
+            status="RUNNING",
+            config={
+                "symbols": [SYMBOL],
+                "exchange": "NSEEQ",
+                "signal_basis": "live",
+                "timeframe": "1d",
+                "lookback_days": 400,
+                "max_open_positions": 20,
+            },
+        )
 
-    from atr.services.runner import PaperRunner
+    from forward.services.runner import PaperRunner
 
-    runner = PaperRunner(db=app_db)
+    runner = PaperRunner(
+        interval_seconds=get_settings().runner_interval_seconds,
+        lookback_days=get_settings().runner_lookback_days,
+        minimum_sleep_seconds=get_settings().runner_min_sleep_seconds,
+        market_wait_seconds=get_settings().runner_market_wait_seconds,
+        symbol_retry_seconds=get_settings().deployment_symbol_retry_seconds,
+        signal_context=NoopSignalContextEnricher(),
+        calendar=get_market_calendar(),
+        venue_provider=StaticRunnerVenueProvider(
+            prices=no_live_price, instruments=order_instrument_lookup
+        ),
+        daily_history=CachedMarketFramesAdapter(),
+        vwap_liquidity=NseBhavcopyLiquidityAdapter(get_settings().research_data_directory),
+        sector_table={},
+        instrument_lookup=order_instrument_lookup,
+        journal_storage=SqlTradeJournalStorage(app_db),
+        portfolio_storage=SqlPortfolioStorage(app_db),
+        ledger=PaperLedger(storage=SqlPaperLedgerStorage(app_db), price_source=no_live_price),
+        order_storage=SqlOrderStorage(app_db),
+        runner_storage=SqlPaperRunnerStorage(app_db),
+        state_storage=SqlSystemStateStorage(app_db),
+        risk_state=RiskStateService(SqlRiskStateStorage(app_db), get_settings()),
+    )
     runner.sync_loops()
     loop = runner._loops[deployment["deployment_id"]]
     feed: dict[str, float] = {}
     loop.venue.prices = lambda sym, exch: feed.get(sym.upper())
     yield runner, feed
-    paper_service.install_live_source(None)
 
 
 def _at(day: date, hour: int, minute: int) -> datetime:
@@ -237,7 +363,7 @@ def test_no_gap_trade_on_a_tuesday(gap_run):
 
 
 def test_no_gap_trade_when_the_market_reading_is_missing(gap_run, monkeypatch):
-    from atr.services import runner as runner_module
+    from forward.services import runner as runner_module
 
     monkeypatch.setattr(runner_module._MARKET_WEEK, "pct", lambda today, prior: None)
     runner, feed = gap_run
@@ -258,33 +384,86 @@ def test_a_trade_still_open_on_friday_is_sold_at_the_close(gap_run):
 
 
 def test_a_full_book_is_filled_by_the_deepest_gaps_not_the_first_names(app_db, monkeypatch):
-    from atr.appdb.repositories import DeploymentRepository, StrategyRepository
-    from atr.appdb.schema import users
-    from atr.services import paper as paper_service
-    from atr.services import runner as runner_module
-    from atr.services.runner import PaperRunner
+    from forward.appdb.account_schema import users
+    from forward.appdb.deployment_repository import DeploymentRepository
+    from forward.appdb.strategy_repository import StrategyRepository
+    from forward.services import runner as runner_module
+    from forward.services.runner import PaperRunner
 
-    paper_service.install_live_source(None)
-    monkeypatch.setattr("atr.signals.engine.load_daily", lambda symbol, exchange="NSEEQ", **kw: _history())
+    monkeypatch.setattr(
+        "forward.data.cached_market_frames.load_daily_from_cache",
+        lambda symbol, exchange="NSEEQ", **kw: _history(),
+    )
     monkeypatch.setattr(runner_module._MARKET_WEEK, "pct", lambda today, prior: 1.5)
     names = ["AAA", "BBB", "CCC", "DDD"]  # list order is the reverse of gap depth
     opens = {"AAA": 98.9, "BBB": 98.0, "CCC": 96.0, "DDD": 90.0}
 
     with app_db.session() as session:
-        session.execute(users.insert().values(
-            user_id="u_rank", email="r@example.com", username="rank", display_name="Rank",
-            password_hash="x", role="owner", is_active=True, mfa_enabled=False, failed_logins=0,
-            created_at=datetime(2026, 1, 1), updated_at=datetime(2026, 1, 1)))
-        strategy = StrategyRepository.create(session, user_id="u_rank", name="Monday gap", kind="rules")
+        session.execute(
+            users.insert().values(
+                user_id="u_rank",
+                email="r@example.com",
+                username="rank",
+                display_name="Rank",
+                password_hash="x",
+                role="owner",
+                is_active=True,
+                mfa_enabled=False,
+                failed_logins=0,
+                created_at=datetime(2026, 1, 1),
+                updated_at=datetime(2026, 1, 1),
+            )
+        )
+        strategy = StrategyRepository.create(
+            session, user_id="u_rank", name="Monday gap", kind="rules"
+        )
         version = StrategyRepository.create_version(
-            session, strategy_id=strategy["strategy_id"], author_user_id="u_rank", definition=DEFINITION)
+            session,
+            strategy_id=strategy["strategy_id"],
+            author_user_id="u_rank",
+            definition=DEFINITION,
+        )
         DeploymentRepository.create(
-            session, user_id="u_rank", strategy_id=strategy["strategy_id"], strategy_version=int(version["version"]),
-            mode="PAPER", capital=500_000.0, status="RUNNING",
-            config={"symbols": names, "exchange": "NSEEQ", "signal_basis": "live", "order_value": 25_000.0, "lookback_days": 400,
-                    "max_open_positions": 2})
+            session,
+            user_id="u_rank",
+            strategy_id=strategy["strategy_id"],
+            strategy_version=int(version["version"]),
+            mode="PAPER",
+            capital=500_000.0,
+            status="RUNNING",
+            config={
+                "symbols": names,
+                "exchange": "NSEEQ",
+                "signal_basis": "live",
+                "timeframe": "1d",
+                "lookback_days": 400,
+                "max_open_positions": 2,
+            },
+        )
 
-    runner = PaperRunner(db=app_db)
+    runner = PaperRunner(
+        interval_seconds=get_settings().runner_interval_seconds,
+        lookback_days=get_settings().runner_lookback_days,
+        minimum_sleep_seconds=get_settings().runner_min_sleep_seconds,
+        market_wait_seconds=get_settings().runner_market_wait_seconds,
+        symbol_retry_seconds=get_settings().deployment_symbol_retry_seconds,
+        signal_context=NoopSignalContextEnricher(),
+        calendar=get_market_calendar(),
+        venue_provider=StaticRunnerVenueProvider(
+            prices=no_live_price, instruments=order_instrument_lookup
+        ),
+        daily_history=CachedMarketFramesAdapter(),
+        vwap_liquidity=NseBhavcopyLiquidityAdapter(get_settings().research_data_directory),
+        sector_table={},
+        instrument_lookup=order_instrument_lookup,
+        journal_storage=SqlTradeJournalStorage(app_db),
+        portfolio_storage=SqlPortfolioStorage(app_db),
+        ledger=PaperLedger(storage=SqlPaperLedgerStorage(app_db), price_source=no_live_price),
+        order_storage=SqlOrderStorage(app_db),
+        runner_storage=SqlPaperRunnerStorage(app_db),
+        state_storage=SqlSystemStateStorage(app_db),
+        risk_state=RiskStateService(SqlRiskStateStorage(app_db), get_settings()),
+    )
     runner.sync_loops()
     loop = next(iter(runner._loops.values()))
     loop.venue.prices = lambda sym, exch: opens.get(sym.upper())
@@ -293,22 +472,30 @@ def test_a_full_book_is_filled_by_the_deepest_gaps_not_the_first_names(app_db, m
 
     held = {p.instrument.symbol for p in loop._portfolio().positions.values() if not p.is_flat}
     assert held == {"DDD", "CCC"}
-    paper_service.install_live_source(None)
 
 
 # ---- Triple RSI decides at the close -------------------------------------
-from atr.signals.rules import eval_exit as _eval_exit  # noqa: E402
+from forward.signals.rules import eval_exit as _eval_exit  # noqa: E402
 
 
 def _falling_uptrend() -> pd.DataFrame:
     up = np.linspace(100, 200, 260) + np.sin(np.arange(260)) * 1.5
     closes = np.concatenate([up, [198, 195, 191, 186, 180]])
-    return pd.DataFrame({"open": closes, "high": closes, "low": closes, "close": closes,
-                         "volume": np.full(len(closes), 1000.0)})
+    return pd.DataFrame(
+        {
+            "open": closes,
+            "high": closes,
+            "low": closes,
+            "close": closes,
+            "volume": np.full(len(closes), 1000.0),
+        }
+    )
 
 
 def _triple(close_only: bool) -> EntryRules:
-    return EntryRules(setup="triple_rsi", triple_rsi_trend_sma=200, min_history_bars=210, close_only=close_only)
+    return EntryRules(
+        setup="triple_rsi", triple_rsi_trend_sma=200, min_history_bars=210, close_only=close_only
+    )
 
 
 def test_triple_rsi_ignores_the_mornings_price_but_acts_near_the_close():
@@ -321,8 +508,12 @@ def test_triple_rsi_ignores_the_mornings_price_but_acts_near_the_close():
 
 def test_without_the_flag_or_without_a_context_the_rule_reads_the_bar_as_given():
     frame = _falling_uptrend()
-    assert [s.rule for s in eval_entry("X", frame, _triple(False), SessionContext(today=MONDAY))] == ["triple_rsi"]
-    assert [s.rule for s in eval_entry("X", frame, _triple(True), None)] == ["triple_rsi"]  # a backtest
+    assert [
+        s.rule for s in eval_entry("X", frame, _triple(False), SessionContext(today=MONDAY))
+    ] == ["triple_rsi"]
+    assert [s.rule for s in eval_entry("X", frame, _triple(True), None)] == [
+        "triple_rsi"
+    ]  # a backtest
 
 
 def test_the_rsi_exit_also_waits_for_the_close():
@@ -330,57 +521,147 @@ def test_the_rsi_exit_also_waits_for_the_close():
     for col in ("open", "high", "low"):
         bounce[col] = bounce["close"]
     bounce["volume"] = 1000.0
-    exits = ExitRules(stop_loss_pct=50.0, take_profit_pct=None, trailing_stop_pct=None, trend_sma=0,
-                      rsi_overbought=50.0, rsi_period=5, close_only=True)
-    morning = _eval_exit("X", bounce, avg_price=60.0, rules=exits, quantity=1, context=SessionContext(today=MONDAY))
-    late = _eval_exit("X", bounce, avg_price=60.0, rules=exits, quantity=1,
-                      context=SessionContext(today=MONDAY, near_close=True))
+    exits = ExitRules(
+        stop_loss_pct=50.0,
+        take_profit_pct=None,
+        trailing_stop_pct=None,
+        trend_sma=0,
+        rsi_overbought=50.0,
+        rsi_period=5,
+        close_only=True,
+    )
+    morning = _eval_exit(
+        "X", bounce, avg_price=60.0, rules=exits, quantity=1, context=SessionContext(today=MONDAY)
+    )
+    late = _eval_exit(
+        "X",
+        bounce,
+        avg_price=60.0,
+        rules=exits,
+        quantity=1,
+        context=SessionContext(today=MONDAY, near_close=True),
+    )
     assert "rsi_overbought" not in [s.rule for s in morning]
     assert "rsi_overbought" in [s.rule for s in late]
 
 
 TRIPLE_DEFINITION = {
     "rules": {
-        "entry": {"setup": "triple_rsi", "triple_rsi_trend_sma": 200, "min_history_bars": 210, "close_only": True},
-        "exit": {"stop_loss_pct": 8.0, "take_profit_pct": None, "trailing_stop_pct": None, "trend_sma": 0,
-                 "rsi_overbought": 50.0, "rsi_period": 5, "close_only": True, "min_history_bars": 60},
+        "entry": {
+            "setup": "triple_rsi",
+            "triple_rsi_trend_sma": 200,
+            "min_history_bars": 210,
+            "close_only": True,
+        },
+        "exit": {
+            "stop_loss_pct": 8.0,
+            "take_profit_pct": None,
+            "trailing_stop_pct": None,
+            "trend_sma": 0,
+            "rsi_overbought": 50.0,
+            "rsi_period": 5,
+            "close_only": True,
+            "min_history_bars": 60,
+        },
     },
 }
 
 
 def test_a_triple_rsi_run_buys_at_the_close_not_on_the_mornings_price(app_db, monkeypatch):
-    from atr.appdb.repositories import DeploymentRepository, StrategyRepository
-    from atr.appdb.schema import users
-    from atr.services import paper as paper_service
-    from atr.services.runner import PaperRunner
+    from forward.appdb.account_schema import users
+    from forward.appdb.deployment_repository import DeploymentRepository
+    from forward.appdb.strategy_repository import StrategyRepository
+    from forward.services.runner import PaperRunner
 
-    paper_service.install_live_source(None)
     up = np.linspace(100, 200, 260) + np.sin(np.arange(260)) * 1.5
     closes = np.concatenate([up, [198, 195, 191, 186]])
     days = pd.bdate_range(end=pd.Timestamp(FRIDAY), periods=len(closes))
-    history = pd.DataFrame({"ts": days, "open": closes, "high": closes, "low": closes, "close": closes,
-                            "volume": 1000.0})
-    monkeypatch.setattr("atr.signals.engine.load_daily", lambda symbol, exchange="NSEEQ", **kw: history)
+    history = pd.DataFrame(
+        {
+            "ts": days,
+            "open": closes,
+            "high": closes,
+            "low": closes,
+            "close": closes,
+            "volume": 1000.0,
+        }
+    )
+    monkeypatch.setattr(
+        "forward.data.cached_market_frames.load_daily_from_cache",
+        lambda symbol, exchange="NSEEQ", **kw: history,
+    )
 
     with app_db.session() as session:
-        session.execute(users.insert().values(
-            user_id="u_t", email="t@example.com", username="t", display_name="T", password_hash="x",
-            role="owner", is_active=True, mfa_enabled=False, failed_logins=0,
-            created_at=datetime(2026, 1, 1), updated_at=datetime(2026, 1, 1)))
-        strategy = StrategyRepository.create(session, user_id="u_t", name="Triple RSI", kind="rules")
+        session.execute(
+            users.insert().values(
+                user_id="u_t",
+                email="t@example.com",
+                username="t",
+                display_name="T",
+                password_hash="x",
+                role="owner",
+                is_active=True,
+                mfa_enabled=False,
+                failed_logins=0,
+                created_at=datetime(2026, 1, 1),
+                updated_at=datetime(2026, 1, 1),
+            )
+        )
+        strategy = StrategyRepository.create(
+            session, user_id="u_t", name="Triple RSI", kind="rules"
+        )
         version = StrategyRepository.create_version(
-            session, strategy_id=strategy["strategy_id"], author_user_id="u_t", definition=TRIPLE_DEFINITION)
+            session,
+            strategy_id=strategy["strategy_id"],
+            author_user_id="u_t",
+            definition=TRIPLE_DEFINITION,
+        )
         DeploymentRepository.create(
-            session, user_id="u_t", strategy_id=strategy["strategy_id"], strategy_version=int(version["version"]),
-            mode="PAPER", capital=500_000.0, status="RUNNING",
-            config={"symbols": ["TESTCO"], "exchange": "NSEEQ", "order_value": 25_000.0, "lookback_days": 400,
-                    "max_open_positions": 20})
-    runner = PaperRunner(db=app_db)
+            session,
+            user_id="u_t",
+            strategy_id=strategy["strategy_id"],
+            strategy_version=int(version["version"]),
+            mode="PAPER",
+            capital=500_000.0,
+            status="RUNNING",
+            config={
+                "symbols": ["TESTCO"],
+                "exchange": "NSEEQ",
+                "signal_basis": "closed_bar",
+                "timeframe": "1d",
+                "lookback_days": 400,
+                "max_open_positions": 20,
+            },
+        )
+    runner = PaperRunner(
+        interval_seconds=get_settings().runner_interval_seconds,
+        lookback_days=get_settings().runner_lookback_days,
+        minimum_sleep_seconds=get_settings().runner_min_sleep_seconds,
+        market_wait_seconds=get_settings().runner_market_wait_seconds,
+        symbol_retry_seconds=get_settings().deployment_symbol_retry_seconds,
+        signal_context=NoopSignalContextEnricher(),
+        calendar=get_market_calendar(),
+        venue_provider=StaticRunnerVenueProvider(
+            prices=no_live_price, instruments=order_instrument_lookup
+        ),
+        daily_history=CachedMarketFramesAdapter(),
+        vwap_liquidity=NseBhavcopyLiquidityAdapter(get_settings().research_data_directory),
+        sector_table={},
+        instrument_lookup=order_instrument_lookup,
+        journal_storage=SqlTradeJournalStorage(app_db),
+        portfolio_storage=SqlPortfolioStorage(app_db),
+        ledger=PaperLedger(storage=SqlPaperLedgerStorage(app_db), price_source=no_live_price),
+        order_storage=SqlOrderStorage(app_db),
+        runner_storage=SqlPaperRunnerStorage(app_db),
+        state_storage=SqlSystemStateStorage(app_db),
+        risk_state=RiskStateService(SqlRiskStateStorage(app_db), get_settings()),
+    )
     runner.sync_loops()
     loop = next(iter(runner._loops.values()))
     loop.venue.prices = lambda sym, exch: 180.0  # a price that makes today the third falling day
 
-    assert runner.pass_once(now=_at(MONDAY, 9, 16)).orders == 0  # the morning's price is not a close
+    assert (
+        runner.pass_once(now=_at(MONDAY, 9, 16)).orders == 0
+    )  # the morning's price is not a close
     assert runner.pass_once(now=_at(MONDAY, 12, 0)).orders == 0
     assert runner.pass_once(now=_at(MONDAY, 15, 20)).orders == 1
-    paper_service.install_live_source(None)

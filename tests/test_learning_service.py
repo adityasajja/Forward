@@ -21,7 +21,6 @@ cache or on today's date is not a test.
 from __future__ import annotations
 
 import json
-import os
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -29,19 +28,25 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from atr.services.learning import (
-    DATASET_COLUMNS,
+from forward.appdb.daily_learning_storage import SqlDailyLearningStorage
+from forward.appdb.learning_storage import SqlLearningStorage
+from forward.appdb.portfolio_storage import SqlPortfolioStorage
+from forward.data.learning_artifacts import LocalLearningArtifactsAdapter
+from forward.services.learning import (
     GRADE_FORWARD,
     GRADE_IN_SAMPLE,
     SOURCE_BACKTEST,
     SOURCE_LIVE,
     SOURCE_PAPER,
-    DailyLearningReport,
-    LearningDataset,
-    LearningDatasetBuilder,
     LearningService,
-    PerformanceAnalysis,
 )
+from forward.services.learning_analysis import PerformanceAnalysis
+from forward.services.learning_dataset import (
+    LearningDatasetBuilder,
+)
+from forward.services.learning_dataset_model import DATASET_COLUMNS, LearningDataset
+from forward.services.learning_reports import DailyLearningReport
+from tests.market_data_fakes import InMemoryLearningArtifactsPort, InMemoryMarketFramesPort
 
 # ---------------------------------------------------------------------------
 # fixtures
@@ -138,7 +143,7 @@ def _seed_backtest(app_db, trades: list[dict], *, engine_key: str = "sma_crossov
     exactly what is in the table — a builder test that depended on a real
     backtest executing would be slow and would conflate two concerns.
     """
-    from atr.appdb.schema import backtest_runs, backtest_trades
+    from forward.appdb.strategy_backtest_schema import backtest_runs, backtest_trades
 
     run_id = trades[0]["run_id"] if trades else "RUN0000000000000000000000000001"
     with app_db.session() as session:
@@ -167,7 +172,7 @@ def _seed_backtest(app_db, trades: list[dict], *, engine_key: str = "sma_crossov
 def _owner(app_db) -> str:
     from sqlalchemy import select
 
-    from atr.appdb.schema import users
+    from forward.appdb.account_schema import users
 
     with app_db.session() as session:
         found = session.execute(select(users.c.user_id).limit(1)).scalar()
@@ -179,7 +184,7 @@ def owner(app_db) -> str:
     """A real user row. ``backtest_runs.user_id`` is a foreign key, so a run
     cannot be seeded without one — and a fabricated id would fail the constraint
     rather than the assertion under test."""
-    from atr.appdb.schema import users
+    from forward.appdb.account_schema import users
 
     with app_db.session() as session:
         session.execute(
@@ -202,7 +207,12 @@ def owner(app_db) -> str:
 
 @pytest.fixture()
 def builder(app_db, frames, sector_root, owner):
-    return LearningDatasetBuilder(db=app_db, cache_root=sector_root, frames=frames)
+    return LearningDatasetBuilder(
+        portfolio_storage=SqlPortfolioStorage(app_db),
+        storage=SqlLearningStorage(app_db),
+        artifacts=LocalLearningArtifactsAdapter(sector_root),
+        market_history=InMemoryMarketFramesPort(frames),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -222,18 +232,14 @@ def test_an_empty_database_yields_a_valid_empty_dataset(app_db, builder):
 def test_the_empty_dataset_still_has_every_column(frames):
     """A frame with zero *columns* would make every groupby raise. The empty
     case is a zero-row, correctly-shapen frame instead."""
-    dataset = LearningDataset(
-        rows=[], missing_features={}, generated_at=datetime.now(UTC)
-    )
+    dataset = LearningDataset(rows=[], missing_features={}, generated_at=datetime.now(UTC))
     frame = dataset.frame()
     assert len(frame) == 0
     assert list(frame.columns) == list(DATASET_COLUMNS)
 
 
 def test_the_empty_dataset_reports_absent_rather_than_zero():
-    dataset = LearningDataset(
-        rows=[], missing_features={}, generated_at=datetime.now(UTC)
-    )
+    dataset = LearningDataset(rows=[], missing_features={}, generated_at=datetime.now(UTC))
     summary = dataset.summary()
     assert summary["trades"] == 0
     # Zero rupees earned and no trades is a different statement from "a
@@ -243,9 +249,7 @@ def test_the_empty_dataset_reports_absent_rather_than_zero():
 
 
 def test_the_empty_report_refuses_to_invent_a_number():
-    dataset = LearningDataset(
-        rows=[], missing_features={}, generated_at=datetime.now(UTC)
-    )
+    dataset = LearningDataset(rows=[], missing_features={}, generated_at=datetime.now(UTC))
     report = DailyLearningReport(dataset).build()
     assert report.trades_today == 0
     assert report.net_pnl_today is None
@@ -256,9 +260,7 @@ def test_the_empty_report_refuses_to_invent_a_number():
 
 
 def test_the_empty_analysis_suppresses_everything_and_says_so():
-    dataset = LearningDataset(
-        rows=[], missing_features={}, generated_at=datetime.now(UTC)
-    )
+    dataset = LearningDataset(rows=[], missing_features={}, generated_at=datetime.now(UTC))
     analysis = PerformanceAnalysis(dataset).analyse()
     assert analysis.n == 0
     assert analysis.overall["n"] == 0
@@ -268,7 +270,13 @@ def test_the_empty_analysis_suppresses_everything_and_says_so():
 
 
 def test_status_reports_the_real_state_of_the_database(app_db):
-    status = LearningService(db=app_db).status()
+    status = LearningService(
+        artifacts=InMemoryLearningArtifactsPort(),
+        market_history=InMemoryMarketFramesPort({}),
+        portfolio_storage=SqlPortfolioStorage(app_db),
+        storage=SqlLearningStorage(app_db),
+        daily_learning_storage=SqlDailyLearningStorage(app_db),
+    ).status()
     assert status["available"] is True
     assert status["trades_available"] == 0
     assert status["sufficient_for_analysis"] is False
@@ -277,7 +285,14 @@ def test_status_reports_the_real_state_of_the_database(app_db):
 
 def test_the_empty_pipeline_does_not_write_artefacts(app_db, builder):
     """``snapshot`` must be able to run without touching the filesystem."""
-    service = LearningService(db=app_db, builder=builder)
+    service = LearningService(
+        artifacts=InMemoryLearningArtifactsPort(),
+        market_history=InMemoryMarketFramesPort({}),
+        portfolio_storage=SqlPortfolioStorage(app_db),
+        storage=SqlLearningStorage(app_db),
+        daily_learning_storage=SqlDailyLearningStorage(app_db),
+        builder=builder,
+    )
     payload = service.snapshot(write=False)
     assert payload["dataset"]["trades"] == 0
     assert "written" not in payload
@@ -358,7 +373,9 @@ def test_relative_volume_is_read_from_the_breakout_reason_when_present(app_db, b
 
 
 def test_entry_time_market_context_is_added(app_db, builder):
-    _seed_backtest(app_db, [_trade(symbol="RELIANCE", entry_ts=datetime(2026, 2, 2), net_pnl=100.0)])
+    _seed_backtest(
+        app_db, [_trade(symbol="RELIANCE", entry_ts=datetime(2026, 2, 2), net_pnl=100.0)]
+    )
     dataset = builder.build()
     row = dataset.rows[0]
     assert row["as_of_ts"] is not None
@@ -387,7 +404,9 @@ def test_a_symbol_with_no_cached_history_is_marked_not_estimated(app_db, builder
 def test_a_symbol_absent_from_the_universe_csvs_has_no_sector(app_db, builder):
     """501 of 3,089 cached symbols are in the index CSVs. The rest have no
     sector, which is a gap to report rather than a bucket to invent."""
-    _seed_backtest(app_db, [_trade(symbol="SOMETHINGELSE", entry_ts=datetime(2026, 2, 2), net_pnl=50.0)])
+    _seed_backtest(
+        app_db, [_trade(symbol="SOMETHINGELSE", entry_ts=datetime(2026, 2, 2), net_pnl=50.0)]
+    )
     dataset = builder.build()
     row = dataset.rows[0]
     assert row["sector"] is None
@@ -407,7 +426,7 @@ def test_a_failed_run_contributes_no_trades(app_db, builder):
     """A FAILED run has no trade rows by construction; a RUNNING one has
     half-written ones. Reading either would put a partial equity path into the
     statistics as though it were a result."""
-    from atr.appdb.schema import backtest_runs
+    from forward.appdb.strategy_backtest_schema import backtest_runs
 
     _seed_backtest(app_db, [_trade(symbol="TCS", entry_ts=datetime(2026, 2, 2), net_pnl=10.0)])
     with app_db.session() as session:
@@ -425,7 +444,7 @@ def test_a_failed_run_contributes_no_trades(app_db, builder):
 
 
 def _seed_journal(app_db, rows: list[dict], *, user_id: str, deployment_id: str | None = None):
-    from atr.appdb.repositories import TradeJournalRepository
+    from forward.appdb.trade_journal_repository import TradeJournalRepository
 
     ids = []
     with app_db.session() as session:
@@ -547,7 +566,7 @@ def test_a_live_deployment_labels_its_journal_trades_live(app_db, builder, owner
     """The journal does not record paper versus real money; the deployment does.
     Getting this wrong would break the one comparison the drift analysis exists
     to make."""
-    from atr.appdb.schema import deployments
+    from forward.appdb.execution_schema import deployments
 
     with app_db.session() as session:
         session.execute(
@@ -586,10 +605,10 @@ def test_a_live_deployment_labels_its_journal_trades_live(app_db, builder, owner
     assert dataset.source_counts[SOURCE_LIVE] == 1
 
 
-def test_both_sources_land_in_one_table_with_the_same_columns(
-    app_db, builder, owner
-):
-    _seed_backtest(app_db, [_trade(symbol="RELIANCE", entry_ts=datetime(2026, 2, 2), net_pnl=100.0)])
+def test_both_sources_land_in_one_table_with_the_same_columns(app_db, builder, owner):
+    _seed_backtest(
+        app_db, [_trade(symbol="RELIANCE", entry_ts=datetime(2026, 2, 2), net_pnl=100.0)]
+    )
     _seed_journal(
         app_db,
         [
@@ -645,16 +664,14 @@ def _dataset_from(values: list[float], **extra) -> LearningDataset:
             "time_of_day": "open",
             "market_regime": "uptrend",
             "rvol_bucket": "1.5-2.0",
-            "atr_bucket": "normal",
+            "forward_bucket": "normal",
             "rsi_bucket": "45_55",
             "trend_pct": 1.0,
             "missing_features": [],
         }
         row.update(extra)
         rows.append(row)
-    return LearningDataset(
-        rows=rows, missing_features={}, generated_at=datetime.now(UTC)
-    )
+    return LearningDataset(rows=rows, missing_features={}, generated_at=datetime.now(UTC))
 
 
 def test_a_strategy_below_the_sample_floor_is_reported_as_not_evidence():
@@ -680,9 +697,9 @@ def test_every_bucket_carries_a_sample_size_and_a_confidence_interval():
     for breakdown in analysis.breakdowns:
         for bucket in breakdown.buckets:
             assert "n" in bucket
-            assert bucket["n"] == len(bucket.get("n") and range(bucket["n"])) or True
             stats = bucket["stats"]
             assert "n" in stats
+            assert bucket["n"] == stats["n"]
             if stats["n"] >= 10:
                 assert stats["win_rate_ci"] is not None or stats["n"] == 0
 
@@ -744,9 +761,10 @@ def test_a_strategy_whose_edge_is_one_trade_says_so():
     not evidence."""
     values = [5000.0] + [-100.0] * 19
     analysis = PerformanceAnalysis(_dataset_from(values)).analyse()
-    assert any("single best trade" in note for note in analysis.caveats) or analysis.overall[
-        "without_best"
-    ] < 0
+    assert (
+        any("single best trade" in note for note in analysis.caveats)
+        or analysis.overall["without_best"] < 0
+    )
 
 
 def test_a_backtest_only_sample_is_flagged_as_in_sample():
@@ -799,7 +817,7 @@ def test_the_metric_can_be_switched_to_percentage_returns():
 def _dated_dataset(days: list[tuple[str, float]], *, strategy: str = "sma_crossover"):
     """One trade per (day, value) with the exit on that day."""
     rows = []
-    for index, (day, value) in enumerate(days):
+    for day, value in days:
         stamp = datetime.fromisoformat(day).replace(tzinfo=None)
         rows.append(
             {
@@ -858,12 +876,8 @@ def test_the_headline_quotes_the_deviation_in_words_and_numbers():
 
 def test_days_with_no_closed_trade_are_not_counted_as_zero():
     """Dividing by calendar days would report a holiday as a break-even day."""
-    dataset = _dated_dataset(
-        [("2026-06-01", 500.0), ("2026-06-30", 500.0), ("2026-07-01", 100.0)]
-    )
-    report = DailyLearningReport(dataset).build(
-        as_of=datetime(2026, 7, 1, 18, 0), window_days=90
-    )
+    dataset = _dated_dataset([("2026-06-01", 500.0), ("2026-06-30", 500.0), ("2026-07-01", 100.0)])
+    report = DailyLearningReport(dataset).build(as_of=datetime(2026, 7, 1, 18, 0), window_days=90)
     # Two trading days in the window, not twenty-nine.
     assert report.expectation["trading_days"] == 2
     assert report.expectation["mean_per_day"] == pytest.approx(500.0)
@@ -895,7 +909,9 @@ def test_the_regime_section_reports_counts_not_conclusions():
     assert report.regime["losing_distribution"] == {"sideways": 4}
     # Facts, phrased as counts. "Sideways is unprofitable" is a claim that needs
     # the bucket statistics, and those live in observations.
-    assert any("4 of 4 losing trades occurred in a sideways regime" in line for line in report.unusual)
+    assert any(
+        "4 of 4 losing trades occurred in a sideways regime" in line for line in report.unusual
+    )
 
 
 def test_a_tie_for_the_dominant_regime_is_reported_as_a_tie():
@@ -904,9 +920,7 @@ def test_a_tie_for_the_dominant_regime_is_reported_as_a_tie():
     the market. A tie must be stated so the caller cannot mistake it for a
     finding."""
     dataset = _dated_dataset(
-        [("2026-06-01", 100.0)]
-        + [("2026-06-10", 100.0)] * 4
-        + [("2026-06-10", -50.0)] * 4
+        [("2026-06-01", 100.0)] + [("2026-06-10", 100.0)] * 4 + [("2026-06-10", -50.0)] * 4
     )
     for row in dataset.rows[-4:]:
         row["market_regime"] = "sideways"
@@ -920,9 +934,7 @@ def test_a_tie_for_the_dominant_regime_is_reported_as_a_tie():
 def test_one_losing_trade_is_not_reported_as_a_concentration():
     """The unusual detector refuses to generalise from a single loss, which is
     the same instinct that sets the bucket sample floor."""
-    dataset = _dated_dataset(
-        [("2026-06-01", 100.0), ("2026-06-10", 100.0), ("2026-06-10", -50.0)]
-    )
+    dataset = _dated_dataset([("2026-06-01", 100.0), ("2026-06-10", 100.0), ("2026-06-10", -50.0)])
     dataset.rows[-1]["market_regime"] = "sideways"
     report = DailyLearningReport(dataset).build(as_of=datetime(2026, 6, 10, 18, 0))
     assert not any("losing trades occurred" in line for line in report.unusual)
@@ -941,9 +953,7 @@ def test_a_single_trade_day_gets_no_regime_conclusion():
 def test_the_report_states_that_no_slippage_was_recorded():
     """The backtest reports slippage per run, not per trade. A blank must be
     explained rather than read as zero slippage."""
-    dataset = _dated_dataset(
-        [("2026-06-09", 100.0), ("2026-06-10", 100.0)]
-    )
+    dataset = _dated_dataset([("2026-06-09", 100.0), ("2026-06-10", 100.0)])
     report = DailyLearningReport(dataset).build(as_of=datetime(2026, 6, 10, 18, 0))
     assert report.execution["slippage_bps_mean"] is None
     assert report.execution["trades_with_slippage"] == 0
@@ -972,7 +982,8 @@ def test_the_report_never_proposes_a_parameter_value():
     returned a parameter value would sooner or later be fed to something that
     applies it."""
     dataset = _dated_dataset(
-        [("2026-06-0%d" % day, 100.0 * day) for day in (1, 2, 3)] + [("2026-06-10", -900.0)]
+        [(f"2026-06-{day:02d}", 100.0 * day) for day in (1, 2, 3)]
+        + [("2026-06-10", -900.0)]
     )
     report = DailyLearningReport(dataset).build(as_of=datetime(2026, 6, 10, 18, 0))
     payload = report.as_dict()
@@ -1017,7 +1028,7 @@ def test_the_report_carries_the_drift_verdict_but_not_a_second_copy_of_the_numbe
 def test_the_report_drift_section_is_the_same_verdict_the_drift_analysis_reaches():
     """The one thing that *must* agree: the sentence the report prints and the
     sentence the drift command prints have to be the same sentence."""
-    from atr.research.learning_drift import analyse as drift_analysis
+    from forward.research.learning_drift import analyse as drift_analysis
 
     dataset = _dated_dataset([("2026-06-01", 100.0), ("2026-06-10", 50.0)])
     report = DailyLearningReport(dataset).build(as_of=datetime(2026, 6, 10, 18, 0))
@@ -1040,7 +1051,7 @@ def _fingerprint(app_db) -> dict[str, str]:
 
     from sqlalchemy import select
 
-    from atr.appdb import schema as s
+    from forward.appdb import schema as s
 
     watched = {
         "strategies": s.strategies,
@@ -1099,8 +1110,17 @@ def test_the_learning_pipeline_never_writes_to_a_strategy_or_an_order_table(
 
     before = _fingerprint(app_db)
     service = LearningService(
-        db=app_db,
-        builder=LearningDatasetBuilder(db=app_db, cache_root=sector_root, frames=frames),
+        artifacts=InMemoryLearningArtifactsPort(),
+        market_history=InMemoryMarketFramesPort({}),
+        portfolio_storage=SqlPortfolioStorage(app_db),
+        storage=SqlLearningStorage(app_db),
+        daily_learning_storage=SqlDailyLearningStorage(app_db),
+        builder=LearningDatasetBuilder(
+            portfolio_storage=SqlPortfolioStorage(app_db),
+            storage=SqlLearningStorage(app_db),
+            artifacts=LocalLearningArtifactsAdapter(sector_root),
+            market_history=InMemoryMarketFramesPort(frames),
+        ),
     )
     service.dataset(refresh=True)
     service.performance()
@@ -1134,23 +1154,15 @@ def test_the_service_exposes_no_method_that_changes_a_strategy():
         "optimize",
     )
     public = [name for name in dir(LearningService) if not name.startswith("_")]
-    offenders = [
-        name for name in public if any(token in name.lower() for token in forbidden)
-    ]
+    offenders = [name for name in public if any(token in name.lower() for token in forbidden)]
     assert offenders == [], f"the learning service must not mutate anything: {offenders}"
 
 
-def test_the_snapshot_write_is_confined_to_the_learning_directory(app_db, monkeypatch, tmp_path):
-    """The only write in the module, and it goes where it says it goes.
-
-    The destination is resolved through ``ATR_DATA_ROOT`` rather than a module
-    constant, so the test moves the root instead of patching the constant — the
-    same lever the ledger and the sector table are read through, which is what
-    stops the write and the reads disagreeing about where "data" is.
-    """
+def test_the_learning_artifact_adapter_writes_under_its_configured_root(tmp_path):
+    """The file adapter owns the learning report paths."""
     target = tmp_path / "data" / "learning"
-    service = LearningService(db=app_db)
-    written = service._write({"generated_at": "2026-06-10T18:00:00", "x": 1})
+    adapter = LocalLearningArtifactsAdapter(tmp_path / "data")
+    written = adapter.write_snapshot({"generated_at": "2026-06-10T18:00:00", "x": 1})
     assert Path(written["latest"]).parent == target
     assert (target / "latest.json").exists()
     assert (target / "report_20260610T180000.json").exists()
@@ -1159,16 +1171,16 @@ def test_the_snapshot_write_is_confined_to_the_learning_directory(app_db, monkey
 def test_the_learning_modules_respect_the_layer_boundaries():
     """Belt and braces with ``tests/test_architecture.py``.
 
-    ``atr.research`` may not import ``appdb``. The statistics and enrichment
+    ``forward.research`` may not import ``appdb``. The statistics and enrichment
     modules are in ``research`` and must stay free of it; the dataset builder
     needs the trade tables and must therefore be in ``services``.
     """
     import ast
     import pathlib
 
-    import atr.research.learning_axes as axes
-    import atr.research.learning_enrich as enrichment
-    import atr.research.learning_stats as statistics
+    import forward.research.learning_axes as axes
+    import forward.research.learning_enrich as enrichment
+    import forward.research.learning_stats as statistics
 
     for module in (statistics, enrichment, axes):
         tree = ast.parse(pathlib.Path(module.__file__).read_text(encoding="utf-8"))
@@ -1181,11 +1193,9 @@ def test_the_learning_modules_respect_the_layer_boundaries():
         offenders = [
             name
             for name in imported
-            if name.startswith("atr.appdb") or name.startswith("atr.services")
+            if name.startswith("forward.appdb") or name.startswith("forward.services")
         ]
         assert offenders == [], f"{module.__name__} reaches into a storage layer: {offenders}"
-
-
 
 
 # ---------------------------------------------------------------------------
@@ -1193,15 +1203,21 @@ def test_the_learning_modules_respect_the_layer_boundaries():
 # ---------------------------------------------------------------------------
 
 
-def _run_cli(argv: list[str], monkeypatch, db) -> tuple[int, str]:
-    """Run ``atr <argv>`` against the test database and capture stdout."""
+def _run_cli(argv: list[str], monkeypatch, db, *, artifacts=None) -> tuple[int, str]:
+    """Run ``forward <argv>`` against the test database and capture stdout."""
     import io
     from contextlib import redirect_stdout
 
-    import atr.cli as cli
-    import atr.services.learning as learning_module
+    import forward.cli as cli
+    import forward.services.learning as learning_module
 
-    service = LearningService(db=db)
+    service = LearningService(
+        artifacts=(artifacts if artifacts is not None else InMemoryLearningArtifactsPort()),
+        market_history=InMemoryMarketFramesPort({}),
+        portfolio_storage=SqlPortfolioStorage(db),
+        storage=SqlLearningStorage(db),
+        daily_learning_storage=SqlDailyLearningStorage(db),
+    )
     monkeypatch.setattr(learning_module, "get_learning_service", lambda: service)
 
     buffer = io.StringIO()
@@ -1253,7 +1269,7 @@ def test_the_cli_offers_no_action_that_writes_to_a_strategy(monkeypatch, app_db)
     import io
     from contextlib import redirect_stdout
 
-    import atr.cli as cli
+    import forward.cli as cli
 
     buffer = io.StringIO()
     try:
@@ -1275,7 +1291,7 @@ def test_the_drift_action_runs_on_an_empty_database(monkeypatch, app_db):
 
 def test_the_drift_action_prints_each_metric_with_its_sample(monkeypatch, app_db):
     """A drift table without sample sizes is the format that gets misread."""
-    import atr.services.learning as learning_module
+    import forward.services.learning as learning_module
 
     dataset = _dataset_from([100.0] * 40)
     for row in dataset.rows:
@@ -1293,14 +1309,20 @@ def test_the_drift_action_prints_each_metric_with_its_sample(monkeypatch, app_db
         source_counts={"BACKTEST": 40, "PAPER": 0, "LIVE": 40},
     )
 
-    service = LearningService(db=app_db)
+    service = LearningService(
+        artifacts=InMemoryLearningArtifactsPort(),
+        market_history=InMemoryMarketFramesPort({}),
+        portfolio_storage=SqlPortfolioStorage(app_db),
+        storage=SqlLearningStorage(app_db),
+        daily_learning_storage=SqlDailyLearningStorage(app_db),
+    )
     monkeypatch.setattr(service, "dataset", lambda **_: combined)
     monkeypatch.setattr(learning_module, "get_learning_service", lambda: service)
 
     import io
     from contextlib import redirect_stdout
 
-    import atr.cli as cli
+    import forward.cli as cli
 
     buffer = io.StringIO()
     with redirect_stdout(buffer):
@@ -1320,11 +1342,21 @@ def test_the_snapshot_action_writes_only_when_asked(monkeypatch, app_db, tmp_pat
     assert not target.exists()
     assert "not written" in out
 
-    code, out = _run_cli(["learn", "snapshot"], monkeypatch, app_db)
+    code, out = _run_cli(
+        ["learn", "snapshot"],
+        monkeypatch,
+        app_db,
+        artifacts=LocalLearningArtifactsAdapter(tmp_path / "data"),
+    )
     assert code == 0
     assert (target / "latest.json").exists()
 
-    code, out = _run_cli(["learn", "snapshot"], monkeypatch, app_db)
+    code, out = _run_cli(
+        ["learn", "snapshot"],
+        monkeypatch,
+        app_db,
+        artifacts=LocalLearningArtifactsAdapter(tmp_path / "data"),
+    )
     assert code == 0
     assert (target / "latest.json").exists()
 
@@ -1358,8 +1390,7 @@ def _ledger_records(
             "filter": "top_decile_ret_26w",
             "n_picks": len(symbols),
             "picks": [
-                {"symbol": symbol, "entry": 500.0 + index}
-                for index, symbol in enumerate(symbols)
+                {"symbol": symbol, "entry": 500.0 + index} for index, symbol in enumerate(symbols)
             ],
             "backtest_expectation": {
                 "mean_weekly_pct": None if backfilled else 0.88,
@@ -1414,7 +1445,12 @@ def ledger_builder(app_db, frames, sector_root, tmp_path):
     """
     picks, settlements = _ledger_records([("2026-06-05", True), ("2026-06-12", False)])
     _write_ledger(tmp_path, picks, settlements)
-    return LearningDatasetBuilder(db=app_db, cache_root=sector_root, frames=frames)
+    return LearningDatasetBuilder(
+        portfolio_storage=SqlPortfolioStorage(app_db),
+        storage=SqlLearningStorage(app_db),
+        artifacts=LocalLearningArtifactsAdapter(sector_root),
+        market_history=InMemoryMarketFramesPort(frames),
+    )
 
 
 def test_the_ledger_lands_as_paper_evidence(ledger_builder):
@@ -1444,7 +1480,12 @@ def test_a_backfilled_week_is_not_counted_as_forward_evidence(ledger_builder):
 def test_the_dataset_reports_the_ledger_holding_no_forward_week(tmp_path, app_db, frames):
     picks, settlements = _ledger_records([("2026-06-05", True)])
     _write_ledger(tmp_path, picks, settlements)
-    dataset = LearningDatasetBuilder(db=app_db, cache_root=tmp_path, frames=frames).build()
+    dataset = LearningDatasetBuilder(
+        portfolio_storage=SqlPortfolioStorage(app_db),
+        storage=SqlLearningStorage(app_db),
+        artifacts=LocalLearningArtifactsAdapter(tmp_path),
+        market_history=InMemoryMarketFramesPort(frames),
+    ).build()
     assert dataset.ledger["forward_trades"] == 0
     assert dataset.ledger["in_sample_trades"] == 2
     assert "none of them is forward" in dataset.ledger["note"]
@@ -1453,7 +1494,10 @@ def test_the_dataset_reports_the_ledger_holding_no_forward_week(tmp_path, app_db
 def test_a_dataset_without_a_ledger_says_so(ledger_builder, tmp_path):
     """No ledger written is a finding about the evidence, not an error."""
     empty = LearningDatasetBuilder(
-        db=ledger_builder._db, cache_root=tmp_path / "nothing-here", frames={}
+        portfolio_storage=ledger_builder._portfolio_storage,
+        storage=ledger_builder._storage,
+        artifacts=LocalLearningArtifactsAdapter(tmp_path / "nothing-here"),
+        market_history=InMemoryMarketFramesPort({}),
     ).build()
     assert empty.ledger["present"] is False
     assert len(empty) == 0
@@ -1515,8 +1559,7 @@ def test_a_percentage_total_is_flagged_as_not_a_portfolio_return(ledger_builder)
 def test_an_in_sample_only_sample_is_flagged(ledger_builder):
     analysis = PerformanceAnalysis(ledger_builder.build()).analyse(grades=["in_sample"])
     assert analysis.n == 2
-    assert any("no trade in this sample is forward evidence" in note
-               for note in analysis.caveats)
+    assert any("no trade in this sample is forward evidence" in note for note in analysis.caveats)
 
 
 def test_filtering_by_grade_isolates_the_forward_sample(ledger_builder):
@@ -1558,7 +1601,12 @@ def test_a_percentage_day_total_is_the_mean_not_the_sum(tmp_path, app_db, frames
         returns={"RELIANCE": 0.02, "TCS": 0.02, "INFY": 0.02, "SBIN": 0.02},
     )
     _write_ledger(tmp_path, picks, settlements)
-    dataset = LearningDatasetBuilder(db=app_db, cache_root=tmp_path, frames=frames).build()
+    dataset = LearningDatasetBuilder(
+        portfolio_storage=SqlPortfolioStorage(app_db),
+        storage=SqlLearningStorage(app_db),
+        artifacts=LocalLearningArtifactsAdapter(tmp_path),
+        market_history=InMemoryMarketFramesPort(frames),
+    ).build()
     report = DailyLearningReport(dataset).build(as_of=datetime(2026, 6, 12, 18, 0, tzinfo=UTC))
     assert report.trades_today == 4
     assert report.metric_total == pytest.approx(2.0)
@@ -1570,7 +1618,13 @@ def test_the_service_status_counts_the_ledger(app_db, tmp_path):
     paper trades would be the first screen an operator checks, lying."""
     picks, settlements = _ledger_records([("2026-06-05", True), ("2026-06-12", False)])
     _write_ledger(tmp_path, picks, settlements)
-    status = LearningService(db=app_db, cache_root=tmp_path).status()
+    status = LearningService(
+        market_history=InMemoryMarketFramesPort({}),
+        portfolio_storage=SqlPortfolioStorage(app_db),
+        storage=SqlLearningStorage(app_db),
+        daily_learning_storage=SqlDailyLearningStorage(app_db),
+        artifacts=LocalLearningArtifactsAdapter(tmp_path),
+    ).status()
     assert status["counts"]["paper_ledger_trades"] == 4
     assert status["counts"]["paper_ledger_forward_trades"] == 2
     assert status["trades_available"] == 4
@@ -1580,23 +1634,38 @@ def test_the_service_status_counts_the_ledger(app_db, tmp_path):
 def test_the_service_status_says_when_no_paper_trade_is_forward(tmp_path, app_db):
     picks, settlements = _ledger_records([("2026-06-05", True)])
     _write_ledger(tmp_path, picks, settlements)
-    status = LearningService(db=app_db, cache_root=tmp_path).status()
+    status = LearningService(
+        market_history=InMemoryMarketFramesPort({}),
+        portfolio_storage=SqlPortfolioStorage(app_db),
+        storage=SqlLearningStorage(app_db),
+        daily_learning_storage=SqlDailyLearningStorage(app_db),
+        artifacts=LocalLearningArtifactsAdapter(tmp_path),
+    ).status()
     assert "none of the 2 paper trades is forward" in status["note"]
 
 
 def test_the_service_status_reports_no_ledger_as_nothing(tmp_path, app_db):
-    status = LearningService(db=app_db, cache_root=tmp_path).status()
+    status = LearningService(
+        market_history=InMemoryMarketFramesPort({}),
+        portfolio_storage=SqlPortfolioStorage(app_db),
+        storage=SqlLearningStorage(app_db),
+        daily_learning_storage=SqlDailyLearningStorage(app_db),
+        artifacts=LocalLearningArtifactsAdapter(tmp_path),
+    ).status()
     assert status["counts"]["paper_ledger_trades"] == 0
     assert status["paper_ledger"]["present"] is False
     assert "nothing to analyse yet" in status["note"]
 
 
-def test_the_ledger_is_read_through_the_data_root_not_the_working_directory(app_db):
-    """The read and the write resolve through one root, so a test pointing at
-    its own directory never reads the operator's record."""
-    import atr.services.learning as learning_module
+def test_learning_reference_adapter_reads_the_configured_root(tmp_path):
+    """The adapter reads ledger files only from its configured directory."""
+    picks, settlements = _ledger_records([("2026-06-05", True)])
+    _write_ledger(tmp_path, picks, settlements)
 
-    assert learning_module.data_root() == Path(os.environ["ATR_DATA_ROOT"])
+    ledger = LocalLearningArtifactsAdapter(tmp_path).paper_ledger()
+
+    assert ledger.present is True
+    assert LocalLearningArtifactsAdapter(tmp_path / "empty").paper_ledger().present is False
 
 
 def test_the_ledger_cannot_be_revised_by_a_reader(tmp_path, app_db, frames):
@@ -1605,16 +1674,17 @@ def test_the_ledger_cannot_be_revised_by_a_reader(tmp_path, app_db, frames):
     _write_ledger(tmp_path, picks, settlements)
     directory = tmp_path / "paper_momentum"
     before = {
-        name: (directory / name).read_bytes()
-        for name in ("picks.jsonl", "settlements.jsonl")
+        name: (directory / name).read_bytes() for name in ("picks.jsonl", "settlements.jsonl")
     }
-    builder = LearningDatasetBuilder(db=app_db, cache_root=tmp_path, frames=frames)
+    builder = LearningDatasetBuilder(
+        portfolio_storage=SqlPortfolioStorage(app_db),
+        storage=SqlLearningStorage(app_db),
+        artifacts=LocalLearningArtifactsAdapter(tmp_path),
+        market_history=InMemoryMarketFramesPort(frames),
+    )
     builder.build()
     builder.build()
-    after = {
-        name: (directory / name).read_bytes()
-        for name in ("picks.jsonl", "settlements.jsonl")
-    }
+    after = {name: (directory / name).read_bytes() for name in ("picks.jsonl", "settlements.jsonl")}
     assert before == after
 
 
@@ -1627,18 +1697,19 @@ def test_a_pipeline_run_touches_no_strategy_order_or_risk_table(app_db, tmp_path
     """
     picks, settlements = _ledger_records([("2026-06-05", True), ("2026-06-12", False)])
     _write_ledger(tmp_path, picks, settlements)
-    service = LearningService(db=app_db, cache_root=tmp_path)
+    service = LearningService(
+        market_history=InMemoryMarketFramesPort({}),
+        portfolio_storage=SqlPortfolioStorage(app_db),
+        storage=SqlLearningStorage(app_db),
+        daily_learning_storage=SqlDailyLearningStorage(app_db),
+        artifacts=LocalLearningArtifactsAdapter(tmp_path),
+    )
 
     def fingerprint() -> dict[str, int]:
         from sqlalchemy import func, select
 
-        from atr.appdb.schema import (
-            deployments,
-            order_events,
-            orders,
-            strategies,
-            strategy_versions,
-        )
+        from forward.appdb.execution_schema import deployments, order_events, orders
+        from forward.appdb.strategy_backtest_schema import strategies, strategy_versions
 
         tables = {
             "strategies": strategies,

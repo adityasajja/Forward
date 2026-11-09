@@ -1,0 +1,66 @@
+{
+  "start_date": "2020-01-01",
+  "end_date": "2026-09-18",
+  "universe_files": [
+    "data/universe/n50.txt",
+    "data/universe/mid150.txt"
+  ],
+  "minimum_bars": 250,
+  "trading_days": 252,
+  "sessions_per_week": 5,
+  "cost_per_roundtrip": 0.00283,
+  "annual_risk_free_rate": 0.075,
+  "fold_count": 4,
+  "best_config": {
+    "signal": "gap_run_5",
+    "sl": 10,
+    "tp": 20,
+    "mh": 20,
+    "k": 5,
+    "step": 5,
+    "tsma": 0
+  },
+  "configs_to_test": [
+    {
+      "signal": "gap_run_5",
+      "sl": 10,
+      "tp": 20,
+      "mh": 20,
+      "k": 5,
+      "step": 5,
+      "tsma": 0
+    },
+    {
+      "signal": "gap_run_5",
+      "sl": 10,
+      "tp": 20,
+      "mh": 20,
+      "k": 3,
+      "step": 5,
+      "tsma": 0
+    },
+    {
+      "signal": "gap_run_5",
+      "sl": 10,
+      "tp": 20,
+      "mh": 20,
+      "k": 5,
+      "step": 5,
+      "tsma": 200
+    }
+  ],
+  "vol_target_annual": 0.25,
+  "minimum_annualized_volatility": 0.001,
+  "vol_window": 20,
+  "warmup_bars": 22,
+  "minimum_rebalances": 5,
+  "oos_start_fraction": 0.5,
+  "minimum_valid_folds_for_summary": 2,
+  "profitable_fold_minimum_sharpe": 2,
+  "minimum_stop_pct": 0,
+  "minimum_target_pct": 0,
+  "weekly_thresholds": {"2": 0.02, "3": 0.03, "5": 0.05},
+  "display_decimal_places": 3,
+  "stop_deltas": [-2, 0, 2],
+  "target_deltas": [-5, 0, 5]
+}

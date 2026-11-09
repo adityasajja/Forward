@@ -7,7 +7,7 @@ Usage:
     ./.venv/Scripts/python.exe scripts/validate_cross_sectional.py [--limit 120]
 """
 
-# ruff: noqa: I001  — the src/ path shim must run before the atr imports.
+# ruff: noqa: I001  — the src/ path shim must run before the Forward imports.
 from __future__ import annotations
 
 import argparse
@@ -17,24 +17,27 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from atr.backtest.engine import BacktestConfig  # noqa: E402
-from atr.brokers.iifl.client import IiflClient  # noqa: E402
-from atr.brokers.iifl.contracts import InstrumentMaster  # noqa: E402
-from atr.config.settings import get_settings  # noqa: E402
-from atr.core.enums import Timeframe  # noqa: E402
-from atr.core.models import Instrument  # noqa: E402
-from atr.data.base import ListFeed, pivot_to_snapshots  # noqa: E402
-from atr.research.validate import (  # noqa: E402
+from forward.backtest.engine import BacktestConfig  # noqa: E402
+from forward.brokers.iifl.client import IiflClient  # noqa: E402
+from forward.brokers.iifl.contracts import InstrumentMaster  # noqa: E402
+from forward.config.settings import get_settings  # noqa: E402
+from forward.core.enums import Timeframe  # noqa: E402
+from forward.core.instrument_models import Instrument
+from forward.core.feeds import ListFeed  # noqa: E402
+from forward.data.base import pivot_to_snapshots  # noqa: E402
+from forward.research.validate import (  # noqa: E402
     ValidationConfig,
     WalkForwardConfig,
     walk_forward,
 )
-from atr.signals.cross_sectional import CrossSectionalMomentum  # noqa: E402
-from atr.signals.engine import liquid_universe, load_daily  # noqa: E402
+from forward.signals.cross_sectional import CrossSectionalMomentum  # noqa: E402
+from forward.data.universe import liquid_universe
+from forward.brokers.iifl.daily_history import load_daily  # noqa: E402
 from loguru import logger  # noqa: E402
 
 
 def main() -> int:
+    """Fetch or load a panel, then validate cross-sectional momentum."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--limit", type=int, default=120, help="universe size")
     parser.add_argument("--train", type=int, default=300)
@@ -54,7 +57,7 @@ def main() -> int:
         app_key=settings.iifl_app_key, app_secret=settings.iifl_app_secret
     )
     if not client.restore_session():
-        logger.error("no IIFL session — run `atr login --print-url` first")
+        logger.error("no IIFL session — run `forward login --print-url` first")
         return 1
 
     symbols = liquid_universe("NSEEQ", limit=args.limit)
@@ -75,10 +78,12 @@ def main() -> int:
             master.load_cached(["NSEEQ"])
             for i, symbol in enumerate(symbols, 1):
                 try:
-                    conid = master.find(symbol, "NSEEQ").conid
+                    instrument = master.find(symbol, "NSEEQ")
                 except KeyError:
                     continue
-                frame = load_daily(symbol, "NSEEQ", client, conid, lookback_days=2200)
+                frame = load_daily(
+                    client, instrument, lookback_days=2200
+                )
                 if frame.empty:
                     continue
                 frame = frame.copy()
@@ -94,14 +99,15 @@ def main() -> int:
         combined.to_parquet(panel, index=False)
         logger.info("cached panel -> {}", panel)
 
-    symbol_count = int(combined["symbol"].nunique())
+    panel_symbols = sorted(combined["symbol"].dropna().unique().tolist())
+    symbol_count = len(panel_symbols)
     logger.info(
         "{} symbols, {} -> {}",
         symbol_count, combined["ts"].min().date(), combined["ts"].max().date(),
     )
 
     snapshots = pivot_to_snapshots(combined, Timeframe.DAY_1)
-    instruments = {s: Instrument(symbol=s, exchange="NSEEQ") for s in symbols}
+    instruments = {s: Instrument(symbol=s, exchange="NSEEQ") for s in panel_symbols}
     feed = ListFeed(snapshots, instruments)
 
     warmup = args.lookback + args.skip + 40
@@ -131,7 +137,7 @@ def main() -> int:
         json.dumps(
             {
                 "strategy": "cross_sectional_momentum",
-                "universe_size": len(frames),
+                "universe_size": symbol_count,
                 "params": {
                     "lookback": args.lookback, "skip": args.skip, "top_n": args.top_n,
                     "rebalance_days": args.rebalance, "trend_sma": args.trend_sma,

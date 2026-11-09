@@ -1,32 +1,59 @@
-"""Debug IIFL API response format."""
-import sys; sys.path.insert(0, "src")
-import pandas as pd
-from datetime import datetime
-from atr.brokers.iifl.auth import SessionStore
-from atr.brokers.iifl.client import IiflClient, _fmt_date
-from atr.brokers.iifl.contracts import InstrumentMaster
-from atr.config.settings import get_settings
+"""Inspect the exact shape of an IIFL historical-data response."""
 
-s = get_settings()
-store = SessionStore(s.iifl_session_cache)
-session = store.load()
-client = IiflClient(app_key=s.iifl_app_key, app_secret=s.iifl_app_secret, session_store=store, timeout=30)
-client.set_session(session)
+from __future__ import annotations
 
-master = InstrumentMaster(client)
-master.sync(["NSEEQ"])
-inst = master.search("NIFTYBEES", exchange="NSEEQ")
-conid = str(inst.iloc[0]["conid"])
-
-from_dt = datetime(2026, 9, 10)
-to_dt = datetime(2026, 9, 12)
-payload = client.historical_data(
-    exchange="NSEEQ", instrument_id=conid, interval="1m",
-    from_date=_fmt_date(from_dt), to_date=_fmt_date(to_dt),
-)
-
+import argparse
 import json
-print(f"Type: {type(payload)}")
-print(f"Keys: {list(payload.keys()) if isinstance(payload, dict) else 'N/A'}")
-print(f"Full response:\n{json.dumps(payload, indent=2, default=str)[:3000]}")
-client.close()
+from datetime import datetime
+from pathlib import Path
+
+from forward.brokers.iifl.auth import SessionStore
+from forward.brokers.iifl.client import IiflClient, _fmt_date
+from forward.brokers.iifl.contracts import InstrumentMaster
+from forward.config.settings import get_settings
+
+ROOT = Path(__file__).resolve().parents[1]
+CONFIG_PATH = ROOT / "config" / "iifl_debug_format.json"
+
+
+def main() -> int:
+    """Print response metadata and a bounded sample."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", type=Path, default=CONFIG_PATH)
+    config_path = parser.parse_args().config
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    print(f"Configuration: {config_path.resolve()}", flush=True)
+
+    settings = get_settings()
+    store = SessionStore(settings.iifl_session_cache)
+    session = store.load()
+    if session is None:
+        raise RuntimeError("No cached IIFL session is available")
+    client = IiflClient(
+        app_key=settings.iifl_app_key,
+        app_secret=settings.iifl_app_secret,
+        session_store=store,
+    )
+    client.set_session(session)
+    master = InstrumentMaster(client)
+    master.sync([config["exchange"]])
+    instrument = master.search(config["symbol"], exchange=config["exchange"]).iloc[0]
+    from_date = datetime.fromisoformat(config["from_date"])
+    to_date = datetime.fromisoformat(config["to_date"])
+    payload = client.historical_data(
+        exchange=config["exchange"],
+        instrument_id=str(instrument["conid"]),
+        interval=config["interval"],
+        from_date=_fmt_date(from_date),
+        to_date=_fmt_date(to_date),
+    )
+    preview = json.dumps(payload, indent=2, default=str)
+    print(f"Type: {type(payload)}")
+    print(f"Keys: {list(payload.keys()) if isinstance(payload, dict) else 'N/A'}")
+    print(f"Full response preview:\n{preview[:config['response_preview_characters']]}")
+    client.close()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

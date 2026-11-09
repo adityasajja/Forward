@@ -20,7 +20,7 @@ decoration:
   genuinely breaches the stored stop. A test that stubbed the rules would prove
   the plumbing between two fakes.
 * **No hand-written journal row.** The episode is opened and closed by
-  :class:`~atr.services.journal.TradeJournalService` reconciling the position
+  :class:`~forward.services.journal.TradeJournalService` reconciling the position
   fold, which is the production path. Seeding ``trade_journal`` directly — as
   ``test_learning_forward_paper.py`` does for the *backfill* case, on purpose —
   would prove nothing about the pipeline, because the pipeline is the thing that
@@ -47,11 +47,33 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import pytest
 
-from atr.research.learning_evidence import (
+from forward.appdb.daily_learning_storage import SqlDailyLearningStorage
+from forward.appdb.learning_storage import SqlLearningStorage
+from forward.appdb.order_storage import SqlOrderStorage
+from forward.appdb.paper_ledger_storage import SqlPaperLedgerStorage
+from forward.appdb.paper_runner_storage import SqlPaperRunnerStorage
+from forward.appdb.portfolio_storage import SqlPortfolioStorage
+from forward.appdb.risk_state_storage import SqlRiskStateStorage
+from forward.appdb.system_state_storage import SqlSystemStateStorage
+from forward.appdb.trade_journal_storage import SqlTradeJournalStorage
+from forward.config.settings import get_settings
+from forward.core.learning_evidence import (
     CLASS_PAPER_FORWARD,
     GRADE_FORWARD,
     GRADE_IN_SAMPLE,
 )
+from forward.data.cached_market_frames import CachedMarketFramesAdapter
+from forward.data.learning_artifacts import LocalLearningArtifactsAdapter
+from forward.data.vwap_liquidity import NseBhavcopyLiquidityAdapter
+from forward.market_calendar import get_market_calendar
+from forward.services.paper_ledger import PaperLedger
+from forward.services.risk import RiskStateService
+from tests.market_data_fakes import (
+    InMemoryMarketFramesPort,
+    NoopSignalContextEnricher,
+)
+from tests.order_fakes import order_instrument_lookup
+from tests.paper_price_fakes import StaticRunnerVenueProvider, no_live_price
 
 SYMBOL = "RELIANCE"
 EXCHANGE = "NSEEQ"
@@ -61,7 +83,6 @@ EXCHANGE = "NSEEQ"
 SESSION = datetime(2026, 9, 14, 10, 0, tzinfo=ZoneInfo("Asia/Kolkata"))
 #: The deployment's capital and the size of one trade.
 CAPITAL = 500_000.0
-ORDER_VALUE = 200_000.0
 
 #: A breakout entry and a stop-loss exit, as a *stored strategy version* — the
 #: same shape a version authored from the rule layer has. Both legs are real
@@ -115,18 +136,13 @@ def _no_live_seams():
     reaching for a broadcaster that is not there. The point of the suite is the
     trading chain, not the feed wiring.
     """
-    from atr.services import paper as paper_service
 
-    paper_service.install_live_source(None)
-    paper_service.install_live_subscriber(None)
     yield
-    paper_service.install_live_source(None)
-    paper_service.install_live_subscriber(None)
 
 
 @pytest.fixture()
 def owner(app_db) -> str:
-    from atr.appdb.schema import users
+    from forward.appdb.account_schema import users
 
     with app_db.session() as session:
         session.execute(
@@ -174,11 +190,12 @@ def chain(app_db, owner, monkeypatch) -> Chain:
     the rules need for warmup, and this test is about the live price, not about
     the cache.
     """
-    from atr.appdb.repositories import DeploymentRepository, StrategyRepository
-    from atr.services.runner import PaperRunner
+    from forward.appdb.deployment_repository import DeploymentRepository
+    from forward.appdb.strategy_repository import StrategyRepository
+    from forward.services.runner import PaperRunner
 
     monkeypatch.setattr(
-        "atr.signals.engine.load_daily",
+        "forward.data.cached_market_frames.load_daily_from_cache",
         lambda symbol, exchange="NSEEQ", **kw: _daily(),
     )
 
@@ -204,7 +221,7 @@ def chain(app_db, owner, monkeypatch) -> Chain:
                 "symbols": [SYMBOL],
                 "exchange": EXCHANGE,
                 "signal_basis": "live",
-                "order_value": ORDER_VALUE,
+                "timeframe": "1d",
                 "lookback_days": 400,
                 "max_open_positions": 1,
             },
@@ -216,7 +233,29 @@ def chain(app_db, owner, monkeypatch) -> Chain:
     high_63 = float(frame["close"].tail(63).max())
     tick = round(high_63 * 0.995, 2)
 
-    runner = PaperRunner(db=app_db)
+    runner = PaperRunner(
+        interval_seconds=get_settings().runner_interval_seconds,
+        lookback_days=get_settings().runner_lookback_days,
+        minimum_sleep_seconds=get_settings().runner_min_sleep_seconds,
+        market_wait_seconds=get_settings().runner_market_wait_seconds,
+        symbol_retry_seconds=get_settings().deployment_symbol_retry_seconds,
+        signal_context=NoopSignalContextEnricher(),
+        calendar=get_market_calendar(),
+        venue_provider=StaticRunnerVenueProvider(
+            prices=no_live_price, instruments=order_instrument_lookup
+        ),
+        daily_history=CachedMarketFramesAdapter(),
+        vwap_liquidity=NseBhavcopyLiquidityAdapter(get_settings().research_data_directory),
+        sector_table={},
+        instrument_lookup=order_instrument_lookup,
+        journal_storage=SqlTradeJournalStorage(app_db),
+        portfolio_storage=SqlPortfolioStorage(app_db),
+        ledger=PaperLedger(storage=SqlPaperLedgerStorage(app_db), price_source=no_live_price),
+        order_storage=SqlOrderStorage(app_db),
+        runner_storage=SqlPaperRunnerStorage(app_db),
+        state_storage=SqlSystemStateStorage(app_db),
+        risk_state=RiskStateService(SqlRiskStateStorage(app_db), get_settings()),
+    )
     runner.sync_loops()
     loop = runner._loops[deployment["deployment_id"]]
 
@@ -244,7 +283,7 @@ def _orders(app_db) -> list[dict]:
 
 
 def _events(app_db, order_id: str) -> list[dict]:
-    from atr.appdb.repositories import OrderEventRepository
+    from forward.appdb.order_event_repository import OrderEventRepository
 
     with app_db.session() as session:
         return OrderEventRepository.history(session, order_id)
@@ -255,7 +294,7 @@ def _raw(event: dict) -> dict:
     if isinstance(raw, str):
         try:
             return json.loads(raw)
-        except (ValueError, TypeError):
+        except ValueError, TypeError:
             return {}
     return raw or {}
 
@@ -273,9 +312,14 @@ def _journal_rows(app_db) -> list[dict]:
 
 
 def _dataset(app_db, tmp_path):
-    from atr.services.learning import LearningDatasetBuilder
+    from forward.services.learning_dataset import LearningDatasetBuilder
 
-    return LearningDatasetBuilder(db=app_db, cache_root=tmp_path, frames={}).build()
+    return LearningDatasetBuilder(
+        portfolio_storage=SqlPortfolioStorage(app_db),
+        storage=SqlLearningStorage(app_db),
+        artifacts=LocalLearningArtifactsAdapter(tmp_path),
+        market_history=InMemoryMarketFramesPort({}),
+    ).build()
 
 
 def _open_then_close(chain: Chain) -> None:
@@ -293,9 +337,7 @@ def _open_then_close(chain: Chain) -> None:
 # ---------------------------------------------------------------------------
 # 1. the whole chain, in one test
 # ---------------------------------------------------------------------------
-def test_a_live_tick_becomes_a_closed_forward_learning_observation(
-    chain, app_db, tmp_path
-):
+def test_a_live_tick_becomes_a_closed_forward_learning_observation(chain, app_db, tmp_path):
     """The headline property, link by link, with nothing stubbed in between."""
     # --- LIVE TICK -----------------------------------------------------
     assert chain.price > 0
@@ -333,9 +375,7 @@ def test_a_live_tick_becomes_a_closed_forward_learning_observation(
     assert summary["latest_forward_ts"] is not None
 
 
-def test_the_forward_row_carries_the_trade_the_chain_actually_produced(
-    chain, app_db, tmp_path
-):
+def test_the_forward_row_carries_the_trade_the_chain_actually_produced(chain, app_db, tmp_path):
     """Real context, and the gaps named rather than filled in."""
     _open_then_close(chain)
     row = _dataset(app_db, tmp_path).rows[0]
@@ -452,7 +492,7 @@ def test_the_entry_order_carries_the_execution_time_provenance_stamp(chain, app_
     pinned where it is written: the order's ``NEW`` event, at creation, by the
     OMS. A timestamp cannot do this job — a backfill harness writes those too.
     """
-    from atr.execution.oms import PROVENANCE_FORWARD, PROVENANCE_KEY, RECORDED_AT_KEY
+    from forward.execution.oms import PROVENANCE_FORWARD, PROVENANCE_KEY, RECORDED_AT_KEY
 
     chain.runner.pass_once(now=SESSION)
     buy = [o for o in _orders(app_db) if o["side"] == "BUY"][0]
@@ -492,9 +532,15 @@ def test_the_learning_service_reports_the_forward_observation(chain, app_db, tmp
     The dataset builder reads the journal the runner wrote; nothing here points
     it at the trade.
     """
-    from atr.services.learning import LearningService
+    from forward.services.learning import LearningService
 
-    service = LearningService(db=app_db, cache_root=tmp_path)
+    service = LearningService(
+        market_history=InMemoryMarketFramesPort({}),
+        portfolio_storage=SqlPortfolioStorage(app_db),
+        storage=SqlLearningStorage(app_db),
+        daily_learning_storage=SqlDailyLearningStorage(app_db),
+        artifacts=LocalLearningArtifactsAdapter(tmp_path),
+    )
     before = service.status()
     assert before["counts"]["trade_journal"] == 0
     assert before["forward_available"] == 0
@@ -545,7 +591,7 @@ def test_a_deployment_whose_version_is_missing_trades_nothing(chain, app_db, tmp
     """
     from sqlalchemy import update
 
-    from atr.appdb.schema import deployments
+    from forward.appdb.execution_schema import deployments
 
     with app_db.session() as session:
         session.execute(
@@ -572,7 +618,7 @@ def test_the_runner_is_not_the_only_thing_that_can_write_a_forward_trade(chain, 
     scheduler, a manual override, a different loop — is stamped the same way,
     because the stamp is written where the order is created.
     """
-    from atr.execution.oms import PROVENANCE_FORWARD, PROVENANCE_KEY, OrderDraft
+    from forward.execution.oms import PROVENANCE_FORWARD, PROVENANCE_KEY, OrderDraft
 
     chain.loop.bind()
     placed = chain.loop.execution.place(

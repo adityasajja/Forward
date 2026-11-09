@@ -66,7 +66,7 @@ def _register(client, *, username: str) -> str:
     The password is real, so ``_as`` can sign in through the actual login route —
     the goal is a genuine session for the right user, not a forged one.
     """
-    from atr.auth.service import get_auth_service
+    from forward.wiring.auth import get_auth_service
 
     user = get_auth_service().register(
         email=f"{username}@example.com",
@@ -87,7 +87,7 @@ def _as(client, username: str):
     """
     from fastapi.testclient import TestClient
 
-    from atr.api.main import app
+    from forward.api.main import app
 
     other = TestClient(app, client=("127.0.0.1", 51235))
     response = other.post(
@@ -101,8 +101,8 @@ def _as(client, username: str):
 
 def _add_strategy(user_id: str, name: str, *, engine_key: str = "signals_entry"):
     """A saved strategy with one immutable version. Returns ``(id, version)``."""
-    from atr.appdb.engine import get_app_db
-    from atr.appdb.repositories import StrategyRepository
+    from forward.appdb.engine import get_app_db
+    from forward.appdb.strategy_repository import StrategyRepository
 
     with get_app_db().session() as session:
         row = StrategyRepository.create(
@@ -183,8 +183,8 @@ def test_versions_are_served_newest_first(auth_client):
     the version is what a deployment is pinned to — so the user deployed the
     rules they least likely meant while the screen said otherwise.
     """
-    from atr.appdb.engine import get_app_db
-    from atr.appdb.repositories import StrategyRepository
+    from forward.appdb.engine import get_app_db
+    from forward.appdb.strategy_repository import StrategyRepository
 
     user_id = _owner(auth_client)
     strategy_id, _ = _add_strategy(user_id, "Ordering Probe")

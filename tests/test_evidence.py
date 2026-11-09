@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from atr.research.evidence import (
+from forward.research.evidence import (
     Evidence,
     RegimeResult,
     SelectionBias,
@@ -343,11 +343,21 @@ def test_buy_and_hold_is_equal_weight():
 # --------------------------------------------------------------------------
 
 
-def test_evidence_endpoint_reports_missing_file_with_a_hint(monkeypatch, tmp_path):
-    from atr.api.legacy import validation as M
+def _use_report_directory(monkeypatch, data_directory):
+    """Configure the report service to read from a temporary data directory."""
+    from forward.api import composition
+    from forward.data.validation_reports import JsonValidationReportAdapter
+    from forward.services.validation_reports import ValidationReportService
 
-    monkeypatch.setattr(M, "_EVIDENCE_PATH", tmp_path / "absent.json")
-    payload = M.evidence_report()
+    service = ValidationReportService(JsonValidationReportAdapter(data_directory))
+    monkeypatch.setattr(composition, "_VALIDATION_REPORT_SERVICE", service)
+
+
+def test_evidence_endpoint_reports_missing_file_with_a_hint(monkeypatch, tmp_path):
+    _use_report_directory(monkeypatch, tmp_path)
+    from forward.api.legacy.validation import evidence_report
+
+    payload = evidence_report()
     assert payload["available"] is False
     assert "research_honest_verdicts" in payload["hint"]
 
@@ -355,9 +365,8 @@ def test_evidence_endpoint_reports_missing_file_with_a_hint(monkeypatch, tmp_pat
 def test_evidence_endpoint_counts_credible_findings(monkeypatch, tmp_path):
     import json
 
-    from atr.api.legacy import validation as M
-
-    path = tmp_path / "evidence.json"
+    path = tmp_path / "signals" / "evidence.json"
+    path.parent.mkdir(parents=True)
     path.write_text(json.dumps({
         "findings": [
             {"verdict": {"credible": False}},
@@ -365,21 +374,22 @@ def test_evidence_endpoint_counts_credible_findings(monkeypatch, tmp_path):
             {"verdict": {"credible": True}},
         ]
     }), encoding="utf8")
-    monkeypatch.setattr(M, "_EVIDENCE_PATH", path)
+    _use_report_directory(monkeypatch, tmp_path)
+    from forward.api.legacy.validation import evidence_report
 
-    payload = M.evidence_report()
+    payload = evidence_report()
     assert payload["available"] is True
     assert payload["total"] == 3
     assert payload["credible_count"] == 1
 
 
 def test_evidence_endpoint_survives_corrupt_json(monkeypatch, tmp_path):
-    from atr.api.legacy import validation as M
-
-    path = tmp_path / "evidence.json"
+    path = tmp_path / "signals" / "evidence.json"
+    path.parent.mkdir(parents=True)
     path.write_text("{not json", encoding="utf8")
-    monkeypatch.setattr(M, "_EVIDENCE_PATH", path)
+    _use_report_directory(monkeypatch, tmp_path)
+    from forward.api.legacy.validation import evidence_report
 
-    payload = M.evidence_report()
+    payload = evidence_report()
     assert payload["available"] is False
     assert "error" in payload

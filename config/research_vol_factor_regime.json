@@ -1,0 +1,10 @@
+{
+  "panel_file": "data/signals/panel_nseeq_120.parquet",
+  "monthly_period": "ME",
+  "volatility_lookback_days": 126,
+  "warmup_months": 6,
+  "minimum_cross_section_symbols": 20,
+  "quantile_count": 5,
+  "periods_per_year": 12,
+  "worst_market_period_count": 5
+}

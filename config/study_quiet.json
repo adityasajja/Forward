@@ -1,0 +1,15 @@
+{
+  "data_directory": "data/iifl_daily/NSEEQ",
+  "minimum_history_bars": 200,
+  "history_split_quantile": 0.5,
+  "quiet_return_days": 5,
+  "quiet_return_maximum_pct": 2.0,
+  "quiet_range_days": 5,
+  "range_baseline_days": 20,
+  "quiet_range_ratio_maximum": 0.7,
+  "top_lookback_days": 20,
+  "top_distance_maximum_pct": 3.5,
+  "typical_move_lookback_days": 120,
+  "forward_days": 5,
+  "half_usual_move_fraction": 0.5
+}

@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from atr.strategy.indicators import atr, bollinger, crossover, crossunder, rsi, sma
+from forward.strategy.indicators import atr, bollinger, crossover, crossunder, rsi, sma
 
 
 def test_rsi_is_100_when_price_only_rises():

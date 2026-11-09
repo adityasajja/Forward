@@ -11,26 +11,25 @@ The property under test is asymmetric on purpose:
 
 from __future__ import annotations
 
+import importlib
+import json
 from types import SimpleNamespace
+
+import pytest
 
 _OPERATOR = SimpleNamespace(username="operator")
 _ADITYA = SimpleNamespace(username="aditya")
-
-import importlib
-import json
-
-import pytest
 
 
 def _restart(monkeypatch, tmp_path):
     """A fresh copy of the route modules, as after a server restart, with one namespace over them."""
     from types import SimpleNamespace
 
-    from atr.api.legacy import common, risk, system
+    from forward.api.legacy import common, risk, system
 
     for module in (common, risk, system):
         importlib.reload(module)
-    monkeypatch.setattr(common, "_AUDIT_PATH", tmp_path / "audit.jsonl")
+    monkeypatch.setenv("FORWARD_AUDIT_PATH", str(tmp_path / "audit.jsonl"))
     names = {}
     for module in (common, system, risk):
         names.update({k: v for k, v in vars(module).items() if not k.startswith("__")})

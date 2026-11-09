@@ -1,0 +1,7 @@
+{
+  "weekly_momentum_config": "config/research_weekly_momentum.json",
+  "fold_count": 5,
+  "minimum_test_weeks": 20,
+  "minimum_training_weeks": 60,
+  "output_file": "data/self_learning/momentum_deflated.json"
+}

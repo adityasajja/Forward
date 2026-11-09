@@ -18,35 +18,37 @@ from typing import Any
 
 import pytest
 
-from atr.appdb.engine import AppDatabase
-from atr.appdb.repositories import (
+from forward.appdb.daily_learning_storage import SqlDailyLearningStorage
+from forward.appdb.engine import AppDatabase
+from forward.appdb.identity_repository import UserRepository
+from forward.appdb.learning_storage import SqlLearningStorage
+from forward.appdb.portfolio_storage import SqlPortfolioStorage
+from forward.appdb.strategy_repository import StrategyRepository
+from forward.appdb.strategy_research_repository import (
     OptimizationRecommendationRepository,
-    StrategyRepository,
-    UserRepository,
 )
-from atr.backtest.engine import BacktestConfig
-from atr.data.synthetic import SyntheticConfig, SyntheticFeed
-from atr.optimization.adaptive import (
+from forward.appdb.strategy_research_storage import SqlStrategyResearchStorage
+from forward.data.synthetic import SyntheticConfig, SyntheticFeed
+from forward.optimization.adaptive import (
     AdaptiveParameter,
     apply_parameter_to_definition,
     extract_adaptive_parameters,
 )
-from atr.optimization.candidates import (
-    OptimizationCandidate,
+from forward.optimization.candidates import (
     generate_candidates_from_observations,
-    match_observation_to_parameter,
 )
-from atr.optimization.evaluator import (
+from forward.optimization.evaluator import (
     PerformanceMetrics,
     RobustnessResult,
     WalkForwardMetrics,
     evaluate_backtest,
-    evaluate_candidate,
     evaluate_robustness,
     evaluate_walk_forward,
 )
-from atr.research.validate import WalkForwardConfig
-from atr.services.optimization import OptimizationService
+from forward.research.validate import WalkForwardConfig
+from forward.services.learning import LearningService
+from forward.services.optimization import OptimizationService
+from tests.market_data_fakes import InMemoryLearningArtifactsPort, InMemoryMarketFramesPort
 
 
 @pytest.fixture
@@ -131,20 +133,28 @@ def test_only_explicit_adaptive_parameters_are_extracted():
 
 def test_empty_adaptive_parameters_yields_empty():
     """A strategy without adaptive_parameters allows zero parameter adaptations."""
-    definition = {
-        "rules": {"entry": {"volume_multiple": 1.5}, "exit": {"stop_loss_pct": 2.0}}
-    }
+    definition = {"rules": {"entry": {"volume_multiple": 1.5}, "exit": {"stop_loss_pct": 2.0}}}
     assert extract_adaptive_parameters(definition) == {}
 
 
 def test_parameter_bounds_validation():
     """Invalid bounds (min >= max or step <= 0) are rejected."""
     bad_def = {
+        "rules": {"entry": {"volume_multiple": 1.5}},
         "adaptive_parameters": [
-            {"name": "volume_multiple", "minimum": 3.0, "maximum": 1.0, "step": 0.1, "current": 1.5}
+            {
+                "name": "volume_multiple",
+                "current": 1.5,
+                "minimum": 3.0,
+                "maximum": 1.0,
+                "step": 0.1,
+                "block": "entry",
+                "adaptive": True,
+            }
         ]
     }
-    assert extract_adaptive_parameters(bad_def) == {}
+    with pytest.raises(ValueError, match="minimum"):
+        extract_adaptive_parameters(bad_def)
 
 
 def test_apply_parameter_immutability():
@@ -155,7 +165,15 @@ def test_apply_parameter_immutability():
             "exit": {"stop_loss_pct": 2.0},
         },
         "adaptive_parameters": [
-            {"name": "volume_multiple", "current": 1.5, "minimum": 1.0, "maximum": 3.0, "step": 0.1}
+            {
+                "name": "volume_multiple",
+                "current": 1.5,
+                "minimum": 1.0,
+                "maximum": 3.0,
+                "step": 0.1,
+                "block": "entry",
+                "adaptive": True,
+            }
         ],
     }
 
@@ -191,6 +209,7 @@ def test_candidate_generation_from_forward_observations():
                 "maximum": 3.0,
                 "step": 0.1,
                 "adaptive": True,
+                "block": "entry",
             }
         ],
     }
@@ -210,7 +229,9 @@ def test_candidate_generation_from_forward_observations():
         }
     ]
 
-    candidates = generate_candidates_from_observations(strategy_def, observations, min_sample_size=10)
+    candidates = generate_candidates_from_observations(
+        strategy_def, observations, min_sample_size=10
+    )
     assert len(candidates) > 0
 
     # Every candidate retains original strategy as baseline
@@ -228,7 +249,15 @@ def test_candidate_generation_suppresses_small_samples():
     strategy_def = {
         "rules": {"entry": {"volume_multiple": 1.5}},
         "adaptive_parameters": [
-            {"name": "volume_multiple", "current": 1.5, "minimum": 1.0, "maximum": 3.0, "step": 0.1}
+            {
+                "name": "volume_multiple",
+                "current": 1.5,
+                "minimum": 1.0,
+                "maximum": 3.0,
+                "step": 0.1,
+                "block": "entry",
+                "adaptive": True,
+            }
         ],
     }
 
@@ -241,7 +270,9 @@ def test_candidate_generation_suppresses_small_samples():
         }
     ]
 
-    candidates = generate_candidates_from_observations(strategy_def, tiny_observations, min_sample_size=10)
+    candidates = generate_candidates_from_observations(
+        strategy_def, tiny_observations, min_sample_size=10
+    )
     assert len(candidates) == 0
 
 
@@ -282,9 +313,7 @@ def test_walk_forward_validation_structure(feed):
     }
 
     wf_config = WalkForwardConfig(train_bars=60, test_bars=20, step_bars=20)
-    wf_metrics = evaluate_walk_forward(
-        feed, definition, "fast_period", 10.0, wf_config=wf_config
-    )
+    wf_metrics = evaluate_walk_forward(feed, definition, "fast_period", 10.0, wf_config=wf_config)
     assert isinstance(wf_metrics, WalkForwardMetrics)
     assert hasattr(wf_metrics, "in_sample_sharpe")
     assert hasattr(wf_metrics, "out_of_sample_sharpe")
@@ -310,6 +339,7 @@ def test_robustness_sensitivity_scan(feed):
         minimum=5.0,
         maximum=20.0,
         step=2.0,
+        block="params",
         adaptive=True,
     )
 
@@ -327,7 +357,9 @@ def test_robustness_sensitivity_scan(feed):
 # ---------------------------------------------------------------------------
 
 
-def test_recommendation_lifecycle_and_version_immutability(app_db: AppDatabase, test_user: dict[str, Any]):
+def test_recommendation_lifecycle_and_version_immutability(
+    app_db: AppDatabase, test_user: dict[str, Any]
+):
     """End-to-end lifecycle test:
 
     V1 created
@@ -353,6 +385,7 @@ def test_recommendation_lifecycle_and_version_immutability(app_db: AppDatabase, 
                 "maximum": 3.0,
                 "step": 0.1,
                 "adaptive": True,
+                "block": "entry",
             }
         ],
     }
@@ -405,7 +438,16 @@ def test_recommendation_lifecycle_and_version_immutability(app_db: AppDatabase, 
         assert rec["proposed_value"] == 1.9
 
     # 3. Attempting to apply directly without APPROVAL must fail
-    opt_service = OptimizationService(db=app_db)
+    opt_service = OptimizationService(
+        learning_service=LearningService(
+            artifacts=InMemoryLearningArtifactsPort(),
+            market_history=InMemoryMarketFramesPort({}),
+            storage=SqlLearningStorage(app_db),
+            daily_learning_storage=SqlDailyLearningStorage(app_db),
+            portfolio_storage=SqlPortfolioStorage(app_db),
+        ),
+        storage=SqlStrategyResearchStorage(app_db),
+    )
     with pytest.raises(ValueError, match="only APPROVED recommendations may be applied"):
         opt_service.apply_recommendation(rec_id, author_user_id=user_id)
 
@@ -420,8 +462,8 @@ def test_recommendation_lifecycle_and_version_immutability(app_db: AppDatabase, 
 
     # 6. Verify Immutability of V1 and validity of V2
     with app_db.session() as session:
-        v1_check = StrategyRepository.get_version(session, strat_id, version=1)
-        v2_check = StrategyRepository.get_version(session, strat_id, version=2)
+        v1_check = StrategyRepository.version(session, strat_id, version=1)
+        v2_check = StrategyRepository.version(session, strat_id, version=2)
 
         assert v1_check is not None
         assert v2_check is not None

@@ -15,12 +15,12 @@ import tempfile
 
 os.environ.setdefault("ENV", "dev")
 os.environ.setdefault("AUTH_REQUIRED", "true")
-os.environ.setdefault("ATR_SECRET_KEY", "verify-key")
+os.environ.setdefault("FORWARD_SECRET_KEY", "verify-key")
 os.environ["APP_DB_URL"] = "sqlite:///" + tempfile.mkdtemp().replace("\\", "/") + "/verify.db"
 
 from fastapi.testclient import TestClient  # noqa: E402
 
-from atr.api.main import app  # noqa: E402
+from forward.api.main import app  # noqa: E402
 
 
 def main() -> int:

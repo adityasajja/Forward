@@ -89,10 +89,10 @@ def other_author(fresh_env, master):
     """
     from fastapi.testclient import TestClient
 
-    from atr.api.main import app
-    from atr.appdb.engine import get_app_db
-    from atr.appdb.repositories import UserRepository
-    from atr.auth.passwords import hash_password
+    from forward.api.main import app
+    from forward.appdb.engine import get_app_db
+    from forward.appdb.identity_repository import UserRepository
+    from forward.auth.passwords import hash_password
 
     with get_app_db().session() as session:
         UserRepository.create(
@@ -117,10 +117,10 @@ def viewer(fresh_env, master) -> object:
     """A read-only account, for the authorization assertions."""
     from fastapi.testclient import TestClient
 
-    from atr.api.main import app
-    from atr.appdb.engine import get_app_db
-    from atr.appdb.repositories import UserRepository
-    from atr.auth.passwords import hash_password
+    from forward.api.main import app
+    from forward.appdb.engine import get_app_db
+    from forward.appdb.identity_repository import UserRepository
+    from forward.auth.passwords import hash_password
 
     with get_app_db().session() as session:
         UserRepository.create(
@@ -333,22 +333,18 @@ def test_a_non_numeric_rule_value_is_refused(auth_client):
     )
 
 
-def test_force_stores_a_broken_definition_and_the_listing_says_so(auth_client):
-    """The escape hatch exists, and it is not quiet: the version reads as undeployable."""
+def test_structurally_invalid_definition_cannot_be_saved_as_a_version(auth_client):
+    """Invalid drafts must not become permanent strategy versions."""
     created = _create(auth_client)
     response = auth_client.post(
         f"{BASE}/{created['strategy_id']}/versions",
-        json={
-            "definition": {"rules": {"entry": {"not_a_field": 1}}},
-            "force": True,
-        },
+        json={"definition": {"rules": {"entry": {"not_a_field": 1}}}},
     )
-    assert response.status_code == 201, response.text
-
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"]["code"] == "invalid_definition"
     listed = auth_client.get(f"{BASE}/{created['strategy_id']}/versions").json()
     assert listed["deployable_versions"] == []
-    assert listed["versions"][0]["deployable"] is False
-    assert listed["versions"][0]["not_deployable_reason"]
+    assert listed["versions"] == []
 
 
 # ========================================================================== validate
@@ -505,10 +501,11 @@ def test_a_deployment_cannot_pin_a_version_that_does_not_exist(auth_client):
 
 def test_a_deployment_cannot_pin_a_version_that_cannot_trade(auth_client):
     created = _create(auth_client)
-    auth_client.post(
+    invalid_version = auth_client.post(
         f"{BASE}/{created['strategy_id']}/versions",
-        json={"definition": {"engine_key": "signals_entry"}, "force": True},
+        json={"definition": {"engine_key": "signals_entry"}},
     )
+    assert invalid_version.status_code == 422, invalid_version.text
 
     response = auth_client.post(
         "/api/v1/paper/deployments",
@@ -549,3 +546,24 @@ def test_a_deployment_can_pin_the_exact_version_that_was_authored(auth_client):
     )
     assert started.status_code == 200, started.text
     assert started.json()["status"] == "RUNNING"
+
+
+def test_list_summary_matches_detail_with_and_without_versions(auth_client):
+    empty = _create(auth_client, name="No versions")
+    versioned = _create(auth_client, name="Versioned")
+    _version(auth_client, versioned["strategy_id"])
+    import copy
+
+    second = copy.deepcopy(DEFINITION)
+    second["rules"]["exit"]["take_profit_pct"] = 12.0
+    second["params"]["take_profit_pct"] = 12.0
+    _version(auth_client, versioned["strategy_id"], definition=second)
+    listing = auth_client.get(BASE).json()["strategies"]
+    for strategy in [empty, versioned]:
+        sid = strategy["strategy_id"]
+        detail = auth_client.get(f"{BASE}/{sid}").json()
+        listed = next(row for row in listing if row["strategy_id"] == sid)
+        assert listed == detail
+    assert next(row for row in listing if row["strategy_id"] == empty["strategy_id"])["version_count"] == 0
+    assert next(row for row in listing if row["strategy_id"] == versioned["strategy_id"])["version_count"] == 2
+    assert next(row for row in listing if row["strategy_id"] == versioned["strategy_id"])["latest_version"] == 2

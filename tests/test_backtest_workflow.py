@@ -24,7 +24,7 @@ import time
 
 import pytest
 
-from atr.config.settings import get_settings
+from forward.config.settings import get_settings
 
 pytestmark = pytest.mark.usefixtures("market_cache", "master")
 
@@ -99,8 +99,8 @@ def test_the_config_form_can_render_itself_from_one_request(auth_client) -> None
     daily = next(t for t in body["timeframes"] if t["value"] == "1d")
     assert daily["available"] is True
     intraday = next(t for t in body["timeframes"] if t["value"] == "5m")
-    assert intraday["available"] is False
-    assert intraday["reason"], "an unavailable option must say why"
+    assert intraday["available"] is True
+    assert intraday["reason"] is None
 
     # The capital floor is exposed so the form can show it rather than letting
     # the user discover it on submit.
@@ -381,15 +381,6 @@ def test_the_longer_series_wins_when_two_files_share_a_ticker(auth_client, marke
         f"the 300-bar one"
     )
 
-    # And the run should say a richer sibling existed, because a silently
-    # shortened window is exactly what the warning is for.
-    warnings = run.get("metrics", {}).get("warnings") or run.get("warnings") or []
-
-    # The warning may be surfaced on the run payload or the metrics; accept
-    # either, but the equity length above is the load-bearing assertion.
-    _ = warnings
-
-
 # ─── error handling ───────────────────────────────────────────────────────────
 
 
@@ -405,7 +396,7 @@ def test_an_unknown_strategy_fails_the_run_with_a_reason(auth_client) -> None:
     [
         ({"stops": {"stop_loss_pct": -3.0}}, "greater than 0"),
         ({"initial_cash": 500.0}, "at least"),
-        ({"timeframe": "5m"}, "daily bars only"),
+        ({"timeframe": "5m"}, "same-day square-off"),
         ({"timeframe": "3w"}, "unknown timeframe"),
     ],
 )
@@ -463,7 +454,7 @@ def test_an_unknown_timeframe_and_an_unavailable_one_are_distinguished(auth_clie
     assert unknown.status_code == 422
     assert unknown.json()["detail"]["code"] == "unknown_timeframe"
 
-    unavailable = post("5m")
+    unavailable = post("1h")
     assert unavailable.status_code == 422
     assert unavailable.json()["detail"]["code"] == "unsupported_timeframe"
 
@@ -631,7 +622,7 @@ def test_a_viewer_cannot_submit_a_run(fresh_env, auth_client, monkeypatch) -> No
 
     from fastapi.testclient import TestClient
 
-    from atr.api.main import app
+    from forward.api.main import app
 
     origin = ("127.0.0.1", 51234)
 
@@ -688,8 +679,8 @@ def _seed_saved_strategy(*, params: dict) -> tuple[str, int]:
     """
     from sqlalchemy import text as sql_text
 
-    from atr.appdb.engine import get_app_db
-    from atr.appdb.repositories import StrategyRepository
+    from forward.appdb.engine import get_app_db
+    from forward.appdb.strategy_repository import StrategyRepository
 
     db = get_app_db()
     with db.session() as session:
@@ -841,7 +832,7 @@ def test_an_unexpected_engine_crash_is_recorded_rather_than_stranding_the_run(
     The assertion names the *sentinel* exception, so the test cannot pass by
     catching some unrelated failure on the way to the same FAILED status.
     """
-    from atr.backtest import runner as runner_module
+    from forward.backtest import runner as runner_module
 
     class UnmodelledEngineFailure(Exception):
         """A type the service has no specific handler for."""
@@ -882,7 +873,7 @@ def test_a_run_that_crashed_writes_no_partial_artefacts(auth_client, monkeypatch
     Half-written artefacts are worse than none: the metrics endpoint will not
     serve them, but a trade list that exists is a trade list someone may read.
     """
-    from atr.backtest import runner as runner_module
+    from forward.backtest import runner as runner_module
 
     def explode(self, *args, **kwargs):
         raise RuntimeError("boom")

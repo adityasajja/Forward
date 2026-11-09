@@ -25,21 +25,21 @@ The groups, and the failure each one blocks:
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 
 import pandas as pd
 import pytest
 
-from atr.analytics import attribute_trade
-from atr.analytics.attribution import DEFAULT_THRESHOLDS
-from atr.analytics.excursions import (
+from forward.analytics import attribute_trade
+from forward.analytics.attribution import DEFAULT_THRESHOLDS
+from forward.analytics.excursions import (
     compute_excursions,
     execution_quality,
     leg_slippage_amount,
     leg_slippage_bps,
 )
-from atr.analytics.models import AttributionInput, AttributionLeg, TradeDetails
-
+from forward.analytics.models import AttributionInput, AttributionLeg, TradeDetails
+from forward.appdb.trade_attribution_repository import TradeAttributionRepository as Repo
 
 # ---------------------------------------------------------------------------
 # builders
@@ -70,7 +70,7 @@ def _trade(**overrides) -> TradeDetails:
         stop_price=97.0,
         planned_risk_amount=300.0,
         realized_risk_pct=1.0,
-        sizing_method="atr_risk",
+        sizing_method="forward_risk",
         sizing_cap_reason=None,
         sizing_cap_value=None,
         signal_id="S-1",
@@ -450,9 +450,7 @@ def test_a_round_trip_averages_the_two_measurable_legs():
     # way out 0.1/104 = +9.6154bps. The mean is what is reported.
     assert quality.entry_slippage_bps == pytest.approx(10.0)
     assert quality.exit_slippage_bps == pytest.approx(9.6154, abs=1e-3)
-    assert quality.total_slippage_bps == pytest.approx(
-        (10.0 + 9.6154) / 2, abs=1e-3
-    )
+    assert quality.total_slippage_bps == pytest.approx((10.0 + 9.6154) / 2, abs=1e-3)
     assert quality.measurable_legs == 2
 
 
@@ -607,7 +605,7 @@ def test_capture_is_absent_when_there_was_no_favourable_move_to_capture():
 def test_a_decision_code_and_an_execution_code_coexist_and_stay_distinguishable():
     """The specification's "clearly distinguish strategy decision from execution
     outcome" is satisfied by the two code families, not by prose in a field."""
-    from atr.analytics.reason_codes import DECISION_CODES, EXECUTION_CODES
+    from forward.analytics.reason_codes import DECISION_CODES, EXECUTION_CODES
 
     trade = _trade(context_score=70, context_class="favorable")
     result = attribute_trade(
@@ -628,7 +626,7 @@ def test_a_decision_code_and_an_execution_code_coexist_and_stay_distinguishable(
 
 def test_an_unfavorable_context_is_not_an_execution_problem():
     """Grouping these together is how a strategy gets blamed for a bad fill."""
-    from atr.analytics.reason_codes import CONTEXT_NEGATIVE, family_of
+    from forward.analytics.reason_codes import CONTEXT_NEGATIVE, family_of
 
     trade = _trade(context_score=12, context_class="unfavorable")
     result = attribute_trade(_payload(trade))
@@ -643,7 +641,7 @@ def test_high_slippage_is_classified_from_the_measurement_not_the_symbol():
     the expected price is good and a fill a rupee above it is poor. A symbol-level
     rule would classify both the same way and hide the execution difference.
     """
-    from atr.analytics.reason_codes import GOOD_ENTRY, POOR_ENTRY
+    from forward.analytics.reason_codes import GOOD_ENTRY, POOR_ENTRY
 
     clean = attribute_trade(
         _payload(
@@ -681,13 +679,11 @@ def test_high_slippage_uses_the_declared_threshold_not_a_second_opinion():
     trip averages the entry's 50bps with the exit's 0 and lands at 25bps — over
     the 15bp default bar, and over a 5bp floor.
     """
-    from atr.analytics.reason_codes import HIGH_SLIPPAGE, LOW_SLIPPAGE
+    from forward.analytics.reason_codes import HIGH_SLIPPAGE, LOW_SLIPPAGE
 
     leg = _leg("entry", "BUY", expected_price=100.0, actual_price=100.5)  # 50bps
     losing = _leg("exit", "SELL", expected_price=104.0, actual_price=104.0)  # 0bps
-    default = attribute_trade(
-        _payload(_trade(trade_id="D"), entry_leg=leg, exit_leg=losing)
-    )
+    default = attribute_trade(_payload(_trade(trade_id="D"), entry_leg=leg, exit_leg=losing))
     assert default.execution.entry_slippage_bps == pytest.approx(50.0)
     assert default.execution.total_slippage_bps == pytest.approx(25.0)
     assert HIGH_SLIPPAGE in default.reason_codes
@@ -709,7 +705,7 @@ def test_high_slippage_uses_the_declared_threshold_not_a_second_opinion():
 
 
 def test_a_low_slippage_label_needs_a_fill_inside_the_low_bar():
-    from atr.analytics.reason_codes import HIGH_SLIPPAGE, LOW_SLIPPAGE
+    from forward.analytics.reason_codes import HIGH_SLIPPAGE, LOW_SLIPPAGE
 
     tight = attribute_trade(
         _payload(
@@ -749,9 +745,7 @@ def test_missing_measurements_are_declared_rather_than_defaulted():
         market_regime=None,
         exit_reason=None,
     )
-    result = attribute_trade(
-        _payload(trade, exit_leg=None, bars_after_entry=None, bars_until=None)
-    )
+    result = attribute_trade(_payload(trade, exit_leg=None, bars_after_entry=None, bars_until=None))
     assert result.missing_fields, "absent inputs produced no missing-field report"
     assert result.excursions.mfe_pct is None
 
@@ -764,12 +758,12 @@ def test_missing_measurements_are_declared_rather_than_defaulted():
 def test_flat_returns_every_declared_dataset_field():
     """The learning join reads these names. A rename that only touches one side
     would silently empty the column instead of failing."""
-    from atr.services.learning import DATASET_COLUMNS
+    from forward.services.learning_dataset_model import DATASET_COLUMNS
 
     flat = attribute_trade(_payload()).flat()
     for name in flat:
         assert name in DATASET_COLUMNS, f"{name} is not a dataset column"
-    assert flat["attribution_sizing_method"] == "atr_risk"
+    assert flat["attribution_sizing_method"] == "forward_risk"
     assert flat["attribution_context_score"] == 62
     assert flat["attribution_market_regime"] == "bull"
     assert flat["attribution_transaction_costs"] == 40.0
@@ -778,7 +772,7 @@ def test_flat_returns_every_declared_dataset_field():
 def test_flat_carries_no_computed_grade_or_forbidden_advice():
     """The flat row is data. It may not carry a recommendation, and it may not
     restate a grade the provenance layer owns."""
-    from atr.analytics.reason_codes import ADVICE_WORDS
+    from forward.analytics.reason_codes import ADVICE_WORDS
 
     flat = attribute_trade(_payload()).flat()
     assert not any("grade" in name and "evidence" not in name for name in flat)
@@ -796,7 +790,7 @@ def test_flat_carries_no_computed_grade_or_forbidden_advice():
 def test_aggregation_separates_forward_from_in_sample_counts():
     """A book of in-sample rows still had a day, but it may not be counted as
     forward evidence. The two counts travel together everywhere."""
-    from atr.analytics.aggregation import evidence_counts, overview
+    from forward.analytics.aggregation import evidence_counts, overview
 
     rows = [
         {"evidence_grade": "forward", "net_pnl": 100.0, "net_return_pct": 1.0},
@@ -819,7 +813,7 @@ def test_aggregation_separates_forward_from_in_sample_counts():
 def test_an_absent_grade_counts_as_in_sample_not_as_forward():
     """A row that never said where it came from may not be pooled with forward
     evidence. Absence is the conservative case by construction."""
-    from atr.analytics.aggregation import evidence_counts
+    from forward.analytics.aggregation import evidence_counts
 
     counts = evidence_counts([{"net_pnl": 10.0}, {"evidence_class": "BACKTEST", "net_pnl": 5.0}])
     assert counts["forward_n"] == 0
@@ -830,7 +824,7 @@ def test_an_absent_grade_counts_as_in_sample_not_as_forward():
 def test_profit_factor_is_absent_when_there_are_no_losses():
     """A book of three winners has an undefined profit factor, not an infinite
     one. Reporting a number there would rank it above every real strategy."""
-    from atr.analytics.aggregation import overview
+    from forward.analytics.aggregation import overview
 
     summary = overview(
         [
@@ -850,7 +844,7 @@ def test_a_book_with_no_rupee_figures_reports_no_rupee_figures():
     to opt into the return-based view explicitly instead of silently reading a
     zero book.
     """
-    from atr.analytics.aggregation import overview
+    from forward.analytics.aggregation import overview
 
     summary = overview(
         [
@@ -872,7 +866,7 @@ def test_a_thin_bucket_is_flagged_rather_than_hidden():
     knows not to quote the mean, and it is driven by the ``min_sample`` the caller
     passed rather than by a constant buried in the grouper.
     """
-    from atr.analytics.aggregation import MIN_SAMPLE, _group
+    from forward.analytics.aggregation import MIN_SAMPLE, _group
 
     rows = [
         {
@@ -905,7 +899,7 @@ def test_a_thin_bucket_is_flagged_rather_than_hidden():
 def test_a_branch_reports_every_six_of_its_groups():
     """The dashboard renders six branches; a missing key would render an empty
     panel with no error."""
-    from atr.analytics.aggregation import by_branch
+    from forward.analytics.aggregation import by_branch
 
     branch = by_branch(
         [
@@ -934,7 +928,7 @@ def test_a_row_the_classifier_cannot_place_is_excluded_and_counted():
     """No "unknown" bucket. A row that cannot be classified is reported as
     excluded, never compared to real buckets as though "we could not tell" were a
     finding."""
-    from atr.analytics.aggregation import by_branch
+    from forward.analytics.aggregation import by_branch
 
     rows = [
         {"evidence_grade": "forward", "net_pnl": 10.0, "reason_codes": ["SIGNAL_POSITIVE"]},
@@ -951,7 +945,7 @@ def test_a_row_the_classifier_cannot_place_is_excluded_and_counted():
 def test_the_summary_reports_net_without_the_best_trade():
     """One trade carrying a book is the most common way a small sample lies.
     The counterfactual belongs beside the headline, not in an appendix."""
-    from atr.analytics.aggregation import overview
+    from forward.analytics.aggregation import overview
 
     rows = [
         {"evidence_grade": "forward", "net_pnl": v, "net_return_pct": v / 100}
@@ -966,7 +960,7 @@ def test_the_summary_reports_net_without_the_best_trade():
 def test_the_best_trade_share_is_absent_when_there_was_no_gross_profit():
     """A losing book has no gross profit to take a share of. A number there
     would be a share of nothing."""
-    from atr.analytics.aggregation import overview
+    from forward.analytics.aggregation import overview
 
     summary = overview(
         [
@@ -986,7 +980,7 @@ def test_the_class_count_never_contradicts_the_grade_count():
 
     An absent class is reported as absent, not guessed.
     """
-    from atr.analytics.aggregation import evidence_counts
+    from forward.analytics.aggregation import evidence_counts
 
     counts = evidence_counts([{"evidence_grade": "forward", "net_pnl": 1.0}])
     assert counts["by_grade"] == {"forward": 1}
@@ -1004,7 +998,7 @@ def test_the_class_count_never_contradicts_the_grade_count():
 def test_every_bucket_placement_is_exclusive_across_all_rows():
     """Half-open buckets. A row counted in two MAE buckets would double the
     sample in every table that sums them."""
-    from atr.analytics.aggregation import MAE_BUCKETS, bucket_mae
+    from forward.analytics.aggregation import MAE_BUCKETS, bucket_mae
 
     # One row per declared boundary, plus values either side of each.
     values = [0.1, 0.25, 0.26, 0.5, 0.51, 1.0, 1.01, 5.0]
@@ -1022,19 +1016,22 @@ def test_every_bucket_placement_is_exclusive_across_all_rows():
 def test_an_unrecognised_class_grades_in_sample():
     """The conservative default, asserted directly. "We do not know where this
     came from" must never resolve to "forward"."""
-    from atr.research.learning_evidence import GRADE_IN_SAMPLE, row_grade
+    from forward.core.learning_evidence import GRADE_IN_SAMPLE, row_grade
 
     for value in (None, "", "SOMETHING_NEW", "backtest"):
         assert row_grade({"evidence_class": value}) == GRADE_IN_SAMPLE
 
 
 def test_the_grades_the_attribution_layer_uses_are_the_canonical_ones():
-    from atr.research.learning_evidence import GRADE_FORWARD, GRADE_IN_SAMPLE
+    from forward.core.learning_evidence import GRADE_FORWARD, GRADE_IN_SAMPLE
 
     forward = attribute_trade(_payload(_trade(evidence_grade=GRADE_FORWARD)))
     in_sample = attribute_trade(
-        _payload(_trade(trade_id="T-2", source="BACKTEST",
-                        evidence_grade=GRADE_IN_SAMPLE, simulated=True))
+        _payload(
+            _trade(
+                trade_id="T-2", source="BACKTEST", evidence_grade=GRADE_IN_SAMPLE, simulated=True
+            )
+        )
     )
     assert forward.evidence_grade == GRADE_FORWARD
     assert in_sample.evidence_grade == GRADE_IN_SAMPLE
@@ -1051,7 +1048,7 @@ def test_a_timestamp_alone_cannot_manufacture_forward_standing():
     from the execution-time stamp and from nothing else. A row that carries an
     ``order_ts`` but no stamp must grade in-sample.
     """
-    from atr.research.learning_evidence import GRADE_IN_SAMPLE, row_grade
+    from forward.core.learning_evidence import GRADE_IN_SAMPLE, row_grade
 
     row = {
         "evidence_class": None,
@@ -1108,7 +1105,7 @@ def owners(app_db):
     purpose: an attributed trade belongs to somebody. Seeding the parents keeps
     the constraint exercised rather than disabled.
     """
-    from atr.appdb.repositories import UserRepository
+    from forward.appdb.identity_repository import UserRepository
 
     with app_db.session() as session:
         first = UserRepository.create(
@@ -1131,7 +1128,6 @@ def owners(app_db):
 def test_attributing_the_same_trade_twice_writes_one_row(app_db, owners):
     """Idempotency is structural — the trade id is the primary key — so a
     re-scan after a crash cannot double the book."""
-    from atr.appdb.repositories import TradeAttributionRepository as Repo
 
     user_id, _other = owners
     with app_db.session() as session:
@@ -1148,7 +1144,6 @@ def test_a_changed_input_produces_a_new_fingerprint_and_a_new_row(app_db, owners
     """A trade re-attributed against different inputs is a changed measurement,
     not a duplicate. The fingerprint is what lets the writer tell the two apart
     and skip the unchanged ones cheaply."""
-    from atr.appdb.repositories import TradeAttributionRepository as Repo
 
     user_id, _other = owners
     with app_db.session() as session:
@@ -1167,7 +1162,6 @@ def test_a_changed_input_produces_a_new_fingerprint_and_a_new_row(app_db, owners
 
 def test_an_attribution_row_cannot_be_read_by_another_user(app_db, owners):
     """Ownership is enforced on the read, not only on the write."""
-    from atr.appdb.repositories import TradeAttributionRepository as Repo
 
     user_id, other_id = owners
     with app_db.session() as session:
@@ -1187,7 +1181,6 @@ def test_the_stored_grade_matches_the_written_grade_and_is_not_recomputed(app_db
     the journal's job. A second opinion is a second chance to disagree with the
     first, and the reader would have no way to tell which one won.
     """
-    from atr.appdb.repositories import TradeAttributionRepository as Repo
 
     user_id, _other = owners
     with app_db.session() as session:
@@ -1204,7 +1197,7 @@ def test_the_stored_grade_matches_the_written_grade_and_is_not_recomputed(app_db
 def test_the_attribution_table_is_keyed_one_row_per_trade(app_db, owners):
     """Not one row per order event. A trade filled in four slices is one trade,
     and a table keyed on order id would attribute it four times."""
-    from atr.appdb.schema import app_metadata
+    from forward.appdb.metadata import app_metadata
 
     table = app_metadata.tables["trade_attributions"]
     assert [c.name for c in table.primary_key.columns] == ["trade_id"]
@@ -1231,7 +1224,6 @@ def test_several_fills_under_one_order_produce_one_attribution():
 def test_the_repository_offers_no_way_to_compute_a_grade():
     """A structural guard. If a method named like a grade derivation appears, the
     provenance rule has been broken somewhere by someone."""
-    from atr.appdb.repositories import TradeAttributionRepository as Repo
 
     offenders = [
         name
@@ -1250,7 +1242,7 @@ def test_the_attribution_service_exposes_no_action_that_changes_trading():
     being the thing that catches it — which is why the named list is spelled out
     rather than pattern-matched loosely.
     """
-    from atr.services.attribution import AttributionService
+    from forward.services.attribution import AttributionService
 
     public = [name for name in dir(AttributionService) if not name.startswith("_")]
     offenders = [
@@ -1258,7 +1250,16 @@ def test_the_attribution_service_exposes_no_action_that_changes_trading():
         for name in public
         if any(
             word in name.lower()
-            for word in ("place", "promote", "deploy", "apply", "optimize", "modify", "trade", "execute")
+            for word in (
+                "place",
+                "promote",
+                "deploy",
+                "apply",
+                "optimize",
+                "modify",
+                "trade",
+                "execute",
+            )
         )
     ]
     assert offenders == []
@@ -1271,17 +1272,15 @@ def test_the_attribution_service_only_writes_the_attribution_table():
     writer for records the OMS already owns, and the provenance rule depends on
     there being exactly one of those.
     """
-    from atr.services.attribution import AttributionService
+    from forward.services.attribution import AttributionService
 
-    source = (
-        __import__("pathlib").Path(AttributionService.__module__.replace(".", "/"))
-    )
+    source = __import__("pathlib").Path(AttributionService.__module__.replace(".", "/"))
     text = (
         __import__("pathlib")
         .Path(__file__)
         .resolve()
         .parents[1]
-        .joinpath("src", "atr", "services", "attribution.py")
+        .joinpath("src", "forward", "services", "attribution.py")
         .read_text(encoding="utf-8")
     )
     # The only repository whose write methods are reachable from here.
@@ -1302,7 +1301,7 @@ def test_coverage_reports_unknown_when_the_count_cannot_be_taken():
     "We could not count the book" and "the book is not fully attributed" call for
     different responses from the reader, so they must not render the same.
     """
-    from atr.services.attribution import AttributionService
+    from forward.services.attribution import AttributionService
 
     service = AttributionService.__new__(AttributionService)  # no db, deliberately
     data = service.coverage("U-1", attributed=7)
@@ -1323,7 +1322,7 @@ def test_the_risk_engine_still_halts_and_is_untouched_by_analytics():
     — and on the absence of any analytics entry point. A post-trade layer that
     could reach into the pre-trade gate would be a way to trade around a limit.
     """
-    from atr.execution.risk import RiskEngine
+    from forward.execution.risk import RiskEngine
 
     engine = RiskEngine()
     assert callable(engine.check_order)
@@ -1345,8 +1344,10 @@ def test_the_risk_engine_module_does_not_import_the_analytics_layer():
     import pathlib
 
     source = (
-        pathlib.Path(__file__).resolve().parents[1]
-        .joinpath("src", "atr", "execution", "risk.py")
+        pathlib.Path(__file__)
+        .resolve()
+        .parents[1]
+        .joinpath("src", "forward", "execution", "risk.py")
         .read_text(encoding="utf-8")
     )
     assert "analytics" not in source
@@ -1356,7 +1357,7 @@ def test_the_risk_engine_module_does_not_import_the_analytics_layer():
 def test_the_oms_provenance_constants_are_unchanged():
     """The stamp string is the contract between the OMS and the journal. An
     analytics change must not have renamed it."""
-    from atr.execution.oms import PROVENANCE_FORWARD, PROVENANCE_KEY
+    from forward.execution.oms import PROVENANCE_FORWARD, PROVENANCE_KEY
 
     assert PROVENANCE_FORWARD == "forward"
     assert PROVENANCE_KEY == "provenance"
@@ -1365,7 +1366,7 @@ def test_the_oms_provenance_constants_are_unchanged():
 def test_the_learning_dataset_grade_gate_is_still_in_place():
     """The learning builder must still refuse to launder an in-sample row into a
     forward one. Asserted at the vocabulary, which is where the gate lives."""
-    from atr.research.learning_evidence import (
+    from forward.core.learning_evidence import (
         GRADE_FORWARD,
         GRADE_IN_SAMPLE,
         is_forward_grade,
@@ -1380,7 +1381,7 @@ def test_the_learning_dataset_grade_gate_is_still_in_place():
 def test_no_advice_word_reaches_the_reason_code_vocabulary():
     """The vocabulary is descriptive. A code that reads like an instruction would
     turn a post-trade report into a signal, which is the line this layer holds."""
-    from atr.analytics.reason_codes import ADVICE_WORDS, ALL_REASON_CODES
+    from forward.analytics.reason_codes import ADVICE_WORDS, ALL_REASON_CODES
 
     for code in ALL_REASON_CODES:
         lowered = code.lower()
@@ -1390,7 +1391,7 @@ def test_no_advice_word_reaches_the_reason_code_vocabulary():
 def test_the_reason_code_vocabulary_is_closed_and_unique():
     """A duplicate or an unregistered code would make the family lookup return
     ``None`` for a code the report is already printing."""
-    from atr.analytics.reason_codes import (
+    from forward.analytics.reason_codes import (
         ALL_REASON_CODES,
         DECISION_CODES,
         EXECUTION_CODES,
@@ -1420,7 +1421,7 @@ def test_an_excursion_keeps_the_documented_sign_convention():
         ]
     )
     for side, expected_mfe, expected_mae in (
-        ("BUY", 6.0, -6.0),   # best 106 above, worst 94 below
+        ("BUY", 6.0, -6.0),  # best 106 above, worst 94 below
         ("SELL", 6.0, -6.0),  # mirrored: 94 is favourable, 106 is adverse
     ):
         result = compute_excursions(

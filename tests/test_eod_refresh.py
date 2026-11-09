@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 
-from atr.data import eod_refresh as eod
+from forward.data import eod_refresh as eod
 
 IST = timezone(timedelta(hours=5, minutes=30))
 AFTER_CLOSE = datetime(2026, 9, 18, 17, 0, tzinfo=IST)  # a Friday
@@ -99,23 +99,9 @@ def test_refresh_counts_outcomes_and_survives_a_failing_fetch(tmp_path, monkeypa
 
     monkeypatch.setattr(eod, "fetch_recent", fake_fetch)
 
-    summary = eod.refresh(tmp_path, workers=2, now=AFTER_CLOSE)
+    summary = eod.refresh(tmp_path, ["AAA-EQ", "BBB-EQ"], workers=2, now=AFTER_CLOSE)
 
     assert (summary["ok"], summary["fail"]) == (1, 1)
-    assert eod.read_state(tmp_path)["ran_date_ist"] == "2026-09-18"
-
-
-def test_due_once_per_weekday_after_the_close(tmp_path):
-    yesterday = {"ran_date_ist": "2026-09-17"}
-    (tmp_path / "eod_refresh.json").write_text(__import__("json").dumps(yesterday))
-
-    assert eod.due(tmp_path, BEFORE_CLOSE) is False  # not yet
-    assert eod.due(tmp_path, AFTER_CLOSE) is True
-    (tmp_path / "eod_refresh.json").write_text(__import__("json").dumps({"ran_date_ist": "2026-09-18"}))
-    assert eod.due(tmp_path, AFTER_CLOSE) is False  # already done today
-    saturday = datetime(2026, 9, 19, 17, 0, tzinfo=IST)
-    (tmp_path / "eod_refresh.json").write_text(__import__("json").dumps({"ran_date_ist": "2026-09-18"}))
-    assert eod.due(tmp_path, saturday) is False  # no session on weekends
 
 
 def test_bare_tickers_find_their_series_files(tmp_path, monkeypatch):

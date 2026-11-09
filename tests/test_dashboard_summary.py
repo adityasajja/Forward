@@ -14,46 +14,56 @@ and neither.
 """
 from __future__ import annotations
 
-import sys
-from pathlib import Path
+from datetime import UTC, datetime
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from forward.core.market_models import BrokerReadResult, DailyClose, DashboardHistorySample
+from forward.services.dashboard_summary import (
+    DashboardSummaryCache,
+    DashboardSummaryService,
+)
 
-from atr.api.legacy import dashboard as M  # noqa: E402
 
-
-class FakeClient:
-    """Minimal stand-in exposing only what the summary endpoint calls."""
+class FakeAccount:
+    """Account reader that returns the supplied broker rows."""
 
     def __init__(self, positions, trades):
-        self._positions = positions
-        self._trades = trades
+        self._sections = {"positions": positions, "trades": trades}
 
-    def positions(self):
-        return self._positions
+    def read(self, section):
+        return BrokerReadResult(rows=self._sections[section])
 
-    def trades(self):
-        return self._trades
 
-    def limits(self):
-        return {}
+class FakeHistory:
+    """History reader that serves the requested prior closes."""
 
-    def close(self):
-        pass
+    def __init__(self, closes=None):
+        session = datetime.now(UTC).date().isoformat()
+        self.closes = {
+            symbol: DailyClose(session=session, close=value)
+            for symbol, value in (closes or {}).items()
+        }
+        self.latest_calls = []
+
+    def latest_closes(self, symbols, exchange):
+        self.latest_calls.append((list(symbols), exchange))
+        return self.closes
+
+    def breadth_history(self, exchange, sample_size, lookback_bars, minimum_bars):
+        return DashboardHistorySample(universe_size=0, symbols={})
 
 
 @pytest.fixture()
-def summary(monkeypatch):
-    """Build a summary from supplied broker rows, bypassing the cache."""
+def summary():
+    """Build a summary from supplied broker rows and cached closes."""
 
     def _run(positions, trades=(), cache_closes=None):
-        monkeypatch.setattr(M, "_authed_client", lambda: FakeClient(positions, list(trades)))
-        # Stub the daily-cache lookup so tests never depend on local parquets.
-        monkeypatch.setattr(M, "_prior_closes", lambda symbols, exchange="NSEEQ": dict(cache_closes or {}))
-        monkeypatch.setattr(M, "_SUMMARY_CACHE", {"data": None, "at": 0.0, "exchange": ""})
-        return M.dashboard_summary(exchange="NSEEQ")
+        service = DashboardSummaryService(
+            FakeHistory(cache_closes), DashboardSummaryCache()
+        )
+        account = FakeAccount(positions, list(trades))
+        return service.summary(lambda: account, exchange="NSEEQ")
 
     return _run
 
@@ -186,20 +196,12 @@ def test_empty_book_is_complete_not_missing(summary):
     assert out["day_pnl_from_cache"] == 0
 
 
-def test_empty_book_does_not_read_the_cache(monkeypatch):
+def test_empty_book_does_not_read_the_cache():
     """No positions means no prior-close lookup at all."""
-    calls = []
-
-    def spy(symbols, exchange="NSEEQ"):
-        calls.append(list(symbols))
-        return {}
-
-    monkeypatch.setattr(M, "_authed_client", lambda: FakeClient([], []))
-    monkeypatch.setattr(M, "_prior_closes", spy)
-    monkeypatch.setattr(M, "_SUMMARY_CACHE", {"data": None, "at": 0.0, "exchange": ""})
-
-    M.dashboard_summary(exchange="NSEEQ")
-    assert calls == [], "cache must not be consulted with an empty book"
+    history = FakeHistory()
+    service = DashboardSummaryService(history, DashboardSummaryCache())
+    service.summary(lambda: FakeAccount([], []), exchange="NSEEQ")
+    assert history.latest_calls == [], "cache must not be consulted with an empty book"
 
 
 # ── performance ──────────────────────────────────────────────────────────────

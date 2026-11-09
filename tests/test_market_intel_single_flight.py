@@ -5,7 +5,7 @@ from __future__ import annotations
 import threading
 import time
 
-from atr.market_intel.service import MarketIntelService
+from forward.market_intel.service import MarketIntelService
 
 
 def test_concurrent_callers_share_one_computation(monkeypatch):

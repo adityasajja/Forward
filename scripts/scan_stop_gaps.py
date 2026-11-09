@@ -10,23 +10,26 @@ Read-only. Prints the worst overshoots and the count of trades affected.
 
 from __future__ import annotations
 
-import os
-import sys
+import argparse
+import json
 from pathlib import Path
 
-sys.path.insert(0, "src")
-os.environ.setdefault(
-    "APP_DB_URL", f"sqlite:///{(Path(__file__).resolve().parents[1] / 'data' / 'app.db').as_posix()}"
-)
+from forward.appdb.schema import backtest_runs, backtest_trades
+from sqlalchemy import select
 
-from sqlalchemy import select  # noqa: E402
+from forward.appdb.engine import get_app_db
 
-from atr.appdb.engine import AppDatabase  # noqa: E402
-from atr.appdb.schema import backtest_runs, backtest_trades  # noqa: E402
+ROOT = Path(__file__).resolve().parents[1]
+CONFIG_PATH = ROOT / "config" / "scan_stop_gaps.json"
 
 
 def main() -> int:
-    db = AppDatabase()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", type=Path, default=CONFIG_PATH)
+    config_path = parser.parse_args().config
+    settings = json.loads(config_path.read_text(encoding="utf-8"))
+    print(f"Configuration: {config_path.resolve()}")
+    db = get_app_db()
     with db.session_factory() as session:
         # The stop percentage is a property of the *run's* config, not of the
         # trade row — a trade records what happened, the run records the rules
@@ -43,12 +46,12 @@ def main() -> int:
     print(f"trades in db: {len(rows)}")
 
     stopped: list[tuple[float, float, str]] = []
-    for symbol, reason, ret, config in rows:
+    for symbol, reason, ret, run_config in rows:
         if reason != "stop_loss" or ret is None:
             continue
-        stop = (config or {}).get("stops", {}).get("stop_loss_pct")
-        if stop is None:
-            continue
+        if run_config is None:
+            raise ValueError(f"Backtest run config is missing for {symbol}")
+        stop = run_config["stops"]["stop_loss_pct"]
         stopped.append((float(ret), float(stop), str(symbol)))
 
     print(f"stop_loss exits: {len(stopped)}")
@@ -58,16 +61,21 @@ def main() -> int:
 
     stopped.sort()
     print("\nworst overshoots (realised return past a negative stop):")
-    for ret, stop, symbol in stopped[:10]:
+    for ret, stop, symbol in stopped[:settings["examples_to_display"]]:
         overshoot = -stop - ret
-        verdict = "GAPPED" if overshoot > 0.5 else "held"
+        verdict = (
+            "GAPPED"
+            if overshoot > settings["overshoot_threshold_percentage_points"]
+            else "held"
+        )
         print(
             f"  {symbol:<10} stop={stop:>5.2f}%  realised={ret:>8.3f}%  "
             f"overshoot={overshoot:>7.3f}pp  {verdict}"
         )
 
-    gapped = [t for t in stopped if -t[1] - t[0] > 0.5]
-    print(f"\ngapped through stop (>0.5pp past): {len(gapped)} of {len(stopped)}")
+    threshold = settings["overshoot_threshold_percentage_points"]
+    gapped = [t for t in stopped if -t[1] - t[0] > threshold]
+    print(f"\ngapped through stop (>{threshold}pp past): {len(gapped)} of {len(stopped)}")
     return 0
 
 

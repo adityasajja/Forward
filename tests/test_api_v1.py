@@ -10,9 +10,8 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
-from atr.api.main import app
-from atr.auth.rate_limit import reset_rate_limiter
-from atr.config.settings import get_settings
+from forward.api.main import app
+from forward.config.settings import get_settings
 
 LOOPBACK = ("127.0.0.1", 51234)
 REMOTE = ("203.0.113.9", 51234)
@@ -106,7 +105,7 @@ def test_login_sets_a_cookie_and_returns_a_token(auth_client):
     )
     assert response.status_code == 200
     assert response.json()["token"]
-    assert "atr_session" in response.cookies
+    assert "forward_session" in response.cookies
 
     me = fresh.get("/api/v1/auth/me")
     assert me.status_code == 200
@@ -161,9 +160,9 @@ def viewer_client(auth_client):
     ``PATCH /users/{id}`` can only change an existing user. A viewer can only
     come from an admin action, which is the point.
     """
-    from atr.appdb.engine import get_app_db
-    from atr.appdb.repositories import UserRepository
-    from atr.auth.passwords import hash_password
+    from forward.appdb.engine import get_app_db
+    from forward.appdb.identity_repository import UserRepository
+    from forward.auth.passwords import hash_password
 
     with get_app_db().session() as session:
         UserRepository.create(
@@ -216,7 +215,10 @@ def test_watchlist_lifecycle_over_http(auth_client):
     assert added.json()["added"] == ["RELIANCE", "INFY"]
     assert added.json()["unknown"] == ["NOPE"]
 
-    reordered = auth_client.put(f"/api/v1/watchlists/{wid}/items/order", json={"symbols": ["INFY"]})
+    reordered = auth_client.put(
+        f"/api/v1/watchlists/{wid}/items/order",
+        json={"symbols": ["INFY", "RELIANCE"]},
+    )
     assert reordered.json()["items"] == ["INFY", "RELIANCE"]
 
     columns = auth_client.put(
@@ -225,7 +227,7 @@ def test_watchlist_lifecycle_over_http(auth_client):
     assert columns.json()["columns"] == ["ltp", "rsi14"]
     assert columns.json()["rejected_columns"] == ["made_up"]
 
-    quotes = auth_client.get(f"/api/v1/watchlists/{wid}/quotes")
+    quotes = auth_client.get(f"/api/v1/watchlists/{wid}/quotes?live=false")
     assert quotes.status_code == 200
     assert quotes.json()["count"] == 2
     assert quotes.json()["rows"][0]["rsi14"] is not None
@@ -318,12 +320,12 @@ def test_watchlist_writes_are_audited(auth_client):
     assert events["events"][0]["target_type"] == "watchlist"
 
 
-def test_the_legacy_jsonl_audit_trail_still_exists(auth_client):
+def test_jsonl_audit_trail_records_watchlist_events(auth_client):
     """The restart-proof file sink is not replaced by the queryable table."""
-    from atr.audit.log import read_file
+    from forward.wiring.audit import get_audit_log_service
 
     auth_client.post("/api/v1/watchlists", json={"name": "FileSink"})
-    entries = read_file(limit=50)
+    entries = get_audit_log_service().recent(limit=50)
     assert any(e.get("action") == "watchlist.create" for e in entries)
 
 
@@ -381,7 +383,7 @@ def test_csrf_origin_check_applies_to_cookie_auth_only(fresh_env, master):
 def test_a_same_origin_request_is_allowed_on_any_port(fresh_env, master):
     """The case the hardcoded port list got wrong.
 
-    Browsers send ``Origin`` on same-origin POSTs too, so `atr serve --port 8123`
+    Browsers send ``Origin`` on same-origin POSTs too, so `forward serve --port 8123`
     produced ``Origin: http://127.0.0.1:8123`` — not in the allowlist — and every
     write came back 403 as a "cross-origin" request. The rule has to be
     "is this the origin you connected to?", not "is this one of four ports I
@@ -402,7 +404,7 @@ def test_a_same_origin_request_is_allowed_on_any_port(fresh_env, master):
     for host, origin in (
         ("127.0.0.1:8123", "http://127.0.0.1:8123"),
         ("localhost:9000", "http://localhost:9000"),
-        ("atr.internal", "https://atr.internal"),
+        ("forward.internal", "https://forward.internal"),
     ):
         res = session_client.post(
             "/api/v1/watchlists",
@@ -431,6 +433,8 @@ def test_a_same_origin_request_is_allowed_on_any_port(fresh_env, master):
 
 
 def test_rate_limiting_returns_429_with_retry_after(fresh_env, master, monkeypatch):
+    from forward.wiring.auth import reset_rate_limiter
+
     monkeypatch.setenv("RATE_LIMIT_PER_MINUTE", "3")
     get_settings.cache_clear()
     reset_rate_limiter()

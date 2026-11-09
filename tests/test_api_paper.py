@@ -11,7 +11,7 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
-from atr.api.main import app
+from forward.api.main import app
 
 LOOPBACK = ("127.0.0.1", 51234)
 
@@ -20,17 +20,15 @@ LOOPBACK = ("127.0.0.1", 51234)
 def prices(monkeypatch):
     """A deterministic price source for paper fills.
 
-    The venue's default reads the operator's real daily cache, which a test must
-    not depend on: "it passed because the cache had data today" is not a test. The
-    seam exists for exactly this substitution.
+    The test replaces the venue's live price source so its fills do not depend
+    on current market data or the operator's local cache.
     """
-    from atr.services import paper as paper_service
-    from atr.services.paper import fixed_price_source
+    import forward.wiring.paper as paper
+    from forward.services.paper_prices import fixed_price_source
 
     table = {"RELIANCE": 2500.0, "TCS": 3000.0, "INFY": 1500.0}
     monkeypatch.setattr(
-        paper_service, "default_price_source",
-        lambda: fixed_price_source(table),
+        paper, "get_live_paper_price_source", lambda: fixed_price_source(table)
     )
     return table
 
@@ -53,9 +51,9 @@ def owner(fresh_env, master, prices) -> TestClient:
 @pytest.fixture()
 def viewer(fresh_env, master, owner) -> TestClient:
     """Read-only, for the authorization assertions."""
-    from atr.appdb.engine import get_app_db
-    from atr.appdb.repositories import UserRepository
-    from atr.auth.passwords import hash_password
+    from forward.appdb.engine import get_app_db
+    from forward.appdb.identity_repository import UserRepository
+    from forward.auth.passwords import hash_password
 
     with get_app_db().session() as session:
         UserRepository.create(

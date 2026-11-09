@@ -1,0 +1,11 @@
+{
+  "pattern_config": "config/study_chart_patterns.json",
+  "output_file": "data/research/pattern_search.json",
+  "minimum_train_occurrences": 300,
+  "top_rules": 12,
+  "combination_sizes": [1, 2, 3],
+  "shuffle_seed": 7,
+  "shuffle_iterations": 5,
+  "minimum_late_sample_for_summary": 100,
+  "target_hit_probability_pct": 60
+}

@@ -1,121 +1,116 @@
-"""Parallel 1-minute fetcher for IIFL — fetches NIFTY 50 stocks concurrently."""
-import json, time, sys, traceback
-from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
+"""Fetch configured IIFL minute history with a shared broker client."""
 
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "src"))
+from __future__ import annotations
+
+import argparse
+import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 
 import pandas as pd
-from atr.brokers.iifl.client import IiflClient, _fmt_date
-from atr.brokers.iifl.auth import Session, SessionStore
-from atr.brokers.iifl.feeds import _candles, _candle_row
+from fetch_iifl_1m import load_contracts, load_universe
 
-UNIVERSE_FILES = [ROOT / "data" / "universe" / "n50.txt",
-                  ROOT / "data" / "universe" / "mid150.txt"]
-CONTRACTS_FILE = ROOT / ".cache" / "contracts" / "NSEEQ.json"
-OUT_DIR = ROOT / "data" / "iifl_1m"
-OUT_DIR.mkdir(parents=True, exist_ok=True)
+from forward.brokers.iifl.auth import SessionStore
+from forward.brokers.iifl.client import IiflClient
+from forward.brokers.iifl.feeds import candles_to_frame
 
-FROM_DATE = "01-Jan-2024"
-TO_DATE = "19-Sep-2026"
-INTERVAL = "1m"
-N_WORKERS = 4
+ROOT = Path(__file__).resolve().parents[1]
+CONFIG_PATH = ROOT / "config" / "fetch_iifl_minute_history.json"
 
 
-def load_universe() -> list[str]:
-    syms = []
-    for f in UNIVERSE_FILES:
-        if f.exists():
-            content = f.read_text().strip()
-            syms.extend(s.strip() for s in content.replace("\n", ",").split(",") if s.strip())
-    return list(dict.fromkeys(syms))
+def fetch_one(
+    symbol: str,
+    instrument_id: str,
+    client: IiflClient,
+    config: dict,
+    output_directory: Path,
+) -> tuple[str, str]:
+    """Fetch and save a symbol's minute bars.
 
+    Args:
+        symbol: Canonical symbol used for the cache filename.
+        instrument_id: Broker instrument identifier.
+        client: Authenticated IIFL client.
+        config: Explicit history-fetch settings.
+        output_directory: Directory that receives parquet files.
 
-def load_contracts() -> dict[str, str]:
-    rows = json.loads(CONTRACTS_FILE.read_text())
-    m = {}
-    for r in rows:
-        sym = r.get("underlyingInstrumentSymbol") or r.get("tradingSymbol", "")
-        iid = r.get("instrumentId")
-        if sym and iid:
-            key = sym.replace("-EQ", "").replace("-BE", "").replace("-SM", "")
-            m[key] = iid
-    return m
-
-
-def fetch_one(symbol, iid, client):
-    out_path = OUT_DIR / f"{symbol}.parquet"
+    Returns:
+        The symbol and a status label with its bar count when fetched.
+    """
+    out_path = output_directory / f"{symbol}.parquet"
     if out_path.exists():
-        df = pd.read_parquet(out_path)
-        if len(df) > 5000:
-            return symbol, f"skip ({len(df)} bars)"
+        cached = pd.read_parquet(out_path)
+        if len(cached) > config["minimum_cached_bars"]:
+            return symbol, f"cached:{len(cached)}"
 
     payload = client.historical_data(
-        exchange="NSEEQ", instrument_id=iid, interval=INTERVAL,
-        from_date=FROM_DATE, to_date=TO_DATE,
+        exchange=config["exchange"],
+        instrument_id=instrument_id,
+        interval=config["interval"],
+        from_date=config["from_date"],
+        to_date=config["to_date"],
     )
-    result = payload.get("result", []) if isinstance(payload, dict) else []
-    if isinstance(result, list) and result and isinstance(result[0], dict):
-        candles = result[0].get("candles", [])
-    elif isinstance(result, dict):
-        candles = result.get("candles", [])
-    else:
-        candles = result
-
-    rows = []
-    for c in candles:
-        if isinstance(c, (list, tuple)) and len(c) >= 6:
-            rows.append({
-                "ts": pd.to_datetime(c[0]),
-                "open": float(c[1]), "high": float(c[2]), "low": float(c[3]),
-                "close": float(c[4]), "volume": float(c[5]),
-            })
-
-    if not rows:
-        return symbol, "NO DATA"
-    df = pd.DataFrame(rows).sort_values("ts").reset_index(drop=True)
-    df.to_parquet(out_path, index=False)
-    return symbol, f"{len(df)} bars ({df['ts'].iloc[0].date()}→{df['ts'].iloc[-1].date()})"
+    frame = candles_to_frame(payload)
+    if frame.empty:
+        return symbol, "empty"
+    frame.to_parquet(out_path, index=False)
+    return symbol, f"fetched:{len(frame)}"
 
 
-client = IiflClient()
-store = SessionStore(str(ROOT / ".cache" / "iifl_session.json"))
-sess = store.load()
-if sess is None:
-    print("ERROR: No cached IIFL session")
-    sys.exit(1)
-client.set_session(sess)
-print(f"Session OK (client_id={sess.client_id})")
+def main() -> int:
+    """Run the configured parallel history download."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", type=Path, default=CONFIG_PATH)
+    config_path = parser.parse_args().config
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    print(f"Configuration: {config_path.resolve()}")
+    output_directory = ROOT / config["output_directory"]
+    output_directory.mkdir(parents=True, exist_ok=True)
 
-universe = load_universe()
-contracts = load_contracts()
-pairs = [(s, contracts[s]) for s in universe if s in contracts]
-print(f"Universe: {len(universe)} symbols, {len(pairs)} have instrument IDs")
+    universe = load_universe(config)
+    contracts = load_contracts(config)
+    pairs = [(symbol, contracts[symbol]) for symbol in universe if symbol in contracts]
+    print(f"Universe: {len(universe)} symbols, {len(pairs)} have instrument IDs")
 
-# Fetch in parallel
-fetched = 0
-errors = 0
-with ThreadPoolExecutor(max_workers=N_WORKERS) as pool:
-    futures = {pool.submit(fetch_one, s, iid, client): s for s, iid in pairs}
-    done = 0
-    for fut in as_completed(futures, timeout=3600):
-        done += 1
-        sym = fut._result_name if hasattr(fut, '_result_name') else futures[fut]
-        try:
-            symbol, msg = fut.result()
-            print(f"  [{done}/{len(pairs)}] {symbol}: {msg}", flush=True)
-            if "bars" in msg:
-                fetched += 1
-            elif "skip" in msg:
-                fetched += 1
-            else:
+    store = SessionStore(str(ROOT / config["session_file"]))
+    session = store.load()
+    if session is None:
+        print("ERROR: No cached IIFL session")
+        return 1
+
+    client = IiflClient(session_store=store)
+    client.set_session(session)
+    print(f"Session OK (client_id={session.client_id})")
+
+    fetched = 0
+    errors = 0
+    with ThreadPoolExecutor(max_workers=config["max_workers"]) as pool:
+        futures = {
+            pool.submit(fetch_one, symbol, instrument_id, client, config, output_directory): symbol
+            for symbol, instrument_id in pairs
+        }
+        for number, future in enumerate(
+            as_completed(futures, timeout=config["parallel_timeout_seconds"]),
+            start=1,
+        ):
+            symbol = futures[future]
+            try:
+                _, status = future.result()
+                print(f"  [{number}/{len(pairs)}] {symbol}: {status}", flush=True)
+                if status.startswith(("fetched:", "cached:")):
+                    fetched += 1
+                else:
+                    errors += 1
+            except Exception as exc:
+                print(f"  [{number}/{len(pairs)}] {symbol}: ERROR — {exc}", flush=True)
                 errors += 1
-        except Exception as e:
-            print(f"  [{done}/{len(pairs)}] {futures[fut]}: ERROR — {e}", flush=True)
-            errors += 1
 
-print(f"\nDone: {fetched} fetched, {errors} errors")
-total_files = len(list(OUT_DIR.glob("*.parquet")))
-total_bars = sum(len(pd.read_parquet(f)) for f in OUT_DIR.glob("*.parquet"))
-print(f"Total cached: {total_files} files, ~{total_bars:,} bars")
+    parquet_files = list(output_directory.glob("*.parquet"))
+    total_bars = sum(len(pd.read_parquet(path)) for path in parquet_files)
+    print(f"\nDone: {fetched} fetched, {errors} errors")
+    print(f"Total cached: {len(parquet_files)} files, {total_bars:,} bars")
+    return 0 if errors == 0 else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

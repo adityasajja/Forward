@@ -15,17 +15,17 @@ import time
 
 import pytest
 
-from atr.appdb.engine import utcnow
-from atr.auth import totp
-from atr.auth.crypto import SecretBox, SecretBoxError
-from atr.auth.models import anonymous_principal
-from atr.auth.passwords import (
+from forward.appdb.engine import utcnow
+from forward.auth import totp
+from forward.auth.crypto import SecretBox, SecretBoxError
+from forward.auth.models import anonymous_principal
+from forward.auth.passwords import (
     hash_password,
     needs_rehash,
     strength_problems,
     verify_password,
 )
-from atr.auth.rbac import (
+from forward.auth.rbac import (
     MFA_REQUIRED_ROLES,
     Permission,
     PermissionDenied,
@@ -34,8 +34,8 @@ from atr.auth.rbac import (
     permissions_for,
     roles_with,
 )
-from atr.auth.service import AuthError, AuthService
-from atr.auth.tokens import (
+from forward.auth.service import AuthError, AuthService
+from forward.auth.tokens import (
     api_key_prefix,
     fingerprint,
     hash_token,
@@ -109,10 +109,10 @@ def test_totp_match_counter_identifies_the_step():
 
 def test_totp_provisioning_uri_is_scannable():
     secret = totp.generate_secret()
-    uri = totp.provisioning_uri(secret, "owner@example.com", issuer="atr")
+    uri = totp.provisioning_uri(secret, "owner@example.com", issuer="Forward")
     assert uri.startswith("otpauth://totp/")
     assert f"secret={secret}" in uri
-    assert "issuer=atr" in uri
+    assert "issuer=Forward" in uri
     assert "period=30" in uri
 
 
@@ -140,11 +140,11 @@ def test_api_key_shape_and_prefix_extraction():
     assert prefix in raw and len(prefix) == 8
     assert len(raw.split("_")[2]) >= 32  # the secret half is long
     assert looks_like_api_key("not-a-key") is False
-    assert looks_like_api_key("atr_onlyonepart") is False
-    assert looks_like_api_key("atr__") is False
+    assert looks_like_api_key("forward_onlyonepart") is False
+    assert looks_like_api_key("invalid__") is False
     # A secret containing the separator must still parse. An earlier version
     # counted separators and rejected exactly this case.
-    assert split_api_key("atr_abcd1234_se_cret_with_underscores") == (
+    assert split_api_key("forward_abcd1234_se_cret_with_underscores") == (
         "abcd1234",
         "se_cret_with_underscores",
     )
@@ -211,7 +211,7 @@ def test_unknown_permission_is_never_granted():
 
 def test_require_raises_with_the_permission_named():
     with pytest.raises(PermissionDenied) as exc:
-        from atr.auth.rbac import require
+        from forward.auth.rbac import require
 
         require(Role.VIEWER, Permission.ORDER_PLACE)
     assert "order:place" in str(exc.value)
@@ -258,7 +258,20 @@ def test_secret_box_roundtrip_and_tamper_detection():
 # ─── service ──────────────────────────────────────────────────────────────────
 @pytest.fixture()
 def service(app_db) -> AuthService:
-    return AuthService(app_db)
+    from forward.appdb.auth_storage import SqlAuthStorageAdapter
+    from forward.config.settings import audit_log_path, get_settings, secret_key_path
+    from forward.infra.audit_log import JsonlAuditLogAdapter
+    from forward.infra.secret_box_provider import ConfiguredSecretBoxProvider
+
+    settings = get_settings()
+    secret_box_provider = ConfiguredSecretBoxProvider(
+        key_material=settings.forward_secret_key,
+        key_file=secret_key_path(),
+    )
+    audit_log = JsonlAuditLogAdapter(audit_log_path())
+    return AuthService(
+        SqlAuthStorageAdapter(app_db, audit_log), settings, secret_box_provider
+    )
 
 
 def _bootstrap(service: AuthService, **overrides):
@@ -317,7 +330,7 @@ def test_login_success_failure_and_unknown_user_look_the_same(service):
 def test_account_locks_after_repeated_failures_then_unlocks(
     service, monkeypatch, tmp_path
 ):
-    from atr.config.settings import get_settings
+    from forward.config.settings import get_settings
 
     monkeypatch.setenv("LOGIN_MAX_ATTEMPTS", "3")
     monkeypatch.setenv("LOGIN_LOCKOUT_MINUTES", "15")
@@ -333,7 +346,7 @@ def test_account_locks_after_repeated_failures_then_unlocks(
 
     # A lock is time-based: it must expire on its own, not need an operator.
     with service.db.session() as session:
-        from atr.appdb.repositories import UserRepository
+        from forward.appdb.identity_repository import UserRepository
 
         user = UserRepository.get_by_identifier(session, "owner")
         UserRepository.update(session, user["user_id"], locked_until=utcnow())
@@ -343,7 +356,7 @@ def test_account_locks_after_repeated_failures_then_unlocks(
 def test_inactive_account_cannot_log_in(service):
     user, _, _ = _bootstrap(service)
     with service.db.session() as session:
-        from atr.appdb.repositories import UserRepository
+        from forward.appdb.identity_repository import UserRepository
 
         UserRepository.update(session, user["user_id"], is_active=False)
     assert service.login(identifier="owner", password=GOOD_PASSWORD).status == "inactive"
@@ -399,7 +412,7 @@ def test_api_key_is_scoped_to_its_role_and_cannot_escalate(service):
     key = service.create_api_key(
         user["user_id"], label="read-only", scopes=["market:read", "instrument:read"]
     )
-    assert key["key"].startswith("atr_")
+    assert key["key"].startswith("forward_")
     assert "key_hash" not in key
 
     principal = service.resolve_api_key(key["key"])
@@ -415,7 +428,7 @@ def test_api_key_is_scoped_to_its_role_and_cannot_escalate(service):
     # A viewer-role account cannot mint a key that exceeds viewer rights either.
     service.register(email="viewer@example.com", username="viewer", password=GOOD_PASSWORD)
     with service.db.session() as session:
-        from atr.appdb.repositories import UserRepository
+        from forward.appdb.identity_repository import UserRepository
 
         viewer = UserRepository.get_by_identifier(session, "viewer")
     with pytest.raises(AuthError) as exc:
@@ -497,8 +510,8 @@ def test_deactivating_a_user_kills_their_sessions(service):
 
 
 def test_expired_session_does_not_resolve(service):
-    from atr.appdb.repositories import SessionRepository
-    from atr.auth.tokens import hash_token
+    from forward.appdb.identity_repository import SessionRepository
+    from forward.auth.tokens import hash_token
 
     _, token, _ = _bootstrap(service)
     with service.db.session() as session:

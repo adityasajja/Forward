@@ -13,17 +13,19 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from atr.backtest.costs import CommissionModel, SlippageModel
-from atr.backtest.engine import BacktestConfig, BacktestEngine
-from atr.backtest.metrics import compute_metrics, max_drawdown
-from atr.backtest.portfolio import Portfolio
-from atr.core.enums import AssetClass, OrderStatus, OrderType, Side
-from atr.core.models import Bar, Fill, Instrument, MarketSnapshot, Order
-from atr.data.base import ListFeed
-from atr.data.synthetic import SyntheticConfig, SyntheticFeed
-from atr.execution.risk import RiskEngine, RiskLimits
-from atr.strategy.base import Strategy
-from atr.strategy.strategies.sma_crossover import SmaCrossover
+from forward.backtest.engine import BacktestConfig, BacktestEngine
+from forward.backtest.metrics import compute_metrics, max_drawdown
+from forward.core.costs import CommissionModel, SlippageModel
+from forward.core.enums import AssetClass, OrderStatus, OrderType, Side
+from forward.core.feeds import ListFeed
+from forward.core.instrument_models import Instrument
+from forward.core.market_models import Bar, MarketSnapshot
+from forward.core.order_models import Fill, Order
+from forward.data.synthetic import SyntheticConfig, SyntheticFeed
+from forward.execution.portfolio import Portfolio
+from forward.execution.risk import RiskEngine, RiskLimits
+from forward.strategy.base import Strategy
+from forward.strategy.strategies.sma_crossover import SmaCrossover
 
 EQ = Instrument(symbol="TEST", asset_class=AssetClass.EQUITY, currency="INR")
 FUT = Instrument(
@@ -81,7 +83,7 @@ def test_position_flip_through_zero():
 
 def test_market_order_fills_next_bar_open_not_signal_close():
     """The anti-look-ahead guarantee."""
-    from atr.backtest.broker import SimulatedBroker
+    from forward.backtest.broker import SimulatedBroker
 
     portfolio = Portfolio(initial_cash=1_000_000)
     broker = SimulatedBroker(portfolio, fill_on_next_open=True)
@@ -97,7 +99,7 @@ def test_market_order_fills_next_bar_open_not_signal_close():
 
 
 def test_limit_order_fills_at_limit_not_through():
-    from atr.backtest.broker import SimulatedBroker
+    from forward.backtest.broker import SimulatedBroker
 
     portfolio = Portfolio(initial_cash=1_000_000)
     broker = SimulatedBroker(portfolio, slippage=SlippageModel(bps=0))
@@ -110,7 +112,7 @@ def test_limit_order_fills_at_limit_not_through():
 
 
 def test_insufficient_margin_rejects_order():
-    from atr.backtest.broker import SimulatedBroker
+    from forward.backtest.broker import SimulatedBroker
 
     portfolio = Portfolio(initial_cash=1_000, equity_margin_ratio=1.0)
     broker = SimulatedBroker(portfolio)
@@ -147,6 +149,7 @@ def test_metrics_on_known_series():
 def test_risk_daily_loss_halts():
     portfolio = Portfolio(initial_cash=100_000)
     risk = RiskEngine(RiskLimits(max_daily_loss=1_000))
+    risk.reset_daily(portfolio.equity)
     risk.check(portfolio, datetime(2024, 1, 1))
     portfolio.cash -= 5_000
     verdict = risk.check(portfolio, datetime(2024, 1, 2))
@@ -166,6 +169,7 @@ def test_daily_loss_baseline_moves_with_the_day():
     portfolio = Portfolio(initial_cash=100_000)
     risk = RiskEngine(RiskLimits(max_daily_loss=5_000))
 
+    risk.reset_daily(portfolio.equity)
     risk.check(portfolio, datetime(2024, 1, 1))
     portfolio.cash -= 4_000          # a 4k loss today — under the 5k limit
     assert risk.check(portfolio, datetime(2024, 1, 1)).allowed
@@ -444,7 +448,7 @@ def test_sma_crossover_runs_and_respects_costs():
 
 def test_margin_counts_the_whole_book_not_one_symbol():
     """Two 60%-of-equity positions must not both pass a 100% limit."""
-    from atr.backtest.broker import SimulatedBroker
+    from forward.backtest.broker import SimulatedBroker
 
     fut2 = Instrument(
         symbol="TESTFUT2", asset_class=AssetClass.FUTURE, multiplier=100,
@@ -464,8 +468,8 @@ def test_margin_counts_the_whole_book_not_one_symbol():
 
 def test_fok_is_all_or_nothing():
     """A participation-capped FOK books nothing; an IOC keeps the partial."""
-    from atr.backtest.broker import SimulatedBroker
-    from atr.core.enums import TimeInForce
+    from forward.backtest.broker import SimulatedBroker
+    from forward.core.enums import TimeInForce
 
     portfolio = Portfolio(initial_cash=1_000_000)
     broker = SimulatedBroker(portfolio, slippage=SlippageModel(bps=0), participation_rate=0.5)
@@ -485,7 +489,7 @@ def test_fok_is_all_or_nothing():
 
 def test_stop_limit_cap_survives_a_gap():
     """A triggered stop-limit that gapped past its cap rests; it is not filled."""
-    from atr.backtest.broker import SimulatedBroker
+    from forward.backtest.broker import SimulatedBroker
 
     portfolio = Portfolio(initial_cash=1_000_000)
     broker = SimulatedBroker(portfolio, slippage=SlippageModel(bps=0))

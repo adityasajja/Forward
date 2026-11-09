@@ -23,26 +23,46 @@ Also validates reliability diagnostics:
 
 from __future__ import annotations
 
-import json
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 import pytest
 
-from atr.research.learning_evidence import (
-    CLASS_PAPER_FORWARD,
+from forward.appdb.daily_learning_storage import SqlDailyLearningStorage
+from forward.appdb.learning_storage import SqlLearningStorage
+from forward.appdb.order_storage import SqlOrderStorage
+from forward.appdb.paper_ledger_storage import SqlPaperLedgerStorage
+from forward.appdb.paper_runner_storage import SqlPaperRunnerStorage
+from forward.appdb.portfolio_storage import SqlPortfolioStorage
+from forward.appdb.risk_state_storage import SqlRiskStateStorage
+from forward.appdb.system_state_storage import SqlSystemStateStorage
+from forward.appdb.trade_journal_storage import SqlTradeJournalStorage
+from forward.config.settings import get_settings
+from forward.core.learning_evidence import (
     GRADE_FORWARD,
 )
-from atr.services.monitoring import DeploymentMonitor
-from atr.services.runner import PaperRunner, DeploymentLoop
-from atr.services.learning import LearningService
+from forward.data.cached_market_frames import CachedMarketFramesAdapter
+from forward.data.learning_artifacts import LocalLearningArtifactsAdapter
+from forward.data.vwap_liquidity import NseBhavcopyLiquidityAdapter
+from forward.market_calendar import get_market_calendar
+from forward.services.deployment_loop import DeploymentLoop
+from forward.services.learning import LearningService
+from forward.services.monitoring import DeploymentMonitor
+from forward.services.paper_ledger import PaperLedger
+from forward.services.risk import RiskStateService
+from forward.services.runner import PaperRunner
+from tests.market_data_fakes import (
+    InMemoryMarketFramesPort,
+    NoopSignalContextEnricher,
+)
+from tests.order_fakes import order_instrument_lookup
+from tests.paper_price_fakes import StaticRunnerVenueProvider, no_live_price
 
 SYMBOL = "TATAMOTORS"
 EXCHANGE = "NSEEQ"
 SESSION = datetime(2026, 9, 14, 10, 0, tzinfo=ZoneInfo("Asia/Kolkata"))
 CAPITAL = 500_000.0
-ORDER_VALUE = 200_000.0
 
 STRATEGY_DEFINITION = {
     "engine_key": None,
@@ -78,18 +98,13 @@ def _daily(n: int = 300, start: float = 800.0) -> pd.DataFrame:
 
 @pytest.fixture(autouse=True)
 def _clear_feed_seams():
-    from atr.services import paper as paper_service
 
-    paper_service.install_live_source(None)
-    paper_service.install_live_subscriber(None)
     yield
-    paper_service.install_live_source(None)
-    paper_service.install_live_subscriber(None)
 
 
 @pytest.fixture()
 def owner(app_db) -> str:
-    from atr.appdb.schema import users
+    from forward.appdb.account_schema import users
 
     with app_db.session() as session:
         session.execute(
@@ -112,10 +127,11 @@ def owner(app_db) -> str:
 
 @pytest.fixture()
 def paper_ops_env(app_db, owner, monkeypatch, tmp_path):
-    from atr.appdb.repositories import DeploymentRepository, StrategyRepository
+    from forward.appdb.deployment_repository import DeploymentRepository
+    from forward.appdb.strategy_repository import StrategyRepository
 
     monkeypatch.setattr(
-        "atr.signals.engine.load_daily",
+        "forward.data.cached_market_frames.load_daily_from_cache",
         lambda symbol, exchange="NSEEQ", **kw: _daily(),
     )
 
@@ -139,8 +155,9 @@ def paper_ops_env(app_db, owner, monkeypatch, tmp_path):
             status="RUNNING",
             config={
                 "symbols": [SYMBOL],
-                "exchange": EXCHANGE, "signal_basis": "live",
-                "order_value": ORDER_VALUE,
+                "exchange": EXCHANGE,
+                "signal_basis": "live",
+                "timeframe": "1d",
                 "lookback_days": 400,
                 "max_open_positions": 1,
             },
@@ -150,15 +167,50 @@ def paper_ops_env(app_db, owner, monkeypatch, tmp_path):
     high_63 = float(frame["close"].tail(63).max())
     breakout_tick = round(high_63 * 0.995, 2)
 
-    runner = PaperRunner(db=app_db)
+    runner = PaperRunner(
+        interval_seconds=get_settings().runner_interval_seconds,
+        lookback_days=get_settings().runner_lookback_days,
+        minimum_sleep_seconds=get_settings().runner_min_sleep_seconds,
+        market_wait_seconds=get_settings().runner_market_wait_seconds,
+        symbol_retry_seconds=get_settings().deployment_symbol_retry_seconds,
+        signal_context=NoopSignalContextEnricher(),
+        calendar=get_market_calendar(),
+        venue_provider=StaticRunnerVenueProvider(
+            prices=no_live_price, instruments=order_instrument_lookup
+        ),
+        daily_history=CachedMarketFramesAdapter(),
+        vwap_liquidity=NseBhavcopyLiquidityAdapter(get_settings().research_data_directory),
+        sector_table={},
+        instrument_lookup=order_instrument_lookup,
+        journal_storage=SqlTradeJournalStorage(app_db),
+        portfolio_storage=SqlPortfolioStorage(app_db),
+        ledger=PaperLedger(storage=SqlPaperLedgerStorage(app_db), price_source=no_live_price),
+        order_storage=SqlOrderStorage(app_db),
+        runner_storage=SqlPaperRunnerStorage(app_db),
+        state_storage=SqlSystemStateStorage(app_db),
+        risk_state=RiskStateService(SqlRiskStateStorage(app_db), get_settings()),
+    )
     runner.sync_loops()
     loop: DeploymentLoop = runner._loops[deployment["deployment_id"]]
 
     live_feed = {SYMBOL: breakout_tick}
     loop.venue.prices = lambda sym, exch: live_feed.get(sym.upper())
 
-    monitor = DeploymentMonitor(db=app_db, runner=runner)
-    learning = LearningService(db=app_db, cache_root=tmp_path)
+    monitor = DeploymentMonitor(
+        portfolio_storage=SqlPortfolioStorage(app_db),
+        order_storage=SqlOrderStorage(app_db),
+        ledger=PaperLedger(storage=SqlPaperLedgerStorage(app_db), price_source=no_live_price),
+        runner=runner,
+        risk_state=RiskStateService(SqlRiskStateStorage(app_db), get_settings()),
+        calendar=get_market_calendar(),
+    )
+    learning = LearningService(
+        market_history=InMemoryMarketFramesPort({}),
+        portfolio_storage=SqlPortfolioStorage(app_db),
+        storage=SqlLearningStorage(app_db),
+        daily_learning_storage=SqlDailyLearningStorage(app_db),
+        artifacts=LocalLearningArtifactsAdapter(tmp_path),
+    )
 
     return {
         "runner": runner,
@@ -177,7 +229,6 @@ def paper_ops_env(app_db, owner, monkeypatch, tmp_path):
 def test_full_chain_live_data_to_genuine_forward_observation(paper_ops_env, app_db):
     """Proves the full pipeline from live market data to forward learning observation."""
     runner = paper_ops_env["runner"]
-    loop = paper_ops_env["loop"]
     user_id = paper_ops_env["user_id"]
     deployment_id = paper_ops_env["deployment_id"]
     monitor = paper_ops_env["monitor"]
@@ -218,7 +269,9 @@ def test_full_chain_live_data_to_genuine_forward_observation(paper_ops_env, app_
     assert res_exit.signals == 1, "Strategy should have generated an exit stop-loss signal"
     assert res_exit.orders == 1, "OMS should have created a closing sell order"
 
-    exit_status = [d for d in runner.status()["deployments"] if d["deployment_id"] == deployment_id][0]
+    exit_status = [
+        d for d in runner.status()["deployments"] if d["deployment_id"] == deployment_id
+    ][0]
     assert exit_status["last_signal"]["side"] == "SELL"
     assert exit_status["last_risk_decision"]["approved"] is True
     assert exit_status["last_order"]["side"] == "SELL"
@@ -316,15 +369,17 @@ def test_reliability_diagnostics_risk_rejection(paper_ops_env, app_db):
     runner = paper_ops_env["runner"]
 
     # Set risk limits using RiskStateService so risk check refuses the order
-    from atr.services.risk import RiskStateService
+    from forward.services.risk import RiskStateService
 
-    risk_service = RiskStateService(db=app_db)
+    risk_service = RiskStateService(SqlRiskStateStorage(app_db), get_settings())
     risk_service.set_limits({"max_order_notional": 10.0}, actor=user_id)
 
     res = runner.pass_once(now=SESSION)
     assert res.orders == 0
 
-    dep_status = [d for d in runner.status()["deployments"] if d["deployment_id"] == deployment_id][0]
+    dep_status = [d for d in runner.status()["deployments"] if d["deployment_id"] == deployment_id][
+        0
+    ]
     assert dep_status["last_risk_decision"] is not None
     assert dep_status["last_risk_decision"]["approved"] is False
 

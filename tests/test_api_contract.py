@@ -96,7 +96,7 @@ def test_mfa_challenge_is_202_not_an_error(auth_client) -> None:
     """
     import time
 
-    from atr.auth.totp import code_at
+    from forward.auth.totp import code_at
 
     enroll = auth_client.post("/api/v1/auth/me/mfa/enroll").json()
     secret = enroll["secret"]
@@ -110,7 +110,7 @@ def test_mfa_challenge_is_202_not_an_error(auth_client) -> None:
     # A fresh client with no cookie: password only, second factor owed.
     from fastapi.testclient import TestClient
 
-    from atr.api.main import app
+    from forward.api.main import app
 
     fresh = TestClient(app, client=("127.0.0.1", 51234))
     res = fresh.post(

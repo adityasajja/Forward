@@ -12,7 +12,7 @@ sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import strategy_hunt as sh
-from atr.research.hunt import STOCK_COSTS, buy_and_hold, run_weights, compare
+from forward.research.hunt import STOCK_COSTS, buy_and_hold, run_weights, compare
 
 DAILY = ROOT / "data" / "iifl_daily" / "NSEEQ"
 OUT = ROOT / "data" / "research"

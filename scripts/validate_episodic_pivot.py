@@ -32,7 +32,6 @@ Usage::
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import random
 import statistics
@@ -45,19 +44,22 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 import pandas as pd  # noqa: E402
+from research_episodic_pivot import universe_symbols  # noqa: E402
+from validate_paper_strategies import build_feed, load_series  # noqa: E402
 
-from atr.backtest.costs import SlippageModel  # noqa: E402
-from atr.backtest.engine import BacktestConfig, BacktestEngine  # noqa: E402
-from atr.execution.risk import RiskLimits  # noqa: E402
-from atr.research.validate import (  # noqa: E402
+from forward.backtest.engine import BacktestConfig, BacktestEngine  # noqa: E402
+from forward.core.costs import SlippageModel  # noqa: E402
+from forward.execution.risk import RiskLimits  # noqa: E402
+from forward.research.validate import (  # noqa: E402
     ValidationConfig,
     WalkForwardConfig,
     walk_forward,
 )
-from atr.strategy.base import Strategy  # noqa: E402
-from atr.strategy.strategies import STRATEGIES  # noqa: E402
-from research_episodic_pivot import UNIVERSES, universe_symbols  # noqa: E402
-from validate_paper_strategies import build_feed, load_series  # noqa: E402
+from forward.strategy.base import Strategy  # noqa: E402
+from forward.strategy.strategies import STRATEGIES  # noqa: E402
+
+ROOT = Path(__file__).resolve().parents[1]
+EPISODIC_CONFIG_PATH = ROOT / "config" / "research_episodic_pivot.json"
 
 #: Parameters searched per variant. Each list is a real choice a trader makes;
 #: every combination counts toward the multiple-testing hurdle, which is the
@@ -156,13 +158,13 @@ def make_control_strategy(schedule: dict):
                 if ctx.has_position(symbol):
                     continue
                 close = ctx.row(symbol).get("close")
-                if close is None or not (close == close) or close <= 0:
+                if close is None or close != close or close <= 0:
                     continue
                 equity = ctx.equity
                 # `NaN <= 0` is False, so a bare comparison lets a NaN equity
                 # through and it detonates as `int(nan)` — which is how three
                 # of six control runs used to die.
-                if equity is None or not (equity == equity) or equity <= 0:
+                if equity is None or equity != equity or equity <= 0:
                     continue
                 instrument = ctx.instruments[symbol]
                 step = max(getattr(instrument, "quantity_step", 1) or 1, 1)
@@ -243,9 +245,10 @@ def run_control(feed, dates, trades, backtest, cfg, val, runs: int) -> dict:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--universe", default="nifty50,midcap150")
+    ap.add_argument("--universe")
+    ap.add_argument("--data-config", type=Path, default=EPISODIC_CONFIG_PATH)
     ap.add_argument("--variants", default=",".join(PARAM_GRIDS))
-    ap.add_argument("--min-bars", type=int, default=1000)
+    ap.add_argument("--min-bars", type=int)
     ap.add_argument("--cash", type=float, default=1_000_000.0)
     ap.add_argument("--slippage-bps", type=float, default=5.0)
     ap.add_argument("--train", type=int, default=400)
@@ -260,6 +263,14 @@ def main() -> int:
     ap.add_argument("--max-daily-loss-pct", type=float, default=25.0)
     ap.add_argument("--out", default="data/self_learning/episodic_pivot_validation.json")
     args = ap.parse_args()
+    data_config = json.loads(args.data_config.read_text(encoding="utf-8"))
+    print(f"Data configuration: {args.data_config.resolve()}")
+    minimum_history_bars = (
+        data_config["minimum_history_bars"] if args.min_bars is None else args.min_bars
+    )
+    universe_names = data_config["universes"]
+    if args.universe is not None:
+        universe_names = [name.strip() for name in args.universe.split(",") if name.strip()]
 
     variants = [v.strip() for v in args.variants.split(",") if v.strip()]
     config = WalkForwardConfig(
@@ -290,11 +301,11 @@ def main() -> int:
         "universes": {},
     }
 
-    for name in [u.strip() for u in args.universe.split(",") if u.strip()]:
-        if name not in UNIVERSES:
+    for name in universe_names:
+        if name not in data_config["universe_files"]:
             print(f"unknown universe {name!r}", file=sys.stderr)
             return 1
-        series = load_series(universe_symbols(name), min_bars=args.min_bars)
+        series = load_series(universe_symbols(name, data_config), min_bars=minimum_history_bars)
         if not series:
             print(f"{name}: no cached history", file=sys.stderr)
             continue

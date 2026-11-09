@@ -40,19 +40,20 @@ from zoneinfo import ZoneInfo
 import pytest
 from sqlalchemy import text
 
-from atr.appdb.engine import AppDatabase
-from atr.appdb.repositories import (
-    LearningObservationRepository,
+from forward.appdb.engine import AppDatabase
+from forward.appdb.identity_repository import UserRepository
+from forward.appdb.learning_observation_repository import LearningObservationRepository
+from forward.appdb.strategy_repository import StrategyRepository
+from forward.appdb.strategy_research_repository import (
     OptimizationRecommendationRepository,
-    StrategyExperimentRepository,
-    StrategyRepository,
-    UserRepository,
 )
-from atr.data.synthetic import SyntheticConfig, SyntheticFeed
-from atr.research.learning_evidence import CLASS_PAPER_FORWARD, GRADE_FORWARD
-from atr.services.experiment import StrategyExperimentService
-from atr.services.learning import LearningDataset, LearningService
-from atr.services.optimization import OptimizationService
+from forward.appdb.strategy_research_storage import SqlStrategyResearchStorage
+from forward.config.settings import get_settings
+from forward.core.learning_evidence import CLASS_PAPER_FORWARD, GRADE_FORWARD
+from forward.data.synthetic import SyntheticConfig, SyntheticFeed
+from forward.services.experiment import StrategyExperimentService
+from forward.services.learning import LearningService
+from forward.services.learning_dataset_model import LearningDataset
 
 IST = ZoneInfo("Asia/Kolkata")
 
@@ -168,29 +169,34 @@ def test_strategy_experiment_lab_full_lifecycle(
         # 15 trades with high RVOL (positive return), 10 trades with lower RVOL
         rvol = 2.2 if i < 15 else 1.2
         ret_pct = 2.8 if i < 15 else -0.8
-        forward_trades.append({
-            "trade_id": f"pforward-lab-{i:03d}",
-            "symbol": "NIFTY50",
-            "entry_time": (base_time + timedelta(days=i)).isoformat(),
-            "exit_time": (base_time + timedelta(days=i, hours=2)).isoformat(),
-            "side": "BUY",
-            "quantity": 50,
-            "entry_price": 22000.0,
-            "exit_price": 22000.0 * (1.0 + ret_pct / 100.0),
-            "pnl": 50 * 22000.0 * (ret_pct / 100.0),
-            "pnl_pct": ret_pct,
-            "strategy_id": strategy_id,
-            "strategy_version": 1,
-            "evidence_class": CLASS_PAPER_FORWARD,
-            "evidence_grade": GRADE_FORWARD,
-            "relative_volume": rvol,
-            "market_regime": "BULL_TRENDING" if i % 2 == 0 else "RANGING",
-        })
+        forward_trades.append(
+            {
+                "trade_id": f"pforward-lab-{i:03d}",
+                "symbol": "NIFTY50",
+                "entry_time": (base_time + timedelta(days=i)).isoformat(),
+                "exit_time": (base_time + timedelta(days=i, hours=2)).isoformat(),
+                "side": "BUY",
+                "quantity": 50,
+                "entry_price": 22000.0,
+                "exit_price": 22000.0 * (1.0 + ret_pct / 100.0),
+                "pnl": 50 * 22000.0 * (ret_pct / 100.0),
+                "pnl_pct": ret_pct,
+                "strategy_id": strategy_id,
+                "strategy_version": 1,
+                "evidence_class": CLASS_PAPER_FORWARD,
+                "evidence_grade": GRADE_FORWARD,
+                "relative_volume": rvol,
+                "market_regime": "BULL_TRENDING" if i % 2 == 0 else "RANGING",
+            }
+        )
 
     learning_svc = MockLearningService(trades=forward_trades)
     assert len(learning_svc.dataset().rows) == 25
-    opt_svc = OptimizationService(db=app_db, learning_service=learning_svc)
-    exp_svc = StrategyExperimentService(db=app_db)
+    exp_svc = StrategyExperimentService(
+        storage=SqlStrategyResearchStorage(app_db),
+        curve_max_points=get_settings().experiment_curve_max_points,
+        result_decimals=get_settings().experiment_result_decimals,
+    )
 
     # -----------------------------------------------------------------------
     # Step 2: Learning Observation & Hypothesis
@@ -233,7 +239,11 @@ def test_strategy_experiment_lab_full_lifecycle(
             sample_size=25,
             baseline_metrics={"sharpe": 1.15, "profit_factor": 1.42, "max_drawdown_pct": 14.5},
             candidate_metrics={"sharpe": 1.48, "profit_factor": 1.61, "max_drawdown_pct": 11.2},
-            walk_forward_metrics={"passed": True, "efficiency_ratio": 0.88, "out_of_sample_profit_factor": 1.52},
+            walk_forward_metrics={
+                "passed": True,
+                "efficiency_ratio": 0.88,
+                "out_of_sample_profit_factor": 1.52,
+            },
             robustness_results={"is_stable": True, "stable_range": [1.7, 2.0]},
             confidence="high",
             status="RECOMMENDED",
@@ -361,9 +371,7 @@ def test_strategy_experiment_lab_full_lifecycle(
     assert approved["status"] == "APPROVED"
     assert approved["reviewed_by"] == test_user["user_id"]
 
-    apply_res = exp_svc.apply_experiment(
-        exp["experiment_id"], user_id=test_user["user_id"]
-    )
+    apply_res = exp_svc.apply_experiment(exp["experiment_id"], user_id=test_user["user_id"])
     final_exp = apply_res["experiment"]
     new_version = apply_res["new_version"]
     assert final_exp["status"] == "APPLIED"
@@ -376,15 +384,19 @@ def test_strategy_experiment_lab_full_lifecycle(
     # -----------------------------------------------------------------------
     with app_db.session() as session:
         # V(1) must remain strictly UNCHANGED
-        v1 = StrategyRepository.get_version(session, strategy_id, 1)
+        v1 = StrategyRepository.version(session, strategy_id, 1)
         assert v1 is not None
-        v1_def = json.loads(v1["definition"]) if isinstance(v1["definition"], str) else v1["definition"]
+        v1_def = (
+            json.loads(v1["definition"]) if isinstance(v1["definition"], str) else v1["definition"]
+        )
         assert v1_def["rules"]["entry"]["volume_multiple"] == 1.5
 
         # V(2) contains the approved candidate parameter
-        v2 = StrategyRepository.get_version(session, strategy_id, 2)
+        v2 = StrategyRepository.version(session, strategy_id, 2)
         assert v2 is not None
-        v2_def = json.loads(v2["definition"]) if isinstance(v2["definition"], str) else v2["definition"]
+        v2_def = (
+            json.loads(v2["definition"]) if isinstance(v2["definition"], str) else v2["definition"]
+        )
         assert v2_def["rules"]["entry"]["volume_multiple"] != 1.5
         assert f"experiment {exp['experiment_id']}" in (v2["change_note"] or "")
 

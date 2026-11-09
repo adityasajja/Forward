@@ -1,64 +1,72 @@
-"""A running paper deployment must be *on* the live feed, not only reading it.
+"""Keep every running paper deployment connected to the live quote feed.
 
-What this suite protects
-------------------------
+PaperRunner states its active symbol universe through the market-data port. The
+API adapter connects that port to :class:`forward.api.stream.TickBroadcaster`.
+Feed ownership stays independent from browser clients, so a dashboard closing
+cannot remove symbols needed by a running paper deployment. If a fresh tick is
+missing, the venue refuses to invent a fill from an old daily close.
 
-The paper venue reads its prices from :class:`~atr.api.stream.TickBroadcaster`,
-and a symbol only reaches that broadcaster's tick store when somebody
-**subscribes** to it. Subscription used to be reachable from one place only —
-:meth:`TickBroadcaster.subscribe`, the browser path. So the chain
-
-    deployment RUNNING ──► runner pass ──► latest_price(symbol) ──► None
-
-was the normal state of a deployment nobody was watching: no bridge connection,
-no ticks, every price lookup ``None``, and ``default_price_source`` falling
-through to the daily cache. The venue reads "no price" as a rejection for a new
-order and as "resting" for a resting one, so the deployment either filled at
-yesterday's close or never filled at all — while reporting itself as running.
-
-That is the difference between a paper account that trades and one that only
-looks like it does, and it is why these tests are about *subscription* rather
-than about prices. Each one pins a property that, if it broke, would leave a
-deployment silently un-priced and the dashboard showing green.
+These tests cover the broadcaster subscription contract and its runner wiring.
 """
 
 from __future__ import annotations
 
-import pytest
+import pandas as pd
 
-from atr.api.stream import TickBroadcaster, _normalise_universe
+from forward.api.stream import TickBroadcaster, _normalise_universe
+from forward.appdb.order_storage import SqlOrderStorage
+from forward.appdb.paper_ledger_storage import SqlPaperLedgerStorage
+from forward.appdb.paper_runner_storage import SqlPaperRunnerStorage
+from forward.appdb.portfolio_storage import SqlPortfolioStorage
+from forward.appdb.risk_state_storage import SqlRiskStateStorage
+from forward.appdb.system_state_storage import SqlSystemStateStorage
+from forward.appdb.trade_journal_storage import SqlTradeJournalStorage
+from forward.config.settings import get_settings
+from forward.data.cached_market_frames import CachedMarketFramesAdapter
+from forward.data.observed_bars import ObservedBars
+from forward.data.vwap_liquidity import NseBhavcopyLiquidityAdapter
+from forward.market_calendar import get_market_calendar
+from forward.services.paper_ledger import PaperLedger
+from forward.services.risk import RiskStateService
+from tests.market_data_fakes import (
+    InMemoryLiveMarketFeed,
+    InMemoryTickCandleAggregation,
+    NoopSignalContextEnricher,
+)
+from tests.order_fakes import order_instrument_lookup
+from tests.paper_price_fakes import StaticRunnerVenueProvider, no_live_price
 
 SYMBOL = "RELIANCE"
+
+
+class RecordingMarketData:
+    """Capture the market feed calls made by the paper runner."""
+
+    def __init__(self) -> None:
+        self.symbol_calls: list[dict[str, list[str]]] = []
+
+    def ensure_symbols(self, universe: dict[str, list[str]]) -> dict[str, list[str]]:
+        self.symbol_calls.append(universe)
+        return {"added": [], "removed": [], "unresolved": []}
+
+    def ensure_indices(self, indices: tuple[tuple[str, str], ...]) -> None:
+        return None
 
 
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
-class FakeBridge:
-    """A bridge that records what was asked of it."""
-
-    def __init__(self) -> None:
-        self.is_connected = True
-        self.subscribed: list[str] = []
-        self.unsubscribed: list[str] = []
-
-    def subscribe_feed(self, topics: list[str]) -> None:
-        self.subscribed.extend(topics)
-
-    def unsubscribe_feed(self, topics: list[str]) -> None:
-        self.unsubscribed.extend(topics)
-
-
-def _broadcaster(monkeypatch, *, resolve: bool = True) -> tuple[TickBroadcaster, FakeBridge]:
+def _broadcaster(
+    monkeypatch, *, resolve: bool = True
+) -> tuple[TickBroadcaster, InMemoryLiveMarketFeed]:
     """A broadcaster with a fake bridge and a deterministic contract resolver.
 
     The resolver is stubbed rather than left real because resolving a symbol
     against the instrument master reads a 22,899-contract index — the subject
     here is the subscription logic, not the master.
     """
-    broadcaster = TickBroadcaster()
-    bridge = FakeBridge()
-    broadcaster._bridge = bridge
+    bridge = InMemoryLiveMarketFeed()
+    broadcaster = TickBroadcaster(bridge, InMemoryTickCandleAggregation(), ObservedBars())
 
     def stub_resolve(symbol: str, exchange: str = "NSEEQ"):
         if not resolve:
@@ -72,23 +80,11 @@ def _broadcaster(monkeypatch, *, resolve: bool = True) -> tuple[TickBroadcaster,
     return broadcaster, bridge
 
 
-@pytest.fixture()
-def subscriber_reset():
-    """Leave the process-wide subscriber seam as it was found."""
-    from atr.services import paper as paper_service
-
-    yield
-    paper_service.install_live_subscriber(None)
-    paper_service.install_live_source(None)
-
-
 # ---------------------------------------------------------------------------
 # 1. the universe statement itself
 # ---------------------------------------------------------------------------
 def test_a_flat_universe_is_normalised_to_upper_case_symbols():
-    assert _normalise_universe(["reliance", " tcs ", ""], "nseeq") == {
-        "NSEEQ": {"RELIANCE", "TCS"}
-    }
+    assert _normalise_universe(["reliance", " tcs ", ""], "nseeq") == {"NSEEQ": {"RELIANCE", "TCS"}}
 
 
 def test_a_per_exchange_universe_keeps_its_exchanges_apart():
@@ -249,8 +245,8 @@ def test_a_statement_made_while_the_bridge_is_down_is_retried(monkeypatch):
     """
     broadcaster, bridge = _broadcaster(monkeypatch)
     bridge.is_connected = False
-    # No session: `_ensure_bridge` cannot build one either.
-    monkeypatch.setattr(broadcaster, "_ensure_bridge", lambda: False)
+    # The feed is unavailable for this pass.
+    monkeypatch.setattr(broadcaster, "_ensure_live_feed", lambda: False)
 
     first = broadcaster.ensure_symbols([SYMBOL])
     assert first["added"] == [SYMBOL]
@@ -258,7 +254,7 @@ def test_a_statement_made_while_the_bridge_is_down_is_retried(monkeypatch):
 
     # The session arrives.
     bridge.is_connected = True
-    monkeypatch.setattr(broadcaster, "_ensure_bridge", lambda: True)
+    monkeypatch.setattr(broadcaster, "_ensure_live_feed", lambda: True)
 
     second = broadcaster.ensure_symbols([SYMBOL])
     assert second["added"] == [SYMBOL], "the outstanding symbol was not retried"
@@ -325,104 +321,181 @@ def test_the_runner_states_the_union_of_its_running_deployments(app_db, monkeypa
     """The runner is the only thing that knows the current universe."""
     from datetime import datetime as _dt
 
-    from atr.appdb.repositories import DeploymentRepository
-    from atr.appdb.schema import users
-    from atr.services import paper as paper_service
-    from atr.services.runner import PaperRunner
+    from forward.appdb.account_schema import users
+    from forward.appdb.deployment_repository import DeploymentRepository
+    from forward.services.runner import PaperRunner
 
     monkeypatch.setattr(
-        "atr.signals.engine.load_daily", lambda symbol, exchange="NSEEQ", **kw: None
+        "forward.data.cached_market_frames.load_daily_from_cache",
+        lambda symbol, exchange="NSEEQ", **kw: pd.DataFrame(
+            columns=["ts", "open", "high", "low", "close", "volume"]
+        ),
     )
 
     with app_db.session() as session:
         session.execute(
             users.insert().values(
-                user_id="u1", email="f@example.com", username="f", display_name="F",
-                password_hash="x", role="owner", is_active=True, mfa_enabled=False,
-                failed_logins=0, created_at=_dt(2026, 1, 1), updated_at=_dt(2026, 1, 1),
+                user_id="u1",
+                email="f@example.com",
+                username="f",
+                display_name="F",
+                password_hash="x",
+                role="owner",
+                is_active=True,
+                mfa_enabled=False,
+                failed_logins=0,
+                created_at=_dt(2026, 1, 1),
+                updated_at=_dt(2026, 1, 1),
             )
         )
         DeploymentRepository.create(
-            session, user_id="u1", strategy_id="s", strategy_version=1, mode="PAPER",
-            capital=100_000.0, status="RUNNING",
-            config={"symbols": ["RELIANCE", "TCS"], "exchange": "NSEEQ"},
+            session,
+            user_id="u1",
+            strategy_id="s",
+            strategy_version=1,
+            mode="PAPER",
+            capital=100_000.0,
+            status="RUNNING",
+            config={
+                "symbols": ["RELIANCE", "TCS"],
+                "exchange": "NSEEQ",
+                "timeframe": "1d",
+                "max_open_positions": 10,
+                "signal_basis": "closed_bar",
+            },
         )
         DeploymentRepository.create(
-            session, user_id="u1", strategy_id="s", strategy_version=1, mode="PAPER",
-            capital=100_000.0, status="RUNNING",
-            config={"symbols": ["INFY"], "exchange": "NSEEQ"},
+            session,
+            user_id="u1",
+            strategy_id="s",
+            strategy_version=1,
+            mode="PAPER",
+            capital=100_000.0,
+            status="RUNNING",
+            config={
+                "symbols": ["INFY"],
+                "exchange": "NSEEQ",
+                "timeframe": "1d",
+                "max_open_positions": 10,
+                "signal_basis": "closed_bar",
+            },
         )
 
-    calls: list[object] = []
-    paper_service.install_live_subscriber(
-        lambda symbols, exchange="NSEEQ": calls.append(symbols) or {
-            "added": [], "removed": [], "unresolved": []
-        }
-    )
+    market_data = RecordingMarketData()
 
-    runner = PaperRunner(db=app_db, price_source=lambda s, e: 100.0)
+    runner = PaperRunner(
+        interval_seconds=get_settings().runner_interval_seconds,
+        lookback_days=get_settings().runner_lookback_days,
+        minimum_sleep_seconds=get_settings().runner_min_sleep_seconds,
+        market_wait_seconds=get_settings().runner_market_wait_seconds,
+        symbol_retry_seconds=get_settings().deployment_symbol_retry_seconds,
+        signal_context=NoopSignalContextEnricher(),
+        calendar=get_market_calendar(),
+        venue_provider=StaticRunnerVenueProvider(
+            prices=lambda s, e: 100.0, instruments=order_instrument_lookup
+        ),
+        daily_history=CachedMarketFramesAdapter(),
+        vwap_liquidity=NseBhavcopyLiquidityAdapter(get_settings().research_data_directory),
+        sector_table={},
+        instrument_lookup=order_instrument_lookup,
+        journal_storage=SqlTradeJournalStorage(app_db),
+        portfolio_storage=SqlPortfolioStorage(app_db),
+        ledger=PaperLedger(storage=SqlPaperLedgerStorage(app_db), price_source=no_live_price),
+        order_storage=SqlOrderStorage(app_db),
+        runner_storage=SqlPaperRunnerStorage(app_db),
+        state_storage=SqlSystemStateStorage(app_db),
+        risk_state=RiskStateService(SqlRiskStateStorage(app_db), get_settings()),
+        market_data=market_data,
+    )
     runner.pass_once()
 
-    assert calls, "the runner never told the feed what it needs"
-    stated = calls[-1]
+    assert market_data.symbol_calls, "the runner never told the feed what it needs"
+    stated = market_data.symbol_calls[-1]
     assert set(stated["NSEEQ"]) == {"RELIANCE", "TCS", "INFY"}
 
 
 def test_the_runner_does_not_state_a_universe_when_nothing_is_running(app_db, monkeypatch):
-    from atr.services import paper as paper_service
-    from atr.services.runner import PaperRunner
+    from forward.services.runner import PaperRunner
 
-    calls: list[object] = []
-    paper_service.install_live_subscriber(lambda symbols, exchange="NSEEQ": calls.append(symbols))
-    PaperRunner(db=app_db, price_source=lambda s, e: 100.0).pass_once()
-    assert calls == []
-
-
-def test_a_failing_subscriber_does_not_stop_the_pass(app_db, monkeypatch):
-    """A feed that cannot be subscribed must not take the trading loop down."""
-    from atr.services import paper as paper_service
-    from atr.services.runner import PaperRunner
-
-    def explode(symbols, exchange="NSEEQ"):
-        raise RuntimeError("no feed today")
-
-    paper_service.install_live_subscriber(explode)
-    tick = PaperRunner(db=app_db, price_source=lambda s, e: 100.0).pass_once()
-    assert tick.deployments == 0  # nothing running; the point is that it returned
-
-
-# ---------------------------------------------------------------------------
-# 6. the seam itself
-# ---------------------------------------------------------------------------
-def test_no_subscriber_installed_is_not_an_error(subscriber_reset):
-    """A CLI run, a test, or a stream that failed to start.
-
-    Absence degrades to the daily cache — the documented behaviour — rather than
-    raising into the trading loop.
-    """
-    from atr.services.paper import ensure_live_symbols
-
-    assert ensure_live_symbols(["RELIANCE"]) is None
+    market_data = RecordingMarketData()
+    PaperRunner(
+        interval_seconds=get_settings().runner_interval_seconds,
+        lookback_days=get_settings().runner_lookback_days,
+        minimum_sleep_seconds=get_settings().runner_min_sleep_seconds,
+        market_wait_seconds=get_settings().runner_market_wait_seconds,
+        symbol_retry_seconds=get_settings().deployment_symbol_retry_seconds,
+        signal_context=NoopSignalContextEnricher(),
+        calendar=get_market_calendar(),
+        venue_provider=StaticRunnerVenueProvider(
+            prices=lambda s, e: 100.0, instruments=order_instrument_lookup
+        ),
+        daily_history=CachedMarketFramesAdapter(),
+        vwap_liquidity=NseBhavcopyLiquidityAdapter(get_settings().research_data_directory),
+        sector_table={},
+        instrument_lookup=order_instrument_lookup,
+        journal_storage=SqlTradeJournalStorage(app_db),
+        portfolio_storage=SqlPortfolioStorage(app_db),
+        ledger=PaperLedger(storage=SqlPaperLedgerStorage(app_db), price_source=no_live_price),
+        order_storage=SqlOrderStorage(app_db),
+        runner_storage=SqlPaperRunnerStorage(app_db),
+        state_storage=SqlSystemStateStorage(app_db),
+        risk_state=RiskStateService(SqlRiskStateStorage(app_db), get_settings()),
+        market_data=market_data,
+    ).pass_once()
+    assert market_data.symbol_calls == []
 
 
-def test_the_api_layer_installs_both_seams(monkeypatch, subscriber_reset):
-    """Reading a price is useless without being on the feed.
+def test_browser_subscription_leaves_event_loop_available(monkeypatch):
+    import asyncio
+    import threading
 
-    Pinned as one wiring because the two are installed in one place and it is
-    exactly the omission of the second that produced the defect.
-    """
-    from atr.api import price_sources
-    from atr.api.stream import TickBroadcaster
-    from atr.services import paper as paper_service
+    broadcaster, bridge = _broadcaster(monkeypatch)
+    ws = object()
+    broadcaster._client_subscriptions[ws] = set()
+    release = threading.Event()
+    blocked = []
 
-    broadcaster = TickBroadcaster()
-    monkeypatch.setattr("atr.api.stream.get_broadcaster", lambda: broadcaster)
+    def connect():
+        blocked.append(not release.wait(0.5))
+        return True
 
-    price_sources.install_live_price_source()
+    monkeypatch.setattr(broadcaster, "_ensure_live_feed", connect)
 
-    assert paper_service._LIVE_SOURCE[0] is not None, "no price source was installed"
-    assert paper_service._LIVE_SUBSCRIBER[0] is not None, "no subscriber was installed"
+    async def check():
+        task = asyncio.create_task(broadcaster.subscribe(ws, [SYMBOL]))
+        await asyncio.sleep(0)
+        release.set()
+        await task
 
-    price_sources.clear_live_price_source()
-    assert paper_service._LIVE_SOURCE[0] is None
-    assert paper_service._LIVE_SUBSCRIBER[0] is None
+    asyncio.run(check())
+    assert blocked == [False], "broker connection blocked the server event loop"
+    assert bridge.subscribed
+
+
+def test_quote_reads_remain_available_during_bridge_connect(monkeypatch):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    broadcaster = TickBroadcaster(
+        InMemoryLiveMarketFeed(), InMemoryTickCandleAggregation(), ObservedBars()
+    )
+    entered, release = threading.Event(), threading.Event()
+    feed = InMemoryLiveMarketFeed()
+
+    def connect(**values):
+        del values
+        entered.set()
+        assert release.wait(5)
+        return True
+
+    monkeypatch.setattr(feed, "ensure_connected", connect)
+    broadcaster = TickBroadcaster(feed, InMemoryTickCandleAggregation(), ObservedBars())
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        connecting = pool.submit(broadcaster._ensure_live_feed)
+        try:
+            assert entered.wait(2)
+            reader = pool.submit(broadcaster.latest_price_and_time, SYMBOL)
+            assert reader.result(timeout=0.5) == (None, None)
+        finally:
+            release.set()
+        assert connecting.result(timeout=2)

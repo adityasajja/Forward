@@ -5,7 +5,10 @@ using the 200d regime filter. Also tests whether a blended signal
 (momentum + gap) is more robust than either alone.
 """
 from __future__ import annotations
-import json, sys
+
+import argparse
+import json
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -13,10 +16,10 @@ import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
 DAILY = ROOT / "data" / "iifl_daily" / "NSEEQ"
-TRADING_DAYS = 252
-COST = 0.00283
 p = print
-def P(*a, **k): k.setdefault("flush", True); p(*a, **k)
+def P(*a, **k):
+    k.setdefault("flush", True)
+    p(*a, **k)
 
 sys.path.insert(0, str(ROOT / "scripts"))
 
@@ -38,45 +41,65 @@ def build_regime(nifty_close, window):
     return filt
 
 
-def load_stocks(symbols, start, end, min_bars=250):
+def load_stocks(symbols, start, end, min_bars):
     close_d, high_d, low_d, open_d, vol_d = {}, {}, {}, {}, {}
     for sym in symbols:
-        try:
-            df = load_symbol(sym, start, end)
-            if len(df) < min_bars: continue
-            close_d[sym] = df["close"]; high_d[sym] = df["high"]
-            low_d[sym] = df["low"]; open_d[sym] = df["open"]; vol_d[sym] = df["volume"]
-        except Exception:
-            continue
+        df = load_symbol(sym, start, end)
+        if len(df) < min_bars:
+            raise ValueError(
+                f"{sym} has {len(df)} bars; the configured minimum is {min_bars}."
+            )
+        close_d[sym] = df["close"]
+        high_d[sym] = df["high"]
+        low_d[sym] = df["low"]
+        open_d[sym] = df["open"]
+        vol_d[sym] = df["volume"]
     panels = {}
     for name, d in [("close", close_d), ("high", high_d), ("low", low_d),
-                     ("open", open_d), ("volume", vol_d)]:
-        if d: panels[name] = pd.concat(d, axis=1)
+                    ("open", open_d), ("volume", vol_d)]:
+        panels[name] = pd.concat(d, axis=1)
     cols = sorted(set(panels["close"].columns) & set(panels["high"].columns) &
                   set(panels["low"].columns) & set(panels["open"].columns) &
                   set(panels["volume"].columns))
-    for name in panels: panels[name] = panels[name][cols]
+    for name in panels:
+        panels[name] = panels[name][cols]
     idx = panels["close"].index
-    for name in panels: panels[name] = panels[name].reindex(idx).ffill()
+    for name, panel in panels.items():
+        aligned = panel.reindex(idx)
+        if aligned.isna().any().any():
+            missing = aligned.isna().stack()
+            symbol = missing[missing].index[0][1]
+            raise ValueError(f"{name} data for {symbol} has missing dates in the panel.")
+        panels[name] = aligned
     return panels, cols, idx
 
 
 def main():
+    """Run the configured ensemble research study."""
     from strategy_hunt import parse_universe
 
-    start = pd.Timestamp("2020-01-01")
-    end = pd.Timestamp("2026-09-18")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", type=Path, required=True)
+    config_path = parser.parse_args().config
+    data_config = json.loads(config_path.read_text(encoding="utf-8"))
+    P(f"Configuration: {config_path.resolve()}")
+    start = pd.Timestamp(data_config["start_date"])
+    end = pd.Timestamp(data_config["end_date"])
 
     all_symbols = list(set(
-        parse_universe(ROOT / "data" / "universe" / "n50.txt") +
-        parse_universe(ROOT / "data" / "universe" / "mid150.txt")
+        parse_universe(ROOT / path) for path in data_config["universe_files"]
     ))
     P(f"Loading {len(all_symbols)} symbols...")
-    panels, syms, dates = load_stocks(all_symbols, start, end)
+    panels, syms, dates = load_stocks(
+        all_symbols, start, end, min_bars=data_config["minimum_bars"]
+    )
     P(f"  {len(syms)} stocks, {len(dates)} dates")
 
-    nifty = load_symbol("NIFTYBEES", start, end)
-    nif_close = nifty["close"].reindex(dates).ffill().to_numpy(dtype=np.float64)
+    nifty = load_symbol(data_config["benchmark_symbol"], start, end)
+    aligned_benchmark = nifty["close"].reindex(dates)
+    if aligned_benchmark.isna().any():
+        raise ValueError("Benchmark is missing dates required for regime signals.")
+    nif_close = aligned_benchmark.to_numpy(dtype=np.float64)
     regime_200 = build_regime(nif_close, 200)
     regime_50 = build_regime(nif_close, 50)
     regime_dual = regime_50 & regime_200
@@ -85,8 +108,8 @@ def main():
     close = panels["close"].to_numpy(dtype=np.float64)
     high = panels["high"].to_numpy(dtype=np.float64)
     low = panels["low"].to_numpy(dtype=np.float64)
-    open_ = panels["open"].to_numpy(dtype=np.float64)
-    volume = panels["volume"].to_numpy(dtype=np.float64)
+    panels["open"].to_numpy(dtype=np.float64)
+    panels["volume"].to_numpy(dtype=np.float64)
     n_dates = len(dates)
     mid = n_dates // 2
 
@@ -98,22 +121,26 @@ def main():
     vols_df = panels["volume"]
 
     closes = closes_df.to_numpy(dtype=np.float64)
-    highs = highs_df.to_numpy(dtype=np.float64)
-    lows = lows_df.to_numpy(dtype=np.float64)
+    highs_df.to_numpy(dtype=np.float64)
+    lows_df.to_numpy(dtype=np.float64)
     opens = opens_df.to_numpy(dtype=np.float64)
     vols = vols_df.to_numpy(dtype=np.float64)
 
     # Build signals manually
-    c = closes; v = vols; o = opens; h = highs; l = lows
+    c = closes
+    v = vols
+    o = opens
     signals = {}
     for lb in [5, 10, 20]:
         s = np.full_like(c, -np.inf)
         s[lb:] = c[lb:] / c[:-lb] - 1.0
-        s = np.roll(s, 1, axis=0); s[:lb + 2] = -np.inf
+        s = np.roll(s, 1, axis=0)
+        s[:lb + 2] = -np.inf
         signals[f"mom_{lb}d"] = s
     gap = np.full_like(c, -np.inf)
     gap[1:] = (o[1:] - c[:-1]) / c[:-1]
-    gap = np.roll(gap, 1, axis=0); gap[:2] = -np.inf
+    gap = np.roll(gap, 1, axis=0)
+    gap[:2] = -np.inf
     signals["gap_run_5"] = np.where(gap > 0.02, gap * signals["mom_5d"], -np.inf)
     signals["gap_run"] = np.where(gap > 0.01, gap * signals["mom_5d"], -np.inf)
     vol_avg = np.full_like(v, np.nan)
@@ -123,10 +150,10 @@ def main():
 
     # Blended signal: 70% gap_run_5 + 30% mom_5d * vol_ratio
     # This combines the strength of gap-and-run with the consistency of momentum
-    gap_signal = signals["gap_run_5"]
-    mom_signal = signals["mom_5d"]
+    signals["gap_run_5"]
+    signals["mom_5d"]
     # Only use gap_run where gap exists, otherwise fall back to momentum
-    blended = np.where(gap > 0.02, gap * signals["mom_5d"], -np.inf)
+    np.where(gap > 0.02, gap * signals["mom_5d"], -np.inf)
     # Where gap doesn't exist, use momentum * volume_ratio as fallback
     momentum_fallback = np.where(vr > 1.0, signals["mom_5d"] * (1 + vr), -np.inf)
     # Combine: use gap_run_5 when available, otherwise momentum fallback
@@ -143,8 +170,8 @@ def main():
     # 3-FOLD WALK-FORWARD for top configs
     # ================================================================
     P(f"\n{'='*80}")
-    P(f"3-FOLD WALK-FORWARD (all market sub-periods, OOS)")
-    P(f"Comparing: gap_run_5 vs combined vs gap_vol")
+    P("3-FOLD WALK-FORWARD (all market sub-periods, OOS)")
+    P("Comparing: gap_run_5 vs combined vs gap_vol")
     P(f"{'='*80}")
 
     configs = [
@@ -187,7 +214,7 @@ def main():
     # PART 2: Full OOS results for comparison table
     # ================================================================
     P(f"\n{'='*80}")
-    P(f"FULL OOS COMPARISON (2023-05 → 2026-09)")
+    P("FULL OOS COMPARISON (2023-05 → 2026-09)")
     P(f"{'='*80}")
 
     P(f"\n  {'Config':50s} {'wk%':>8s} {'Sharpe':>7s} {'DD%':>6s} {'rb':>4s} {'pos_wk':>7s} {'P(>=5%)':>7s}")
@@ -230,7 +257,7 @@ def main():
     # PART 3: Best config detailed analysis
     # ================================================================
     P(f"\n{'='*80}")
-    P(f"BEST CONFIG DETAILED ANALYSIS")
+    P("BEST CONFIG DETAILED ANALYSIS")
     P(f"{'='*80}")
 
     # Pick: highest Sharpe with >= 20 rebalances and in 2-5% range
@@ -275,13 +302,25 @@ def main():
     return 0
 
 
-def run_local_strategy(close, high, low, signal, sl_pct, tp_pct, max_holding, k, step,
-                       costs=COST, regime_filter=None, vol_target=0.20, vol_window=20,
-                       min_rebalances=5):
+def run_local_strategy(
+    close,
+    high,
+    low,
+    signal,
+    sl_pct,
+    tp_pct,
+    max_holding,
+    k,
+    step,
+    costs,
+    regime_filter,
+    vol_target,
+    settings,
+):
     n_dates, n_stocks = close.shape
-    warmup = 22
+    warmup = settings["warmup_bars"]
     rb_dates = list(range(warmup, n_dates - max_holding, step))
-    if len(rb_dates) < 5:
+    if len(rb_dates) < settings["minimum_rebalances"]:
         return {"error": "insufficient dates"}
     daily_ret = np.zeros_like(close)
     daily_ret[1:] = close[1:] / close[:-1] - 1.0
@@ -291,7 +330,7 @@ def run_local_strategy(close, high, low, signal, sl_pct, tp_pct, max_holding, k,
     total_targets = 0
 
     for t in rb_dates:
-        if regime_filter is not None and t < len(regime_filter) and not regime_filter[t]:
+        if regime_filter is not None and not regime_filter[t]:
             continue
         scores = signal[t, :].copy()
         valid = close[t, :] > 0
@@ -302,19 +341,33 @@ def run_local_strategy(close, high, low, signal, sl_pct, tp_pct, max_holding, k,
         picks = np.argpartition(-scores, top_k - 1)[:top_k]
         picks = picks[np.argsort(-scores[picks])]
 
-        exits, n_stop, n_target, n_hold = compute_exit(close, high, low, t, picks, max_holding, sl_pct, tp_pct)
+        exits, n_stop, n_target, n_hold = compute_exit(
+            close,
+            high,
+            low,
+            t,
+            picks,
+            max_holding,
+            sl_pct,
+            tp_pct,
+            settings["price_epsilon"],
+        )
 
-        if vol_target > 0 and t >= vol_window:
-            recent_ret = daily_ret[t - vol_window:t, :][:, picks]
-            stock_vol = np.std(recent_ret, axis=0, ddof=1) * np.sqrt(TRADING_DAYS)
-        else:
-            stock_vol = np.full(len(picks), 0.20)
-        inv_vol = np.where(stock_vol > 0.01, 1.0 / stock_vol, 1.0 / 0.20)
-        raw_weights = inv_vol / inv_vol.sum()
         if vol_target > 0:
+            vol_window = settings["volatility_lookback"]
+            recent_ret = daily_ret[t - vol_window:t, :][:, picks]
+            stock_vol = np.std(recent_ret, axis=0, ddof=1) * np.sqrt(
+                settings["trading_days"]
+            )
+            if (not np.isfinite(stock_vol).all()
+                    or (stock_vol <= settings["minimum_annualized_volatility"]).any()):
+                raise ValueError("Selected instruments have invalid volatility history.")
+            inv_vol = 1.0 / stock_vol
+            raw_weights = inv_vol / inv_vol.sum()
             avg_vol = np.mean(stock_vol)
-            vol_scale = min(1.0, vol_target / avg_vol) if avg_vol > 0 else 1.0
+            vol_scale = min(1.0, vol_target / avg_vol)
         else:
+            raw_weights = np.full(len(picks), 1.0 / len(picks))
             vol_scale = 1.0
         net = exits - costs
         portfolio_ret = float(np.sum(raw_weights * vol_scale * net))
@@ -329,38 +382,42 @@ def run_local_strategy(close, high, low, signal, sl_pct, tp_pct, max_holding, k,
     cum = np.cumprod(1 + returns)
     total_ret = float(cum[-1] - 1)
     n_p = len(returns)
-    years = n_p * step / TRADING_DAYS
-    cagr = (1 + total_ret) ** (1.0 / years) - 1 if years > 0 else 0
-    ppy = TRADING_DAYS / step
+    years = n_p * step / settings["trading_days"]
+    if years <= 0:
+        raise ValueError("The configured sample has no annualized duration.")
+    cagr = (1 + total_ret) ** (1.0 / years) - 1
+    ppy = settings["trading_days"] / step
     arith_annual = float(np.mean(returns)) * ppy
     vol = float(np.std(returns, ddof=1)) * np.sqrt(ppy) if n_p > 1 else 0
-    sharpe = (arith_annual - 0.075) / vol if vol > 0 else 0
-    wf = 5.0 / step
+    if vol <= 0:
+        raise ValueError("The configured sample has zero volatility; Sharpe is undefined.")
+    sharpe = (arith_annual - settings["annual_risk_free_rate"]) / vol
+    wf = settings["sessions_per_week"] / step
     wr = returns * wf
     rmax = np.maximum.accumulate(cum)
     max_dd = float(np.min(cum / rmax - 1))
     return {
-        "weekly_mean_pct": round(100 * np.mean(wr), 3),
-        "weekly_vol_pct": round(100 * np.std(wr, ddof=1), 3) if len(wr) > 1 else 0,
-        "sharpe": round(sharpe, 3),
-        "cagr_pct": round(100 * cagr, 2),
-        "total_return_pct": round(100 * total_ret, 2),
-        "max_drawdown_pct": round(100 * max_dd, 2),
-        "weekly_win_rate_pct": round(100 * np.mean(wr > 0), 1),
-        "weeks_ge_2pct_pct": round(100 * np.mean(wr >= 0.02), 1),
-        "weeks_ge_3pct_pct": round(100 * np.mean(wr >= 0.03), 1),
-        "weeks_ge_5pct_pct": round(100 * np.mean(wr >= 0.05), 1),
+        "weekly_mean_pct": round(100 * np.mean(wr), settings["metric_decimals"]["weekly"]),
+        "weekly_vol_pct": round(100 * np.std(wr, ddof=1), settings["metric_decimals"]["weekly"]),
+        "sharpe": round(sharpe, settings["metric_decimals"]["sharpe"]),
+        "cagr_pct": round(100 * cagr, settings["metric_decimals"]["annual"]),
+        "total_return_pct": round(100 * total_ret, settings["metric_decimals"]["annual"]),
+        "max_drawdown_pct": round(100 * max_dd, settings["metric_decimals"]["annual"]),
+        "weekly_win_rate_pct": round(100 * np.mean(wr > 0), settings["metric_decimals"]["probability"]),
+        "weeks_ge_2pct_pct": round(100 * np.mean(wr >= settings["weekly_thresholds"]["2"]), settings["metric_decimals"]["probability"]),
+        "weeks_ge_3pct_pct": round(100 * np.mean(wr >= settings["weekly_thresholds"]["3"]), settings["metric_decimals"]["probability"]),
+        "weeks_ge_5pct_pct": round(100 * np.mean(wr >= settings["weekly_thresholds"]["5"]), settings["metric_decimals"]["probability"]),
         "num_trades": total_trades,
-        "win_rate_pct": round(100 * total_targets / max(total_trades, 1), 1),
-        "stop_rate_pct": round(100 * total_stops / max(total_trades, 1), 1),
+        "win_rate_pct": round(100 * total_targets / total_trades, settings["metric_decimals"]["probability"]),
+        "stop_rate_pct": round(100 * total_stops / total_trades, settings["metric_decimals"]["probability"]),
         "n_rebalances": n_p,
-        "min_weekly_pct": round(100 * np.min(wr), 3),
-        "max_weekly_pct": round(100 * np.max(wr), 3),
-        "median_weekly_pct": round(100 * np.median(wr), 3),
+        "min_weekly_pct": round(100 * np.min(wr), settings["metric_decimals"]["weekly"]),
+        "max_weekly_pct": round(100 * np.max(wr), settings["metric_decimals"]["weekly"]),
+        "median_weekly_pct": round(100 * np.median(wr), settings["metric_decimals"]["weekly"]),
     }
 
 
-def compute_exit(close, high, low, t, picks, max_holding, sl_pct, tp_pct):
+def compute_exit(close, high, low, t, picks, max_holding, sl_pct, tp_pct, price_epsilon):
     entry = close[t, picks]
     path_end = min(t + max_holding + 1, close.shape[0])
     if path_end <= t + 1 or len(picks) == 0:
@@ -368,7 +425,7 @@ def compute_exit(close, high, low, t, picks, max_holding, sl_pct, tp_pct):
     hi = high[t + 1:path_end][:, picks]
     lo = low[t + 1:path_end][:, picks]
     cl = close[t + 1:path_end][:, picks]
-    eps = 1e-10
+    eps = price_epsilon
     cum_hi = hi / (entry + eps) - 1.0
     cum_lo = lo / (entry + eps) - 1.0
     stop_lvl = -sl_pct / 100.0
@@ -378,14 +435,20 @@ def compute_exit(close, high, low, t, picks, max_holding, sl_pct, tp_pct):
     n_days = path_end - (t + 1)
     if n_days == 1:
         exits = cl[-1] / (entry + eps) - 1.0
-        sw = stop_hits[-1]; tw = target_hits[-1] & ~sw
-        exits[sw] = stop_lvl; exits[tw] = tgt_lvl
+        sw = stop_hits[-1]
+        tw = target_hits[-1] & ~sw
+        exits[sw] = stop_lvl
+        exits[tw] = tgt_lvl
         return exits, int(np.sum(sw)), int(np.sum(tw)), int(np.sum(~sw & ~tw))
-    sf = np.argmax(stop_hits, axis=0); sa = np.any(stop_hits, axis=0)
-    tf = np.argmax(target_hits, axis=0); ta = np.any(target_hits, axis=0)
+    sf = np.argmax(stop_hits, axis=0)
+    sa = np.any(stop_hits, axis=0)
+    tf = np.argmax(target_hits, axis=0)
+    ta = np.any(target_hits, axis=0)
     exits = cl[-1] / (entry + eps) - 1.0
-    sw = sa & (~ta | (sf <= tf)); tw = ta & (~sa | (tf < sf))
-    exits[sw] = stop_lvl; exits[tw] = tgt_lvl
+    sw = sa & (~ta | (sf <= tf))
+    tw = ta & (~sa | (tf < sf))
+    exits[sw] = stop_lvl
+    exits[tw] = tgt_lvl
     return exits, int(np.sum(sw)), int(np.sum(tw)), len(picks) - int(np.sum(sw)) - int(np.sum(tw))
 
 

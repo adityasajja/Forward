@@ -1,0 +1,33 @@
+{
+  "output_directory": "data/iifl_daily/ETF",
+  "url_template": "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}",
+  "start_date": "2008-01-01",
+  "timezone": "Asia/Kolkata",
+  "bar_open": "09:15",
+  "interval": "1d",
+  "request_timeout_seconds": 30.0,
+  "user_agent": "Mozilla/5.0",
+  "max_workers": 6,
+  "etfs": {
+    "NIFTYBEES": "Nifty 50",
+    "JUNIORBEES": "Nifty Next 50",
+    "BANKBEES": "Bank Nifty",
+    "GOLDBEES": "Gold",
+    "SILVERBEES": "Silver",
+    "LIQUIDBEES": "Overnight cash",
+    "MON100": "Nasdaq 100 (offshore)",
+    "MAFANG": "US tech basket (offshore)",
+    "ITBEES": "IT sector",
+    "PHARMABEES": "Pharma sector",
+    "PSUBNKBEES": "PSU banks",
+    "CPSEETF": "CPSE basket",
+    "INFRABEES": "Infrastructure",
+    "CONSUMBEES": "Consumption",
+    "MOM100": "Midcap 100",
+    "SETFNIF50": "Nifty 50 (alt)",
+    "HNGSNGBEES": "Hang Seng (offshore)",
+    "ICICIB22": "Bharat 22",
+    "MOM50": "Midcap 50",
+    "AXISGOLD": "Gold (alt)"
+  }
+}

@@ -4,7 +4,7 @@ Each result below was produced by a separate script and, at the time it was
 produced, was individually correct and collectively misleading. This script
 re-derives them and prints each one with its provenance, its trial count, its
 regime split and its sub-period stability attached, then applies
-:func:`atr.research.evidence.assess` and reports the verdict.
+:func:`forward.research.evidence.assess` and reports the verdict.
 
 The output is the deliverable: a set of verdicts rather than a headline number.
 
@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import sys
+import argparse
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -24,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
-from atr.research.evidence import (  # noqa: E402
+from forward.research.evidence import (  # noqa: E402
     Evidence,
     UniverseProvenance,
     assess,
@@ -35,10 +36,8 @@ from atr.research.evidence import (  # noqa: E402
     summarise,
 )
 
-CACHE = Path("data/iifl_daily/NSEEQ")
-PANEL = Path("data/signals/panel_nseeq_120.parquet")
-OUT = Path("data/signals/evidence.json")
-MIN_BARS = 1000
+ROOT = Path(__file__).resolve().parents[1]
+CONFIG_PATH = ROOT / "config" / "research_honest_verdicts.json"
 
 
 # --------------------------------------------------------------------------
@@ -46,41 +45,50 @@ MIN_BARS = 1000
 # --------------------------------------------------------------------------
 
 
-def unbiased_close() -> pd.DataFrame:
+def unbiased_close(config: dict) -> pd.DataFrame:
     """Every cache symbol with a long history — no liquidity selection."""
     series = {}
-    for path in sorted(CACHE.glob("*.parquet")):
-        try:
-            frame = pd.read_parquet(path, columns=["ts", "close"])
-        except Exception:  # noqa: BLE001
-            continue
-        if len(frame) < MIN_BARS:
+    data_directory = ROOT / config["daily_data_directory"]
+    for path in sorted(data_directory.glob("*.parquet")):
+        frame = pd.read_parquet(path, columns=["ts", "close"])
+        if len(frame) < config["minimum_history_bars"]:
             continue
         frame = frame.copy()
         frame["ts"] = pd.to_datetime(frame["ts"])
         series[path.stem.upper()] = frame.set_index("ts")["close"]
+    if not series:
+        raise ValueError("No cache symbols meet the configured history gate.")
     return pd.DataFrame(series).sort_index()
 
 
-def selected_close() -> pd.DataFrame:
-    frame = pd.read_parquet(PANEL)
+def selected_close(config: dict) -> pd.DataFrame:
+    panel_path = ROOT / config["selected_panel_file"]
+    frame = pd.read_parquet(panel_path)
     frame["ts"] = pd.to_datetime(frame["ts"])
-    return frame.pivot_table(index="ts", columns="symbol", values="close").sort_index()
+    close = frame.pivot_table(index="ts", columns="symbol", values="close").sort_index()
+    if close.empty:
+        raise ValueError(f"Configured selected panel is empty: {panel_path}.")
+    return close
 
 
-def cagr_and_dd(rets: pd.Series) -> tuple[float, float]:
-    rets = rets.fillna(0.0)
+def cagr_and_dd(rets: pd.Series, config: dict) -> tuple[float, float]:
+    if not np.isfinite(rets.to_numpy(dtype=float)).all():
+        raise ValueError("Return series contains missing or non-finite values.")
     eq = (1 + rets).cumprod()
     dd = float((eq / eq.cummax() - 1).min() * 100)
-    years = len(rets) / 252
+    years = len(rets) / config["trading_days_per_year"]
     cagr = (eq.iloc[-1] ** (1 / years) - 1) * 100 if eq.iloc[-1] > 0 else -100.0
     return cagr, dd
 
 
-def sharpe(rets: pd.Series) -> float:
-    rets = rets.fillna(0.0)
+def sharpe(rets: pd.Series, config: dict) -> float:
+    if not np.isfinite(rets.to_numpy(dtype=float)).all():
+        raise ValueError("Return series contains missing or non-finite values.")
     sd = rets.std()
-    return float(rets.mean() / sd * np.sqrt(252)) if sd > 0 else 0.0
+    return (
+        float(rets.mean() / sd * np.sqrt(config["trading_days_per_year"]))
+        if sd > 0 else 0.0
+    )
 
 
 # --------------------------------------------------------------------------
@@ -88,33 +96,48 @@ def sharpe(rets: pd.Series) -> float:
 # --------------------------------------------------------------------------
 
 
-def high_vol_quintile(close: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
+def high_vol_quintile(close: pd.DataFrame, config: dict) -> tuple[pd.Series, pd.Series]:
     """Long the highest-vol quintile, monthly, vs the equal-weight market."""
     returns = close.pct_change()
-    monthly = close.resample("ME").last()
-    vol_m = returns.rolling(126).std().shift(1).resample("ME").last()
+    monthly_period = config["monthly_period"]
+    monthly = close.resample(monthly_period).last()
+    vol_m = returns.rolling(config["high_volatility_lookback_days"]).std().shift(1).resample(monthly_period).last()
     fwd_m = monthly.pct_change().shift(-1)
     mkt_m = monthly.mean(axis=1).pct_change().shift(-1)
 
     rows = []
-    for ts in monthly.index[6:-1]:
+    for ts in monthly.index[config["warmup_months"] : -1]:
         v = vol_m.loc[:ts].iloc[-1].dropna()
         r = fwd_m.loc[ts].dropna()
         m = mkt_m.loc[ts]
         common = v.index.intersection(r.index)
-        if len(common) < 20 or pd.isna(m):
+        if len(common) < config["minimum_cross_section_symbols"] or pd.isna(m):
             continue
-        top = v[common].rank().nlargest(max(len(common) // 5, 1)).index
+        top_count = max(
+            int(len(common) * config["high_volatility_fraction"]), 1
+        )
+        top = v[common].rank().nlargest(top_count).index
         rows.append({"ts": ts, "s": float(r[list(top)].mean()), "m": float(m)})
     df = pd.DataFrame(rows).set_index("ts")
     return df["s"], df["m"]
 
 
-def vol_scale_overlay(market: pd.Series) -> pd.Series:
+def vol_scale_overlay(market: pd.Series, config: dict) -> pd.Series:
     """Hold less when recent vol is high. The best of the five overlays."""
-    vol20 = market.rolling(20).std() * np.sqrt(252)
-    weight = (0.15 / vol20).clip(upper=1.0).shift(1).fillna(0.0)
-    return market * weight
+    annual_volatility = (
+        market.rolling(config["overlay_volatility_lookback_days"]).std()
+        * np.sqrt(config["trading_days_per_year"])
+    )
+    weight = (
+        config["overlay_target_annual_volatility"] / annual_volatility
+    ).clip(upper=config["overlay_maximum_weight"]).shift(1)
+    first_valid = weight.first_valid_index()
+    if first_valid is None:
+        raise ValueError("The configured window cannot produce overlay weights.")
+    weight = weight.loc[first_valid:]
+    if weight.isna().any():
+        raise ValueError("Overlay volatility is missing inside the evaluation window.")
+    return market.loc[first_valid:] * weight
 
 
 # --------------------------------------------------------------------------
@@ -123,10 +146,19 @@ def vol_scale_overlay(market: pd.Series) -> pd.Series:
 
 
 def main() -> int:
+    """Write configured evidence judgments for prior research findings."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", type=Path, default=CONFIG_PATH)
+    config_path = parser.parse_args().config
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    print(f"Configuration: {config_path.resolve()}")
+    output_path = ROOT / config["output_file"]
     print("loading panels...")
-    unb = unbiased_close()
-    sel = selected_close()
+    unb = unbiased_close(config)
+    sel = selected_close(config)
     common = unb.index.intersection(sel.index)
+    if common.empty:
+        raise ValueError("Selected and unselected panels have no common dates.")
 
     findings: list[tuple[str, Evidence]] = []
 
@@ -138,7 +170,7 @@ def main() -> int:
     )
     sel_ret = buy_and_hold(sel.loc[common])
     unb_ret = buy_and_hold(unb.loc[common])
-    findings.append(("FINDING 1 — the +356 point survivorship gap", Evidence(
+    findings.append(("FINDING 1 — the survivorship selection gap", Evidence(
         claim="liquid-120 equal-weight index return",
         headline_pct=bias.selected_total_pct,
         provenance=UniverseProvenance(
@@ -148,27 +180,27 @@ def main() -> int:
             survivorship_biased=True,
             note="names chosen by today's turnover from a cache with no delisted entries",
         ),
-        n_trials=1,
-        oos_sharpe=sharpe(sel_ret),
-        benchmark_sharpe=sharpe(unb_ret),
+        n_trials=config["selection_gap_trial_count"],
+        oos_sharpe=sharpe(sel_ret, config),
+        benchmark_sharpe=sharpe(unb_ret, config),
         p_edge_real=float("nan"),
         bias=bias,
-        max_drawdown_pct=cagr_and_dd(sel_ret)[1],
-        benchmark_drawdown_pct=cagr_and_dd(unb_ret)[1],
+        max_drawdown_pct=cagr_and_dd(sel_ret, config)[1],
+        benchmark_drawdown_pct=cagr_and_dd(unb_ret, config)[1],
     )))
 
     # ---- Finding 2: the high-vol factor -----------------------------------
-    strat, market = high_vol_quintile(sel)
+    strat, market = high_vol_quintile(sel, config)
     blocks = pd.Series(strat.index, index=strat.index).dt.year
     spreads, labels = [], []
     for year in sorted(set(blocks)):
         mask = blocks == year
-        if mask.sum() < 6:
+        if mask.sum() < config["minimum_yearly_observations"]:
             continue
         spreads.append(float((strat[mask] - market[mask]).mean() * 100))
         labels.append(str(year))
-    cagr_s, dd_s = cagr_and_dd(strat)
-    cagr_m, dd_m = cagr_and_dd(market)
+    _, dd_s = cagr_and_dd(strat, config)
+    _, dd_m = cagr_and_dd(market, config)
 
     findings.append(("FINDING 2 — the high-volatility factor", Evidence(
         claim="long the top-vol quintile, monthly rebalance",
@@ -177,9 +209,9 @@ def main() -> int:
             n_names=sel.shape[1], selected_on_full_window=True,
             history_bars=len(sel), survivorship_biased=True,
         ),
-        n_trials=7,  # seven factors were scanned before this one was chosen
-        oos_sharpe=sharpe(strat),
-        benchmark_sharpe=sharpe(market),
+        n_trials=config["high_volatility_factor_trial_count"],
+        oos_sharpe=sharpe(strat, config),
+        benchmark_sharpe=sharpe(market, config),
         p_edge_real=float("nan"),
         bias=bias,
         regime=regime_split(strat, market),
@@ -190,19 +222,20 @@ def main() -> int:
 
     # ---- Finding 3: the vol-scaling overlay -------------------------------
     market_ew = buy_and_hold(unb)
-    overlaid = vol_scale_overlay(market_ew)
-    split_points = [0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
+    overlaid = vol_scale_overlay(market_ew, config)
+    market_ew = market_ew.loc[overlaid.index]
+    split_points = config["overlay_split_fractions"]
     calmar_advantages = []
     for frac in split_points:
         k = int(len(market_ew) * frac)
         tail = slice(k, None)
-        c_o, d_o = cagr_and_dd(overlaid.iloc[tail])
-        c_b, d_b = cagr_and_dd(market_ew.iloc[tail])
+        c_o, d_o = cagr_and_dd(overlaid.iloc[tail], config)
+        c_b, d_b = cagr_and_dd(market_ew.iloc[tail], config)
         cal_o = c_o / abs(d_o) if d_o < 0 else float("nan")
         cal_b = c_b / abs(d_b) if d_b < 0 else float("nan")
         calmar_advantages.append(cal_o - cal_b)
-    c_o, d_o = cagr_and_dd(overlaid)
-    c_b, d_b = cagr_and_dd(market_ew)
+    c_o, d_o = cagr_and_dd(overlaid, config)
+    c_b, d_b = cagr_and_dd(market_ew, config)
 
     findings.append(("FINDING 3 — the volatility-scaling overlay", Evidence(
         claim="hold the equal-weight index, scaled down when vol is high",
@@ -212,9 +245,9 @@ def main() -> int:
             history_bars=len(unb), survivorship_biased=False,
             note="no liquidity screen applied",
         ),
-        n_trials=5,  # five overlays were tried; this was the best
-        oos_sharpe=sharpe(overlaid),
-        benchmark_sharpe=sharpe(market_ew),
+        n_trials=config["overlay_trial_count"],
+        oos_sharpe=sharpe(overlaid, config),
+        benchmark_sharpe=sharpe(market_ew, config),
         p_edge_real=float("nan"),
         regime=regime_split(overlaid, market_ew),
         stability=stability(
@@ -226,7 +259,7 @@ def main() -> int:
         benchmark_drawdown_pct=d_b,
         notes=[
             "stability here is the Calmar advantage over buy-and-hold in the "
-            "second half, at six different split points",
+            f"second half, at {len(split_points)} different split points",
             f"full window Calmar {c_o / abs(d_o):.2f} vs buy-and-hold "
             f"{c_b / abs(d_b):.2f}",
         ],
@@ -278,13 +311,12 @@ def main() -> int:
             },
         })
 
-    OUT.parent.mkdir(parents=True, exist_ok=True)
-    OUT.write_text(json.dumps(payload, indent=2, default=str), encoding="utf8")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf8")
     print()
     print("=" * 74)
-    print("Every finding above fails. The failure is the result: it means the")
-    print("numbers that were reported earlier in this repo should not be acted on.")
-    print(f"written: {OUT}")
+    print("Evidence report complete.")
+    print(f"written: {output_path}")
     print("=" * 74)
     return 0
 

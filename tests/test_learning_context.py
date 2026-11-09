@@ -10,14 +10,12 @@ tests here pin the three ways it could lie:
 
 from __future__ import annotations
 
-from atr.research.learning_context import (
+from forward.analytics.learning_metrics import SCORE_BANDS, max_drawdown, score_band
+from forward.research.learning_context import (
     HIGH_BAND,
     LOW_BAND,
-    SCORE_BANDS,
     ContextEffectiveness,
     evidence_class_for,
-    max_drawdown,
-    score_band,
 )
 
 _FEATURES = {

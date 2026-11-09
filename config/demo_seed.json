@@ -1,0 +1,80 @@
+{
+  "seed": 11,
+  "history_sessions": 320,
+  "trade_sessions": 75,
+  "symbols": {
+    "RELIANCE": "Oil Gas & Consumable Fuels",
+    "TCS": "Information Technology",
+    "INFY": "Information Technology",
+    "HDFCBANK": "Financial Services",
+    "ICICIBANK": "Financial Services",
+    "SBIN": "Financial Services",
+    "LT": "Construction",
+    "ITC": "Fast Moving Consumer Goods",
+    "AXISBANK": "Financial Services",
+    "MARUTI": "Automobile and Auto Components"
+  },
+  "price_series": {
+    "starting_price": 400,
+    "price_step": 300,
+    "growth_rate": 0.0006,
+    "growth_step": 0.0001,
+    "growth_step_period": 3,
+    "daily_volatility": 0.013,
+    "wick_min": 0.001,
+    "wick_max": 0.015,
+    "open_volatility": 0.004,
+    "volume_min": 200000,
+    "volume_max": 3000000,
+    "bar_time": "09:15",
+    "nifty_level": 24000,
+    "nifty_return_scale": 0.8,
+    "nifty_noise": 0.002,
+    "nifty_daily_range": 0.003,
+    "nifty_volume": 0.0,
+    "index_symbol": "NIFTY50",
+    "index_source": "Synthetic demo series",
+    "isin_prefix": "INE",
+    "stock_file_suffix": "-EQ"
+  },
+  "demo_account": {
+    "email": "demo@example.com",
+    "username": "demo",
+    "display_name": "Demo"
+  },
+  "demo_runtime": {
+    "exchange": "NSEEQ",
+    "order_tag": "DEMO",
+    "client_host": "127.0.0.1",
+    "client_port": 51234,
+    "stock_universe_file": "n50.txt",
+    "index_universe_file": "ind_nifty50list.csv",
+    "index_exchange_directory": "INDICES"
+  },
+  "portfolio": {
+    "capital": [500000.0, 300000.0],
+    "allocation_fraction": 0.12,
+    "minimum_quantity": 1,
+    "entry_slippage": 0.0005,
+    "exit_slippage": 0.0005,
+    "commission_rate": 0.0004,
+    "entry_hour_utc": 5,
+    "entry_minute_utc": 0,
+    "deployment_start_hour_utc": 4,
+    "deployment_start_minute_utc": 0
+  },
+  "trade_generation": {
+    "initial_session_min": 0,
+    "initial_session_max": 3,
+    "holding_sessions_min": 4,
+    "holding_sessions_max": 12,
+    "next_entry_gap_min": 1,
+    "next_entry_gap_max": 4,
+    "breakout_lookback": 20,
+    "take_profit_pct": 4.0,
+    "stop_loss_pct": -3.0,
+    "trend_exit_lookback": 10,
+    "minimum_remaining_sessions": 6,
+    "breakout_reference_price_multiplier": 0.99
+  }
+}

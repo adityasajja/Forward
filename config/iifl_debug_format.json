@@ -1,0 +1,8 @@
+{
+  "symbol": "NIFTYBEES",
+  "exchange": "NSEEQ",
+  "interval": "1m",
+  "from_date": "2026-09-10",
+  "to_date": "2026-09-12",
+  "response_preview_characters": 3000
+}

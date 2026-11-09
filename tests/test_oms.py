@@ -18,13 +18,11 @@ import threading
 
 import pytest
 
-from atr.appdb.repositories import (
-    TERMINAL_ORDER_STATUSES,
-    OrderEventRepository,
-    OrderRepository,
-    UserRepository,
-)
-from atr.execution.oms import (
+from forward.appdb.identity_repository import UserRepository
+from forward.appdb.order_event_repository import TERMINAL_ORDER_STATUSES, OrderEventRepository
+from forward.appdb.order_repository import OrderRepository
+from forward.appdb.order_storage import SqlOrderStorage
+from forward.execution.oms import (
     ORDER_STATES,
     TERMINAL_STATES,
     VALID_TRANSITIONS,
@@ -40,7 +38,7 @@ from atr.execution.oms import (
     next_states,
     slippage_bps,
 )
-from atr.services.orders import OrderNotFound, OrderService
+from forward.services.orders import OrderNotFound, OrderService
 
 
 # =========================================================================== the machine
@@ -237,7 +235,7 @@ def _deny(draft: OrderDraft) -> RiskDecision:  # noqa: ARG001 - protocol shape
 
 @pytest.fixture()
 def oms(app_db):
-    return OrderService(app_db, risk_gate=_allow)
+    return OrderService(SqlOrderStorage(app_db), risk_gate=_allow)
 
 
 def _draft(user_id: str, **overrides) -> OrderDraft:
@@ -403,7 +401,7 @@ def test_a_gate_that_raises_leaves_the_order_untouched(oms, trader):
 
 
 def test_the_injected_gate_is_used_when_none_is_passed(app_db, trader):
-    oms = OrderService(app_db, risk_gate=_deny)
+    oms = OrderService(SqlOrderStorage(app_db), risk_gate=_deny)
     opened = oms.open_order(_draft(trader))
     assert oms.validate(opened.order_id, trader) == "REJECTED"
 
@@ -419,8 +417,8 @@ def test_the_service_requires_a_risk_gate(app_db):
 
 def test_limits_risk_gate_adapts_the_existing_engine(app_db, trader):
     """The gate is an adapter over RiskEngine, not a reimplementation."""
-    from atr.core.models import Instrument
-    from atr.execution.risk import RiskEngine, RiskLimits
+    from forward.core.instrument_models import Instrument
+    from forward.execution.risk import RiskEngine, RiskLimits
 
     class _Portfolio:
         equity = 1_000_000.0
@@ -452,8 +450,8 @@ def test_an_unpriceable_order_is_refused_rather_than_treated_as_zero_notional(ap
     every notional limit without being measured against any of them — the
     "unknown reported as a zero" failure. The gate refuses instead.
     """
-    from atr.core.models import Instrument
-    from atr.execution.risk import RiskEngine, RiskLimits
+    from forward.core.instrument_models import Instrument
+    from forward.execution.risk import RiskEngine, RiskLimits
 
     class _Unpriced:
         equity = 0.0
@@ -481,8 +479,8 @@ def test_an_unpriceable_order_is_refused_rather_than_treated_as_zero_notional(ap
 
 
 def test_a_limit_price_makes_the_notional_checkable(app_db, trader):
-    from atr.core.models import Instrument
-    from atr.execution.risk import RiskEngine, RiskLimits
+    from forward.core.instrument_models import Instrument
+    from forward.execution.risk import RiskEngine, RiskLimits
 
     class _Unpriced:
         equity = 0.0
@@ -506,8 +504,8 @@ def test_a_limit_price_makes_the_notional_checkable(app_db, trader):
 
 def test_no_notional_limit_means_no_price_is_needed(app_db, trader):
     """The refusal is tied to a configured limit, not applied unconditionally."""
-    from atr.core.models import Instrument
-    from atr.execution.risk import RiskEngine, RiskLimits
+    from forward.core.instrument_models import Instrument
+    from forward.execution.risk import RiskEngine, RiskLimits
 
     class _Unpriced:
         equity = 0.0
@@ -530,8 +528,8 @@ def test_no_notional_limit_means_no_price_is_needed(app_db, trader):
 
 def test_the_kill_switch_reaches_the_order_path(app_db, trader):
     """The kill switch is checked on the manual order route too, not only on signals."""
-    from atr.core.models import Instrument
-    from atr.execution.risk import RiskEngine, RiskLimits
+    from forward.core.instrument_models import Instrument
+    from forward.execution.risk import RiskEngine, RiskLimits
 
     class _Portfolio:
         equity = 1_000_000.0
@@ -549,7 +547,7 @@ def test_the_kill_switch_reaches_the_order_path(app_db, trader):
         portfolio=_Portfolio(),
         instruments=lambda s, e: Instrument(symbol=s, exchange=e),
     )
-    oms = OrderService(app_db, risk_gate=gate)
+    oms = OrderService(SqlOrderStorage(app_db), risk_gate=gate)
     opened = oms.open_order(_draft(trader))
     assert oms.validate(opened.order_id, trader) == "REJECTED"
     assert "kill switch" in oms.get(opened.order_id, trader)["reject_reason"]
@@ -684,7 +682,7 @@ def test_a_suppressed_duplicate_leaves_no_stray_order(oms, trader):
 
     assert len(oms.open_orders(trader)) == 1
     with oms.db.session() as session:
-        from atr.appdb.repositories import OrderIntentRepository
+        from forward.appdb.order_intent_repository import OrderIntentRepository
 
         intent = OrderIntentRepository.get(session, key)
     assert intent is not None
@@ -706,7 +704,7 @@ def test_concurrent_duplicate_intents_produce_exactly_one_order(app_db, trader):
     let two of them through; the primary key cannot.
     """
     key = "r" * 64
-    service = OrderService(app_db, risk_gate=_allow)
+    service = OrderService(SqlOrderStorage(app_db), risk_gate=_allow)
     results: list[str] = []
     errors: list[BaseException] = []
     barrier = threading.Barrier(4)

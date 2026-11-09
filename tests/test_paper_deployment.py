@@ -29,13 +29,29 @@ that never ran. The tests below pin the correction:
 
 from __future__ import annotations
 
-import json
 from datetime import datetime
 
 import pandas as pd
 import pytest
 
-from atr.services.runner import DeploymentLoop, PaperRunner
+from forward.appdb.order_storage import SqlOrderStorage
+from forward.appdb.paper_ledger_storage import SqlPaperLedgerStorage
+from forward.appdb.paper_runner_storage import SqlPaperRunnerStorage
+from forward.appdb.portfolio_storage import SqlPortfolioStorage
+from forward.appdb.risk_state_storage import SqlRiskStateStorage
+from forward.appdb.system_state_storage import SqlSystemStateStorage
+from forward.appdb.trade_journal_storage import SqlTradeJournalStorage
+from forward.config.settings import get_settings
+from forward.data.cached_market_frames import CachedMarketFramesAdapter
+from forward.data.vwap_liquidity import NseBhavcopyLiquidityAdapter
+from forward.market_calendar import get_market_calendar
+from forward.services.deployment_loop import DeploymentLoop
+from forward.services.paper_ledger import PaperLedger
+from forward.services.risk import RiskStateService
+from forward.services.runner import PaperRunner
+from tests.market_data_fakes import NoopSignalContextEnricher
+from tests.order_fakes import order_instrument_lookup
+from tests.paper_price_fakes import StaticRunnerVenueProvider, no_live_price
 
 #: A Monday, 10:00 IST — inside the cash session.
 SESSION = datetime(2026, 9, 14, 10, 0)
@@ -62,7 +78,7 @@ def _daily(symbol: str, n: int = 300, start: float = 1000.0) -> pd.DataFrame:
 
 @pytest.fixture()
 def user(app_db):
-    from atr.appdb.schema import users
+    from forward.appdb.account_schema import users
 
     with app_db.session() as session:
         session.execute(
@@ -85,7 +101,7 @@ def user(app_db):
 
 def _make_strategy(app_db, *, name: str, definition: dict) -> tuple[str, int]:
     """Create a saved strategy with one version. Returns (strategy_id, version)."""
-    from atr.appdb.repositories import StrategyRepository
+    from forward.appdb.strategy_repository import StrategyRepository
 
     with app_db.session() as session:
         strategy = StrategyRepository.create(
@@ -106,7 +122,7 @@ def _make_strategy(app_db, *, name: str, definition: dict) -> tuple[str, int]:
 
 
 def _deploy(app_db, *, strategy_id: str, version: int, symbols=(SYMBOL,)) -> dict:
-    from atr.appdb.repositories import DeploymentRepository
+    from forward.appdb.deployment_repository import DeploymentRepository
 
     with app_db.session() as session:
         return DeploymentRepository.create(
@@ -117,7 +133,13 @@ def _deploy(app_db, *, strategy_id: str, version: int, symbols=(SYMBOL,)) -> dic
             mode="PAPER",
             capital=200_000.0,
             status="RUNNING",
-            config={"symbols": list(symbols), "exchange": "NSEEQ"},
+            config={
+                "symbols": list(symbols),
+                "exchange": "NSEEQ",
+                "timeframe": "1d",
+                "max_open_positions": 10,
+                "signal_basis": "closed_bar",
+            },
         )
 
 
@@ -125,10 +147,32 @@ def _deploy(app_db, *, strategy_id: str, version: int, symbols=(SYMBOL,)) -> dic
 def runner(app_db, user, monkeypatch):
     """A PaperRunner with stubbed history, so nothing touches a real cache."""
     monkeypatch.setattr(
-        "atr.signals.engine.load_daily",
+        "forward.data.cached_market_frames.load_daily_from_cache",
         lambda symbol, exchange="NSEEQ", **kw: _daily(symbol),
     )
-    return PaperRunner(db=app_db, price_source=lambda s, e: 1000.0)
+    return PaperRunner(
+        interval_seconds=get_settings().runner_interval_seconds,
+        lookback_days=get_settings().runner_lookback_days,
+        minimum_sleep_seconds=get_settings().runner_min_sleep_seconds,
+        market_wait_seconds=get_settings().runner_market_wait_seconds,
+        symbol_retry_seconds=get_settings().deployment_symbol_retry_seconds,
+        signal_context=NoopSignalContextEnricher(),
+        calendar=get_market_calendar(),
+        venue_provider=StaticRunnerVenueProvider(
+            prices=lambda s, e: 1000.0, instruments=order_instrument_lookup
+        ),
+        daily_history=CachedMarketFramesAdapter(),
+        vwap_liquidity=NseBhavcopyLiquidityAdapter(get_settings().research_data_directory),
+        sector_table={},
+        instrument_lookup=order_instrument_lookup,
+        journal_storage=SqlTradeJournalStorage(app_db),
+        portfolio_storage=SqlPortfolioStorage(app_db),
+        ledger=PaperLedger(storage=SqlPaperLedgerStorage(app_db), price_source=no_live_price),
+        order_storage=SqlOrderStorage(app_db),
+        runner_storage=SqlPaperRunnerStorage(app_db),
+        state_storage=SqlSystemStateStorage(app_db),
+        risk_state=RiskStateService(SqlRiskStateStorage(app_db), get_settings()),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -242,7 +286,7 @@ def test_two_versions_of_one_strategy_differ(app_db, runner):
         name="Tight",
         definition={"rules": {"exit": {"stop_loss_pct": 3.0}, "entry": {"trend_fast_sma": 5}}},
     )
-    from atr.appdb.repositories import StrategyRepository
+    from forward.appdb.strategy_repository import StrategyRepository
 
     with app_db.session() as session:
         v2row = StrategyRepository.create_version(
@@ -371,7 +415,7 @@ def test_the_version_is_read_once_per_version_not_once_per_pass(app_db, runner):
 
 def test_a_deployment_with_no_version_refuses(app_db, runner):
     """A deployment must name a version. Without one there is no subject."""
-    from atr.appdb.repositories import DeploymentRepository
+    from forward.appdb.deployment_repository import DeploymentRepository
 
     with app_db.session() as session:
         row = DeploymentRepository.create(
@@ -382,9 +426,42 @@ def test_a_deployment_with_no_version_refuses(app_db, runner):
             mode="PAPER",
             capital=100_000.0,
             status="RUNNING",
-            config={"symbols": [SYMBOL], "exchange": "NSEEQ"},
+            config={
+                "symbols": [SYMBOL],
+                "exchange": "NSEEQ",
+                "timeframe": "1d",
+                "max_open_positions": 10,
+                "signal_basis": "closed_bar",
+            },
         )
     runner.sync_loops()
     loop = runner._loops[row["deployment_id"]]
     assert loop._rules() is None
     assert loop.blocked_reason
+
+
+def test_saved_intraday_context_overrides_deployment_cadence(app_db, runner, monkeypatch):
+    strategy_id, version = _make_strategy(
+        app_db,
+        name="Pinned intraday cadence",
+        definition={
+            "context": {
+                "style": "intraday",
+                "timeframe": "5m",
+                "entry_cutoff": "14:30",
+                "square_off_time": "15:00",
+            },
+            "params": {"max_positions": 3},
+            "rules": {
+                "entry": {"custom_entry_formula": "price > 0", "min_history_bars": 20},
+                "exit": {"stop_loss_pct": 7, "trend_sma": 0},
+            },
+        },
+    )
+    monkeypatch.setattr(DeploymentLoop, "_warmup_intraday", lambda self: None)
+    row = _deploy(app_db, strategy_id=strategy_id, version=version)
+    runner.sync_loops()
+    config = runner._loops[row["deployment_id"]].config
+    assert config.timeframe == "5m" and config.signal_basis == "closed_bar"
+    assert config.entry_cutoff == "14:30" and config.square_off_time == "15:00"
+    assert config.max_open_positions == 3

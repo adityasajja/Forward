@@ -1,7 +1,7 @@
 """Score the pre-registered candidates, each against a null that removes only its signal.
 
 The candidates and their priors are written down in
-``atr.strategy.strategies.alpha_candidates`` **before** this script was run. That
+``forward.strategy.strategies.alpha_candidates`` **before** this script was run. That
 ordering is the point: the multiple-testing hurdle is only meaningful if the set
 of ideas was fixed in advance, and the harness counts every trial so that
 searching harder cannot manufacture a win.
@@ -38,19 +38,20 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
-import pandas as pd  # noqa: E402
+from research_episodic_pivot import universe_symbols  # noqa: E402
+from validate_paper_strategies import build_feed, load_series  # noqa: E402
 
-from atr.backtest.costs import CommissionModel, IndianDeliveryCosts, SlippageModel  # noqa: E402
-from atr.backtest.engine import BacktestConfig  # noqa: E402
-from atr.execution.risk import RiskLimits  # noqa: E402
-from atr.research.validate import (  # noqa: E402
+from forward.backtest.engine import BacktestConfig  # noqa: E402
+from forward.core.costs import CommissionModel, IndianDeliveryCosts, SlippageModel  # noqa: E402
+from forward.execution.risk import RiskLimits  # noqa: E402
+from forward.research.validate import (  # noqa: E402
     ValidationConfig,
     WalkForwardConfig,
     walk_forward,
 )
-from atr.strategy.strategies import STRATEGIES  # noqa: E402
-from research_episodic_pivot import UNIVERSES, universe_symbols  # noqa: E402
-from validate_paper_strategies import build_feed, load_series  # noqa: E402
+from forward.strategy.strategies import STRATEGIES  # noqa: E402
+
+EPISODIC_CONFIG_PATH = Path(__file__).resolve().parents[1] / "config" / "research_episodic_pivot.json"
 
 #: Pre-registered. Small on purpose: each extra combination raises the bar the
 #: winner must clear, so a wide grid makes a *result* harder, not easier.
@@ -172,7 +173,7 @@ def average_exposure(feed, cls, params, backtest) -> float:
     the strategy's behaviour, not a performance number, so using the full sample
     here is fine and it is never reported as a result.
     """
-    from atr.backtest.engine import BacktestEngine
+    from forward.backtest.engine import BacktestEngine
 
     try:
         result = BacktestEngine(feed, cls(**params), backtest).run()
@@ -205,7 +206,7 @@ def t_critical_one_sided(df: int) -> float:
     if df in _T95_ONE_SIDED:
         return _T95_ONE_SIDED[df]
     keys = sorted(_T95_ONE_SIDED)
-    for lower, upper in zip(keys, keys[1:]):
+    for lower, upper in zip(keys, keys[1:], strict=False):
         if lower < df < upper:
             span = upper - lower
             weight = (df - lower) / span
@@ -257,9 +258,10 @@ def verdict(res_metrics: dict, control: dict) -> dict:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--universes", default="nifty50,midcap150")
+    ap.add_argument("--universes")
+    ap.add_argument("--data-config", type=Path, default=EPISODIC_CONFIG_PATH)
     ap.add_argument("--hypotheses", default=",".join(HYPOTHESES))
-    ap.add_argument("--min-bars", type=int, default=1000)
+    ap.add_argument("--min-bars", type=int)
     ap.add_argument("--cash", type=float, default=1_000_000.0)
     ap.add_argument("--slippage-bps", type=float, default=5.0)
     ap.add_argument("--train", type=int, default=500)
@@ -285,6 +287,16 @@ def main() -> int:
     )
     ap.add_argument("--out", default="data/self_learning/alpha_hunt.json")
     args = ap.parse_args()
+    universe_config = json.loads(args.data_config.read_text(encoding="utf-8"))
+    print(f"Data configuration: {args.data_config.resolve()}")
+    minimum_history_bars = (
+        universe_config["minimum_history_bars"]
+        if args.min_bars is None
+        else args.min_bars
+    )
+    universe_names = universe_config["universes"]
+    if args.universes is not None:
+        universe_names = [name.strip() for name in args.universes.split(",") if name.strip()]
 
     names = [n.strip() for n in args.hypotheses.split(",") if n.strip()]
     config = WalkForwardConfig(
@@ -316,11 +328,13 @@ def main() -> int:
         "universes": {},
     }
 
-    for universe in [u.strip() for u in args.universes.split(",") if u.strip()]:
-        if universe not in UNIVERSES:
+    for universe in universe_names:
+        if universe not in universe_config["universe_files"]:
             print(f"unknown universe {universe!r}", file=sys.stderr)
             return 1
-        series = load_series(universe_symbols(universe), min_bars=args.min_bars)
+        series = load_series(
+            universe_symbols(universe, universe_config), min_bars=minimum_history_bars
+        )
         if not series:
             print(f"{universe}: no cached history", file=sys.stderr)
             continue

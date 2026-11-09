@@ -1,5 +1,5 @@
-from atr.core.models import Instrument
-from atr.services.paper import PaperVenue
+from tests.order_fakes import order_instrument_lookup
+from tests.paper_venue_factory import configured_paper_venue as PaperVenue
 
 
 class _Draft:
@@ -11,7 +11,7 @@ class _Draft:
 
 
 def _venue(adv):
-    v = PaperVenue(prices=lambda s, e: 100.0, adv=(lambda s, e: adv))
+    v = PaperVenue(prices=lambda s, e: 100.0, instruments=order_instrument_lookup, adv=(lambda s, e: adv))
     v.max_tick_age_seconds = None
     return v
 
@@ -26,14 +26,18 @@ def test_small_order_barely_moves_price_and_big_order_costs_more_and_is_capped()
 
 
 def test_no_liquidity_data_keeps_flat_slippage():
-    out = PaperVenue(prices=lambda s, e: 100.0).submit(_Draft(500_000))
+    out = PaperVenue(
+        prices=lambda s, e: 100.0,
+        instruments=order_instrument_lookup,
+        max_tick_age_seconds=None,
+    ).submit(_Draft(500_000))
     assert out.filled_qty == 500_000 and "impact_bps" not in out.raw
 
 
 def test_a_partly_filled_order_does_not_take_another_slice_the_same_day():
     from datetime import datetime
 
-    v = PaperVenue(prices=lambda s, e: 100.0, adv=lambda s, e: 1_000_000.0, clock=lambda: datetime(2026, 9, 14, 10, 0))
+    v = PaperVenue(prices=lambda s, e: 100.0, instruments=order_instrument_lookup, adv=lambda s, e: 1_000_000.0, clock=lambda: datetime(2026, 9, 14, 10, 0))
     v.max_tick_age_seconds = None
     order = {
         "order_id": "o1", "symbol": "XYZ", "exchange": "NSEEQ", "side": "BUY", "order_type": "MARKET",
@@ -45,10 +49,18 @@ def test_a_partly_filled_order_does_not_take_another_slice_the_same_day():
 
 
 def test_market_orders_cross_the_real_spread_when_the_feed_has_a_quote():
-    from atr.services.paper import TickPrice
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
 
-    tick = TickPrice(price=100.0, bid=99.9, ask=100.2, open=98.0)
-    v = PaperVenue(prices=lambda s, e: tick)
+    from forward.core.paper_models import TickPrice
+
+    now = datetime(2026, 9, 14, 10, 0, tzinfo=ZoneInfo("Asia/Kolkata"))
+    tick = TickPrice(price=100.0, bid=99.9, ask=100.2, open=98.0, timestamp=now)
+    v = PaperVenue(
+        prices=lambda s, e: tick,
+        instruments=order_instrument_lookup,
+        clock=lambda: now,
+    )
     buy = v.submit(_Draft(10))
     assert buy.filled_price == 100.2 and buy.raw["fill_basis"] == "quote"
 
@@ -59,14 +71,18 @@ def test_market_orders_cross_the_real_spread_when_the_feed_has_a_quote():
 
 
 def test_no_quote_falls_back_to_flat_slippage():
-    out = PaperVenue(prices=lambda s, e: 100.0).submit(_Draft(10))
+    out = PaperVenue(
+        prices=lambda s, e: 100.0,
+        instruments=order_instrument_lookup,
+        max_tick_age_seconds=None,
+    ).submit(_Draft(10))
     assert out.raw["fill_basis"] == "last_plus_flat_slippage" and out.filled_price > 100.0
 
 
 def test_live_tick_source_carries_open_bid_ask():
     from types import SimpleNamespace
 
-    from atr.services.paper import live_tick_source
+    from forward.services.paper_prices import live_tick_source
 
     class B:
         def latest_price_and_time(self, s):

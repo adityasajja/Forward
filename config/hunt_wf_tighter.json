@@ -1,0 +1,53 @@
+{
+  "start_date": "2020-01-01",
+  "end_date": "2026-09-18",
+  "universe_files": ["data/universe/n50.txt", "data/universe/mid150.txt"],
+  "minimum_bars": 250,
+  "short_regime_window": 50,
+  "long_regime_window": 200,
+  "oos_fraction": 0.5,
+  "fold_count": 3,
+  "volume_lookback": 20,
+  "gap_signal_warmup_bars": 2,
+  "momentum_lookback": 5,
+  "momentum_signal_warmup_bars": 6,
+  "gap_vol_minimum_gap": 0.015,
+  "gap_vol_minimum_volume_ratio": 1.0,
+  "gap_run_minimum_gap": 0.02,
+  "entry_step": 5,
+  "round_trip_cost": 0.00283,
+  "annual_volatility_target": 0.2,
+  "experiment_groups": [
+    {
+      "signal": "gap_vol",
+      "regime": "dual",
+      "strategies": {
+        "dual_10_20_k5": {"stop": 10, "target": 20, "holding": 20, "positions": 5},
+        "dual_12_24_k5": {"stop": 12, "target": 24, "holding": 20, "positions": 5},
+        "dual_7_14_k5": {"stop": 7, "target": 14, "holding": 20, "positions": 5},
+        "dual_10_20_k3": {"stop": 10, "target": 20, "holding": 20, "positions": 3},
+        "dual_15_25_k5": {"stop": 15, "target": 25, "holding": 30, "positions": 5}
+      }
+    },
+    {
+      "signal": "gap_vol",
+      "regime": "long",
+      "strategies": {
+        "200d_15_30_k3": {"stop": 15, "target": 30, "holding": 30, "positions": 3},
+        "200d_10_20_k5": {"stop": 10, "target": 20, "holding": 20, "positions": 5},
+        "200d_15_25_k5": {"stop": 15, "target": 25, "holding": 30, "positions": 5},
+        "200d_7_14_k5": {"stop": 7, "target": 14, "holding": 20, "positions": 5}
+      }
+    },
+    {
+      "signal": "gap_run_5",
+      "regime": "long",
+      "strategies": {
+        "gr5_15_25_k5": {"stop": 15, "target": 25, "holding": 30, "positions": 5},
+        "gr5_10_20_k5": {"stop": 10, "target": 20, "holding": 20, "positions": 5},
+        "gr5_7_14_k5": {"stop": 7, "target": 14, "holding": 20, "positions": 5},
+        "gr5_10_20_k3": {"stop": 10, "target": 20, "holding": 20, "positions": 3}
+      }
+    }
+  ]
+}

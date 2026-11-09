@@ -1,0 +1,9 @@
+{
+  "port": 8012,
+  "watch_seconds": 20.0,
+  "startup_timeout_seconds": 90.0,
+  "connection_timeout_seconds": 1.0,
+  "request_timeout_seconds": 30.0,
+  "startup_poll_seconds": 0.1,
+  "request_poll_seconds": 0.25
+}

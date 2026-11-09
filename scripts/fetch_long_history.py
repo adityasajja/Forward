@@ -8,7 +8,7 @@ the same schema ``load_daily`` reads back, so nothing downstream changes.
 Usage::
 
     .venv/Scripts/python.exe scripts/fetch_long_history.py \
-        --symbols RELIANCE,INFY,... --exchange NSEEQ --days 2200
+        --symbols RELIANCE,INFY,... --exchange NSEEQ --days 2200 --pause 0.25
 """
 
 from __future__ import annotations
@@ -22,34 +22,22 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-import pandas as pd  # noqa: E402
 
-from atr.brokers.iifl.client import IiflClient  # noqa: E402
-from atr.brokers.iifl.contracts import InstrumentMaster  # noqa: E402
-from atr.alerts.engine import IST  # noqa: E402
+from forward.alerts.engine import IST  # noqa: E402
+from forward.brokers.iifl.client import IiflClient  # noqa: E402
+from forward.brokers.iifl.contracts import InstrumentMaster  # noqa: E402
+from forward.brokers.iifl.feeds import candles_to_frame  # noqa: E402
 
 OHLCV = ["open", "high", "low", "close", "volume"]
 CACHE_ROOT = Path(__file__).resolve().parents[1] / "data" / "iifl_daily"
 
 
-def _candles_to_frame(payload) -> pd.DataFrame:
-    """Reuse the canonical parser rather than re-deriving IIFL's envelope.
-
-    IIFL wraps candles as ``{"status": "Ok", "result": [{"candles": [[iso, o, h, l, c, v], ...]}]}``.
-    ``atr.signals.engine._candles_to_frame`` already handles that shape plus the
-    list-of-dicts variants, so parsing lives in exactly one place.
-    """
-    from atr.signals.engine import _candles_to_frame as parse
-
-    return parse(payload)
-
-
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--symbols", required=True)
-    ap.add_argument("--exchange", default="NSEEQ")
-    ap.add_argument("--days", type=int, default=2200)
-    ap.add_argument("--pause", type=float, default=0.25)
+    ap.add_argument("--exchange", required=True)
+    ap.add_argument("--days", type=int, required=True)
+    ap.add_argument("--pause", type=float, required=True)
     args = ap.parse_args()
 
     symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
@@ -58,7 +46,7 @@ def main() -> int:
 
     client = IiflClient()
     if client.restore_session() is None:
-        print("no cached IIFL session — run `atr login` first", file=sys.stderr)
+        print("no cached IIFL session — run `forward login` first", file=sys.stderr)
         return 1
     master = InstrumentMaster(client)
     master.load_cached([args.exchange])
@@ -91,7 +79,7 @@ def main() -> int:
                     from_date=from_date,
                     to_date=to_date,
                 )
-                frame = _candles_to_frame(payload)
+                frame = candles_to_frame(payload)
             except Exception as exc:  # noqa: BLE001
                 failed.append(f"{symbol} ({exc})")
                 continue

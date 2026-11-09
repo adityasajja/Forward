@@ -4,7 +4,10 @@ Filters: min 15 rebalancing periods, min 75 trades, Sharpe > 1.5.
 Tests: gap_run_5, gap_run, mom_5d with 200d regime + vol targeting.
 """
 from __future__ import annotations
-import json, sys, time
+
+import argparse
+import json
+import time
 from itertools import product
 from pathlib import Path
 
@@ -13,10 +16,12 @@ import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
 DAILY = ROOT / "data" / "iifl_daily" / "NSEEQ"
-TRADING_DAYS = 252
-COST = 0.00283
 p = print
-def P(*a, **k): k.setdefault("flush", True); p(*a, **k)
+
+
+def P(*a, **k):
+    k.setdefault("flush", True)
+    p(*a, **k)
 
 
 def load_symbol(sym, start, end):
@@ -27,53 +32,83 @@ def load_symbol(sym, start, end):
     return df
 
 
-def load_stocks(symbols, start, end, min_bars=250):
+def load_stocks(symbols, start, end, min_bars):
     close_d, high_d, low_d, open_d, vol_d = {}, {}, {}, {}, {}
     for sym in symbols:
-        try:
-            df = load_symbol(sym, start, end)
-            if len(df) < min_bars: continue
-            close_d[sym] = df["close"]; high_d[sym] = df["high"]
-            low_d[sym] = df["low"]; open_d[sym] = df["open"]; vol_d[sym] = df["volume"]
-        except Exception:
-            continue
+        df = load_symbol(sym, start, end)
+        if len(df) < min_bars:
+            raise ValueError(
+                f"{sym} has {len(df)} bars; the configured minimum is {min_bars}."
+            )
+        close_d[sym] = df["close"]
+        high_d[sym] = df["high"]
+        low_d[sym] = df["low"]
+        open_d[sym] = df["open"]
+        vol_d[sym] = df["volume"]
     panels = {}
     for name, d in [("close", close_d), ("high", high_d), ("low", low_d),
                      ("open", open_d), ("volume", vol_d)]:
-        if d: panels[name] = pd.concat(d, axis=1)
+        panels[name] = pd.concat(d, axis=1)
     cols = sorted(set(panels["close"].columns) & set(panels["high"].columns) &
                   set(panels["low"].columns) & set(panels["open"].columns) &
                   set(panels["volume"].columns))
-    for name in panels: panels[name] = panels[name][cols]
+    for name in panels:
+        panels[name] = panels[name][cols]
     idx = panels["close"].index
-    for name in panels: panels[name] = panels[name].reindex(idx).ffill()
+    for name, panel in panels.items():
+        aligned = panel.reindex(idx)
+        if aligned.isna().any().any():
+            missing = aligned.isna().stack()
+            symbol = missing[missing].index[0][1]
+            raise ValueError(f"{name} data for {symbol} has missing dates in the panel.")
+        panels[name] = aligned
     return panels, cols, idx
 
 
-def compute_signals(close, high, low, open_, volume):
-    c = close; v = volume; o = open_
+def compute_signals(close, high, low, open_, volume, config):
+    c = close
+    v = volume
+    o = open_
     sigs = {}
-    for lb in [5, 10, 20]:
+    for lb in config["momentum_lookbacks"]:
         s = np.full_like(c, -np.inf)
         s[lb:] = c[lb:] / c[:-lb] - 1.0
-        s = np.roll(s, 1, axis=0); s[:lb + 2] = -np.inf
+        s = np.roll(s, 1, axis=0)
+        s[:lb + 2] = -np.inf
         sigs[f"mom_{lb}d"] = s
     gap = np.full_like(c, -np.inf)
     gap[1:] = (o[1:] - c[:-1]) / c[:-1]
-    gap = np.roll(gap, 1, axis=0); gap[:2] = -np.inf
-    sigs["gap_run"] = np.where(gap > 0.01, gap * sigs["mom_5d"], -np.inf)
-    sigs["gap_run_5"] = np.where(gap > 0.02, gap * sigs["mom_5d"], -np.inf)
+    gap = np.roll(gap, 1, axis=0)
+    gap[:2] = -np.inf
+    sigs["gap_run"] = np.where(
+        gap > config["gap_run_minimum_gap"], gap * sigs["mom_5d"], -np.inf
+    )
+    sigs["gap_run_5"] = np.where(
+        gap > config["gap_run_5_minimum_gap"], gap * sigs["mom_5d"], -np.inf
+    )
     vol_avg = np.full_like(v, np.nan)
-    for i in range(20, len(v)):
-        vol_avg[i] = v[i - 20:i].mean(axis=0)
-    vr = np.where(vol_avg > 0, v / vol_avg, 0)
-    sigs["vol_mom_5d"] = np.where(vr > 1.2, sigs["mom_5d"] * (1 + vr), -np.inf)
+    for i in range(config["volume_lookback"], len(v)):
+        vol_avg[i] = v[i - config["volume_lookback"]:i].mean(axis=0)
+    measured_average = vol_avg[config["volume_lookback"]:]
+    if np.isnan(measured_average).any() or (measured_average <= 0).any():
+        raise ValueError("Configured volume history is missing or nonpositive.")
+    vr = v / vol_avg
+    sigs["vol_mom_5d"] = np.where(
+        vr > config["volume_momentum_minimum_ratio"],
+        sigs["mom_5d"] * (config["volume_momentum_base_weight"] + vr), -np.inf
+    )
     # Gap with volume filter
-    sigs["gap_vol"] = np.where((gap > 0.015) & (vr > 1.0), gap * sigs["mom_5d"] * vr, -np.inf)
+    sigs["gap_vol"] = np.where(
+        (gap > config["gap_vol_minimum_gap"])
+        & (vr > config["gap_vol_minimum_ratio"]),
+        gap * sigs["mom_5d"] * vr,
+        -np.inf,
+    )
     return sigs
 
 
-def compute_exit(close, high, low, t, picks, max_holding, sl_pct, tp_pct):
+def compute_exit(close, high, low, t, picks, max_holding, sl_pct, tp_pct,
+                 price_epsilon):
     entry = close[t, picks]
     path_end = min(t + max_holding + 1, close.shape[0])
     if path_end <= t + 1 or len(picks) == 0:
@@ -81,7 +116,7 @@ def compute_exit(close, high, low, t, picks, max_holding, sl_pct, tp_pct):
     hi = high[t + 1:path_end][:, picks]
     lo = low[t + 1:path_end][:, picks]
     cl = close[t + 1:path_end][:, picks]
-    eps = 1e-10
+    eps = price_epsilon
     cum_hi = hi / (entry + eps) - 1.0
     cum_lo = lo / (entry + eps) - 1.0
     stop_lvl = -sl_pct / 100.0
@@ -91,14 +126,20 @@ def compute_exit(close, high, low, t, picks, max_holding, sl_pct, tp_pct):
     n_days = path_end - (t + 1)
     if n_days == 1:
         exits = cl[-1] / (entry + eps) - 1.0
-        sw = stop_hits[-1]; tw = target_hits[-1] & ~sw
-        exits[sw] = stop_lvl; exits[tw] = tgt_lvl
+        sw = stop_hits[-1]
+        tw = target_hits[-1] & ~sw
+        exits[sw] = stop_lvl
+        exits[tw] = tgt_lvl
         return exits, int(np.sum(sw)), int(np.sum(tw)), int(np.sum(~sw & ~tw))
-    sf = np.argmax(stop_hits, axis=0); sa = np.any(stop_hits, axis=0)
-    tf = np.argmax(target_hits, axis=0); ta = np.any(target_hits, axis=0)
+    sf = np.argmax(stop_hits, axis=0)
+    sa = np.any(stop_hits, axis=0)
+    tf = np.argmax(target_hits, axis=0)
+    ta = np.any(target_hits, axis=0)
     exits = cl[-1] / (entry + eps) - 1.0
-    sw = sa & (~ta | (sf <= tf)); tw = ta & (~sa | (tf < sf))
-    exits[sw] = stop_lvl; exits[tw] = tgt_lvl
+    sw = sa & (~ta | (sf <= tf))
+    tw = ta & (~sa | (tf < sf))
+    exits[sw] = stop_lvl
+    exits[tw] = tgt_lvl
     return exits, int(np.sum(sw)), int(np.sum(tw)), len(picks) - int(np.sum(sw)) - int(np.sum(tw))
 
 
@@ -112,12 +153,11 @@ def build_regime(nifty_close, window):
 
 
 def run_strategy(close, high, low, signal, sl_pct, tp_pct, max_holding, k, step,
-                 costs=COST, regime_filter=None, vol_target=0.20, vol_window=20,
-                 min_rebalances=15):
+                 config, costs, regime_filter, vol_target, min_rebalances):
     n_dates, n_stocks = close.shape
-    warmup = 22
+    warmup = config["warmup_bars"]
     rb_dates = list(range(warmup, n_dates - max_holding, step))
-    if len(rb_dates) < 5:
+    if len(rb_dates) < min_rebalances:
         return {"error": "insufficient dates"}
 
     daily_ret = np.zeros_like(close)
@@ -129,7 +169,7 @@ def run_strategy(close, high, low, signal, sl_pct, tp_pct, max_holding, k, step,
     total_targets = 0
 
     for t in rb_dates:
-        if regime_filter is not None and t < len(regime_filter) and not regime_filter[t]:
+        if regime_filter is not None and not regime_filter[t]:
             continue
         scores = signal[t, :].copy()
         valid = close[t, :] > 0
@@ -140,20 +180,26 @@ def run_strategy(close, high, low, signal, sl_pct, tp_pct, max_holding, k, step,
         picks = np.argpartition(-scores, top_k - 1)[:top_k]
         picks = picks[np.argsort(-scores[picks])]
 
-        exits, n_stop, n_target, n_hold = compute_exit(close, high, low, t, picks, max_holding, sl_pct, tp_pct)
+        exits, n_stop, n_target, n_hold = compute_exit(
+            close, high, low, t, picks, max_holding, sl_pct, tp_pct,
+            config["price_epsilon"],
+        )
 
-        if vol_target > 0 and t >= vol_window:
-            recent_ret = daily_ret[t - vol_window:t, :][:, picks]
-            stock_vol = np.std(recent_ret, axis=0, ddof=1) * np.sqrt(TRADING_DAYS)
-        else:
-            stock_vol = np.full(len(picks), 0.20)
-
-        inv_vol = np.where(stock_vol > 0.01, 1.0 / stock_vol, 1.0 / 0.20)
-        raw_weights = inv_vol / inv_vol.sum()
         if vol_target > 0:
+            vol_window = config["volatility_lookback"]
+            recent_ret = daily_ret[t - vol_window:t, :][:, picks]
+            stock_vol = np.std(recent_ret, axis=0, ddof=1) * np.sqrt(
+                config["trading_days"]
+            )
+            if (not np.isfinite(stock_vol).all()
+                    or (stock_vol <= config["minimum_annualized_volatility"]).any()):
+                raise ValueError("Selected instruments have invalid volatility history.")
+            inv_vol = 1.0 / stock_vol
+            raw_weights = inv_vol / inv_vol.sum()
             avg_vol = np.mean(stock_vol)
-            vol_scale = min(1.0, vol_target / avg_vol) if avg_vol > 0 else 1.0
+            vol_scale = min(1.0, vol_target / avg_vol)
         else:
+            raw_weights = np.full(len(picks), 1.0 / len(picks))
             vol_scale = 1.0
         net = exits - costs
         portfolio_ret = float(np.sum(raw_weights * vol_scale * net))
@@ -169,13 +215,13 @@ def run_strategy(close, high, low, signal, sl_pct, tp_pct, max_holding, k, step,
     cum = np.cumprod(1 + returns)
     total_ret = float(cum[-1] - 1)
     n_p = len(returns)
-    years = n_p * step / TRADING_DAYS
+    years = n_p * step / config["trading_days"]
     cagr = (1 + total_ret) ** (1.0 / years) - 1 if years > 0 else 0
-    ppy = TRADING_DAYS / step
+    ppy = config["trading_days"] / step
     arith_annual = float(np.mean(returns)) * ppy
     vol = float(np.std(returns, ddof=1)) * np.sqrt(ppy) if n_p > 1 else 0
-    sharpe = (arith_annual - 0.075) / vol if vol > 0 else 0
-    wf = 5.0 / step
+    sharpe = (arith_annual - config["annual_risk_free_rate"]) / vol if vol > 0 else 0
+    wf = config["sessions_per_week"] / step
     wr = returns * wf
     rmax = np.maximum.accumulate(cum)
     max_dd = float(np.min(cum / rmax - 1))
@@ -188,9 +234,9 @@ def run_strategy(close, high, low, signal, sl_pct, tp_pct, max_holding, k, step,
         "total_return_pct": round(100 * total_ret, 2),
         "max_drawdown_pct": round(100 * max_dd, 2),
         "weekly_win_rate_pct": round(100 * np.mean(wr > 0), 1),
-        "weeks_ge_2pct_pct": round(100 * np.mean(wr >= 0.02), 1),
-        "weeks_ge_3pct_pct": round(100 * np.mean(wr >= 0.03), 1),
-        "weeks_ge_5pct_pct": round(100 * np.mean(wr >= 0.05), 1),
+        "weeks_ge_2pct_pct": round(100 * np.mean(wr >= config["weekly_thresholds"]["2"]), 1),
+        "weeks_ge_3pct_pct": round(100 * np.mean(wr >= config["weekly_thresholds"]["3"]), 1),
+        "weeks_ge_5pct_pct": round(100 * np.mean(wr >= config["weekly_thresholds"]["5"]), 1),
         "num_trades": total_trades,
         "win_rate_pct": round(100 * total_targets / max(total_trades, 1), 1),
         "stop_rate_pct": round(100 * total_stops / max(total_trades, 1), 1),
@@ -202,22 +248,38 @@ def run_strategy(close, high, low, signal, sl_pct, tp_pct, max_holding, k, step,
 
 
 def main():
-    start = pd.Timestamp("2020-01-01")
-    end = pd.Timestamp("2026-09-18")
+    """Run the configured parameter search and walk-forward study."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", type=Path, required=True)
+    config_path = parser.parse_args().config
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    P(f"Configuration: {config_path.resolve()}")
+    start = pd.Timestamp(config["start_date"])
+    end = pd.Timestamp(config["end_date"])
     from strategy_hunt import parse_universe
-    all_symbols = list(set(
-        parse_universe(ROOT / "data" / "universe" / "n50.txt") +
-        parse_universe(ROOT / "data" / "universe" / "mid150.txt")
-    ))
+    all_symbols = list(
+        dict.fromkeys(
+            symbol
+            for path in config["universe_files"]
+            for symbol in parse_universe(ROOT / path)
+        )
+    )
     P(f"Loading {len(all_symbols)} symbols...")
     t0 = time.time()
-    panels, syms, dates = load_stocks(all_symbols, start, end)
+    panels, syms, dates = load_stocks(
+        all_symbols, start, end, min_bars=config["minimum_bars"]
+    )
+    if not syms or len(dates) == 0:
+        raise ValueError("Configured date range produced no usable stock data.")
     P(f"  {len(syms)} stocks, {len(dates)} dates in {time.time()-t0:.1f}s")
 
-    nifty = load_symbol("NIFTYBEES", start, end)
-    nif_close = nifty["close"].reindex(dates).ffill().to_numpy(dtype=np.float64)
-    regime_50 = build_regime(nif_close, 50)
-    regime_200 = build_regime(nif_close, 200)
+    nifty = load_symbol(config["benchmark_symbol"], start, end)
+    aligned_benchmark = nifty["close"].reindex(dates)
+    if aligned_benchmark.isna().any():
+        raise ValueError("Benchmark is missing dates required for regime signals.")
+    nif_close = aligned_benchmark.to_numpy(dtype=np.float64)
+    regime_50 = build_regime(nif_close, config["short_regime_window"])
+    regime_200 = build_regime(nif_close, config["long_regime_window"])
     regime_dual = regime_50 & regime_200
     regime_or = regime_50 | regime_200
 
@@ -227,31 +289,36 @@ def main():
     open_ = panels["open"].to_numpy(dtype=np.float64)
     volume = panels["volume"].to_numpy(dtype=np.float64)
     n_dates = len(dates)
-    mid = n_dates // 2
+    mid = int(n_dates * config["oos_start_fraction"])
     P(f"  Date: {dates[0].date()} → {dates[-1].date()}")
     P(f"  Regime: dual={np.sum(regime_dual)}({100*np.mean(regime_dual):.0f}%) or={np.sum(regime_or)}({100*np.mean(regime_or):.0f}%)")
 
-    signals = compute_signals(close, high, low, open_, volume)
+    signals = compute_signals(close, high, low, open_, volume, config)
     sigs_oos = {name: sig[mid:] for name, sig in signals.items()}
 
     # ================================================================
     # EXHAUSTIVE SWEEP: min 15 rebalances, 2-5% weekly target
     # ================================================================
     P(f"\n{'='*80}")
-    P(f"EXHAUSTIVE SWEEP (OOS, min 15 rebalances, 2-5% weekly target)")
+    P(f"EXHAUSTIVE SWEEP (OOS, weekly target {config['target_weekly_minimum_pct']}–{config['target_weekly_maximum_pct']}%)")
     P(f"{'='*80}")
 
     param_grid = list(product(
-        [(5, 10), (7, 14), (10, 20), (10, 30), (12, 24), (15, 25), (15, 30)],
-        [3, 5],
-        [5],
-        [10, 20, 30],
-        [0.0, 0.15, 0.20, 0.25],
+        [tuple(pair) for pair in config["stop_target_pairs"]],
+        config["position_counts"],
+        config["entry_steps"],
+        config["maximum_holding_days"],
+        config["annual_volatility_targets"],
     ))
     # (sl, tp), k, step, mh, vt
-    sig_names = ["gap_run_5", "gap_run", "gap_vol", "mom_5d", "vol_mom_5d"]
-    regime_names = [("none", None), ("200d", regime_200[mid:]),
-                    ("dual", regime_dual[mid:]), ("or", regime_or[mid:])]
+    sig_names = config["signals"]
+    regime_arrays = {
+        "none": None,
+        "200d": regime_200[mid:],
+        "dual": regime_dual[mid:],
+        "or": regime_or[mid:],
+    }
+    regime_names = [(name, regime_arrays[name]) for name in config["regimes"]]
 
     P(f"  {len(param_grid)} params × {len(sig_names)} signals × {len(regime_names)} regimes = {len(param_grid)*len(sig_names)*len(regime_names)}")
 
@@ -262,11 +329,13 @@ def main():
         for regime_name, reg in regime_names:
             for (sl, tp), k, step, mh, vt in param_grid:
                 r = run_strategy(close[mid:], high[mid:], low[mid:], sig_arr,
-                                 sl, tp, mh, k, step, costs=COST,
-                                 regime_filter=reg, vol_target=vt, min_rebalances=15)
+                                 sl, tp, mh, k, step, config=config,
+                                 costs=config["round_trip_cost"],
+                                 regime_filter=reg, vol_target=vt,
+                                 min_rebalances=config["minimum_rebalances"])
                 if "error" in r:
                     continue
-                if r["max_drawdown_pct"] < -30:
+                if r["max_drawdown_pct"] < config["maximum_drawdown_pct"]:
                     continue
                 all_results.append({
                     "signal": sig_name, "regime": regime_name,
@@ -277,12 +346,17 @@ def main():
     P(f"  {len(all_results)} valid configs (>=15 rebalances, DD>-30%) in {time.time()-t1:.1f}s")
 
     # Filter: 2-5% weekly, Sharpe > 1, sort by Sharpe
-    target = [r for r in all_results if 2 <= r["weekly_mean_pct"] <= 5 and r["sharpe"] > 1]
+    target = [
+        r for r in all_results
+        if config["target_weekly_minimum_pct"] <= r["weekly_mean_pct"]
+        <= config["target_weekly_maximum_pct"]
+        and r["sharpe"] > config["minimum_target_sharpe"]
+    ]
     target.sort(key=lambda r: r["sharpe"], reverse=True)
     P(f"  Configs in 2-5% range with Sharpe > 1: {len(target)}")
 
-    P(f"\n  Top 20 by Sharpe:")
-    for r in target[:20]:
+    P("\n  Top 20 by Sharpe:")
+    for r in target[:config["top_sharpe_count"]]:
         P(f"  {r['signal']}/{r['regime']}/sl{r['sl']}/tp{r['tp']}/mh{r['mh']}/k{r['k']}/vt{r['vt']}: "
           f"wk={r['weekly_mean_pct']:+.3f}% Sharpe={r['sharpe']:.3f} DD={r['max_drawdown_pct']:.0f}% "
           f"rb={r['n_rebalances']} pos_wk={r['weekly_win_rate_pct']:.0f}%")
@@ -290,8 +364,8 @@ def main():
 
     # Also: configs with most trades in 2-5% range
     target_trade = sorted(target, key=lambda r: r["n_rebalances"] * r["num_trades"], reverse=True)
-    P(f"\n  Top 10 by trade count (in 2-5% range):")
-    for r in target_trade[:10]:
+    P("\n  Top 10 by trade count (in 2-5% range):")
+    for r in target_trade[:config["top_trade_count"]]:
         P(f"  {r['signal']}/{r['regime']}/sl{r['sl']}/tp{r['tp']}/mh{r['mh']}/k{r['k']}/vt{r['vt']}: "
           f"wk={r['weekly_mean_pct']:+.3f}% Sharpe={r['sharpe']:.3f} DD={r['max_drawdown_pct']:.0f}% "
           f"rb={r['n_rebalances']} pos_wk={r['weekly_win_rate_pct']:.0f}%")
@@ -300,26 +374,28 @@ def main():
     # WALK-FORWARD for best 3 configs (most trades)
     # ================================================================
     P(f"\n{'='*80}")
-    P(f"WALK-FORWARD (expanding window, 3 folds)")
+    P("WALK-FORWARD (expanding window, 3 folds)")
     P(f"{'='*80}")
 
     # Pick top 3 by Sharpe among configs with >=20 rebalances
-    robust = [r for r in target if r["n_rebalances"] >= 20]
+    robust = [r for r in target if r["n_rebalances"] >= config["robust_minimum_rebalances"]]
     robust.sort(key=lambda r: r["sharpe"], reverse=True)
-    wf_configs = robust[:3] if robust else target[:3]
+    if not robust:
+        raise ValueError("No target configuration met the walk-forward sample gate.")
+    wf_configs = robust[:config["walk_forward_top_count"]]
 
     # Also include the best gap_run_5/no_regime config for comparison
     for r in all_results:
-        if r["signal"] == "gap_run_5" and r["regime"] == "none" and r["sl"] == 10 and r["tp"] == 20 and r["mh"] == 20 and r["k"] == 5 and r["step"] == 5 and r["vt"] == 0.0:
+        if r["signal"] == config["reference_no_regime"]["signal"] and r["regime"] == "none" and r["sl"] == config["reference_no_regime"]["stop"] and r["tp"] == config["reference_no_regime"]["target"] and r["mh"] == config["reference_no_regime"]["holding"] and r["k"] == config["reference_no_regime"]["positions"] and r["step"] == config["reference_no_regime"]["step"] and r["vt"] == config["reference_no_regime"]["vol_target"]:
             wf_configs.append(r)
             break
     # And the gap_run_5/200d config
     for r in all_results:
-        if r["signal"] == "gap_run_5" and r["regime"] == "200d" and r["sl"] == 10 and r["tp"] == 20 and r["mh"] == 20 and r["k"] == 5 and r["step"] == 5 and r["vt"] == 0.2:
+        if r["signal"] == config["reference_long_regime"]["signal"] and r["regime"] == "200d" and r["sl"] == config["reference_long_regime"]["stop"] and r["tp"] == config["reference_long_regime"]["target"] and r["mh"] == config["reference_long_regime"]["holding"] and r["k"] == config["reference_long_regime"]["positions"] and r["step"] == config["reference_long_regime"]["step"] and r["vt"] == config["reference_long_regime"]["vol_target"]:
             wf_configs.append(r)
             break
 
-    for r_top in wf_configs[:5]:
+    for r_top in wf_configs[:config["walk_forward_max_count"]]:
         sig_name = r_top["signal"]
         sig_arr = signals[sig_name]
         if r_top["regime"] == "none":
@@ -336,18 +412,24 @@ def main():
 
         # Train (2020-01 → 2023-05)
         tr = run_strategy(close[:mid], high[:mid], low[:mid], sig_arr[:mid],
-                          r_top["sl"], r_top["tp"], r_top["mh"], r_top["k"], 5,
-                          costs=COST, regime_filter=reg_full[:mid] if reg_full is not None else None,
-                          vol_target=r_top["vt"], min_rebalances=5)
+                          r_top["sl"], r_top["tp"], r_top["mh"], r_top["k"],
+                          r_top["step"], config=config,
+                          costs=config["round_trip_cost"],
+                          regime_filter=reg_full[:mid] if reg_full is not None else None,
+                          vol_target=r_top["vt"],
+                          min_rebalances=config["walk_forward_minimum_rebalances"])
         if "error" not in tr:
             P(f"    TRAIN: wk={tr['weekly_mean_pct']:+.3f}% Sharpe={tr['sharpe']:.3f} "
               f"DD={tr['max_drawdown_pct']:.0f}% rb={tr['n_rebalances']}")
 
         # OOS (2023-05 → 2026-09) — also walk-forward within OOS
         oos = run_strategy(close[mid:], high[mid:], low[mid:], sig_arr[mid:],
-                           r_top["sl"], r_top["tp"], r_top["mh"], r_top["k"], 5,
-                           costs=COST, regime_filter=reg_full[mid:] if reg_full is not None else None,
-                           vol_target=r_top["vt"], min_rebalances=5)
+                           r_top["sl"], r_top["tp"], r_top["mh"], r_top["k"],
+                           r_top["step"], config=config,
+                           costs=config["round_trip_cost"],
+                           regime_filter=reg_full[mid:] if reg_full is not None else None,
+                           vol_target=r_top["vt"],
+                           min_rebalances=config["walk_forward_minimum_rebalances"])
         if "error" not in oos:
             P(f"    OOS:   wk={oos['weekly_mean_pct']:+.3f}% Sharpe={oos['sharpe']:.3f} "
               f"DD={oos['max_drawdown_pct']:.0f}% rb={oos['n_rebalances']} "
@@ -358,15 +440,19 @@ def main():
 
         # Sub-period walk-forward within OOS (3 sub-folds)
         oos_len = n_dates - mid
-        sub_size = oos_len // 3
-        P(f"    Sub-periods (within OOS):")
-        for si in range(3):
+        sub_size = oos_len // config["subperiod_count"]
+        P("    Sub-periods (within OOS):")
+        for si in range(config["subperiod_count"]):
             ss = mid + si * sub_size
-            se = mid + (si + 1) * sub_size if si < 2 else n_dates
+            se = (mid + (si + 1) * sub_size
+                  if si < config["subperiod_count"] - 1 else n_dates)
             sub_r = run_strategy(close[ss:se], high[ss:se], low[ss:se], sig_arr[ss:se],
-                                 r_top["sl"], r_top["tp"], r_top["mh"], r_top["k"], 5,
-                                 costs=COST, regime_filter=reg_full[ss:se] if reg_full is not None else None,
-                                 vol_target=r_top["vt"], min_rebalances=3)
+                                 r_top["sl"], r_top["tp"], r_top["mh"], r_top["k"],
+                                 r_top["step"], config=config,
+                                 costs=config["round_trip_cost"],
+                                 regime_filter=reg_full[ss:se] if reg_full is not None else None,
+                                 vol_target=r_top["vt"],
+                                 min_rebalances=config["subperiod_minimum_rebalances"])
             if "error" in sub_r:
                 P(f"      Fold {si+1} ({dates[ss].date()} → {dates[se-1].date()}): insufficient")
             else:
@@ -378,54 +464,49 @@ def main():
     # FINAL RECOMMENDATION
     # ================================================================
     P(f"\n{'='*80}")
-    P(f"FINAL RECOMMENDATION")
+    P("FINAL RECOMMENDATION")
     P(f"{'='*80}")
 
     # Find the best config: in 2-5% range, Sharpe > 2, most rebalances
-    final = [r for r in target if r["n_rebalances"] >= 18 and r["sharpe"] > 2]
+    final = [
+        r for r in target
+        if r["n_rebalances"] >= config["recommendation_minimum_rebalances"]
+        and r["sharpe"] > config["recommendation_minimum_sharpe"]
+    ]
     final.sort(key=lambda r: (r["sharpe"], r["n_rebalances"]), reverse=True)
 
-    if final:
-        best = final[0]
-        P(f"\n  Recommended: {best['signal']}/{best['regime']}/sl{best['sl']}/tp{best['tp']}/"
-          f"mh{best['mh']}/k{best['k']}/s5/vt{best['vt']}")
-        P(f"  OOS ({dates[mid].date()} → {dates[-1].date()}):")
-        P(f"    Weekly mean:    {best['weekly_mean_pct']:+.3f}%")
-        P(f"    Sharpe:         {best['sharpe']:.3f}")
-        P(f"    CAGR:           {best['cagr_pct']:.0f}%")
-        P(f"    Total return:   {best['total_return_pct']:.0f}%")
-        P(f"    Max drawdown:   {best['max_drawdown_pct']:.1f}%")
-        P(f"    Weekly vol:     {best['weekly_vol_pct']:.3f}%")
-        P(f"    Win rate (wk):  {best['weekly_win_rate_pct']:.0f}%")
-        P(f"    P(>=2% week):   {best['weeks_ge_2pct_pct']:.0f}%")
-        P(f"    P(>=5% week):   {best['weeks_ge_5pct_pct']:.0f}%")
-        P(f"    Rebalances:     {best['n_rebalances']} ({best['num_trades']} trades)")
-        P(f"    Position win:   {best['win_rate_pct']:.0f}%  Stop: {best['stop_rate_pct']:.0f}%")
-        P(f"    Range:          {best['min_weekly_pct']:+.3f}% to {best['max_weekly_pct']:+.3f}%")
-    else:
-        P(f"  No config meets all criteria. Best available (most rebalances in 2-5%):")
-        fallback = sorted(target, key=lambda r: r["n_rebalances"], reverse=True)[:3]
-        for best in fallback[:3]:
-            P(f"  {best['signal']}/{best['regime']}/sl{best['sl']}/tp{best['tp']}/"
-              f"mh{best['mh']}/k{best['k']}/vt{best['vt']}: "
-              f"wk={best['weekly_mean_pct']:+.3f}% Sharpe={best['sharpe']:.3f} "
-              f"rb={best['n_rebalances']} DD={best['max_drawdown_pct']:.0f}%")
-            P(f"    P(>=2%)={best['weeks_ge_2pct_pct']:.0f}% P(>=5%)={best['weeks_ge_5pct_pct']:.0f}%")
-
+    if not final:
+        raise ValueError("No configuration meets the configured recommendation criteria.")
+    best = final[0]
+    P(f"\n  Recommended: {best['signal']}/{best['regime']}/sl{best['sl']}/tp{best['tp']}/"
+  f"mh{best['mh']}/k{best['k']}/s{best['step']}/vt{best['vt']}")
+    P(f"  OOS ({dates[mid].date()} → {dates[-1].date()}):")
+    P(f"    Weekly mean:    {best['weekly_mean_pct']:+.3f}%")
+    P(f"    Sharpe:         {best['sharpe']:.3f}")
+    P(f"    CAGR:           {best['cagr_pct']:.0f}%")
+    P(f"    Total return:   {best['total_return_pct']:.0f}%")
+    P(f"    Max drawdown:   {best['max_drawdown_pct']:.1f}%")
+    P(f"    Weekly vol:     {best['weekly_vol_pct']:.3f}%")
+    P(f"    Win rate (wk):  {best['weekly_win_rate_pct']:.0f}%")
+    P(f"    P(>=2% week):   {best['weeks_ge_2pct_pct']:.0f}%")
+    P(f"    P(>=5% week):   {best['weeks_ge_5pct_pct']:.0f}%")
+    P(f"    Rebalances:     {best['n_rebalances']} ({best['num_trades']} trades)")
+    P(f"    Position win:   {best['win_rate_pct']:.0f}%  Stop: {best['stop_rate_pct']:.0f}%")
+    P(f"    Range:          {best['min_weekly_pct']:+.3f}% to {best['max_weekly_pct']:+.3f}%")
     # Save
-    OUT = ROOT / "data" / "research" / "gap_run_final_v2.json"
+    output_path = ROOT / config["output_file"]
     payload = {
         "generated_at": pd.Timestamp.now().isoformat(),
         "oos_window": [str(dates[mid].date()), str(dates[-1].date())],
         "n_valid_configs": len(all_results),
         "n_target_configs": len(target),
-        "all_results": all_results[:100],
-        "top_20_by_sharpe": target[:20],
-        "best": final[0] if final else None,
+        "all_results": all_results[:config["saved_result_count"]],
+        "top_by_sharpe": target[:config["top_sharpe_count"]],
+        "best": final[0],
     }
-    OUT.parent.mkdir(parents=True, exist_ok=True)
-    OUT.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
-    P(f"\n  Results saved to {OUT}")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+    P(f"\n  Results saved to {output_path}")
     return 0
 
 

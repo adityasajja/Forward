@@ -1,0 +1,38 @@
+{
+  "start_date": "2020-01-01",
+  "end_date": "2026-09-18",
+  "universe_files": ["data/universe/n50.txt", "data/universe/mid150.txt"],
+  "minimum_bars": 250,
+  "benchmark_symbol": "NIFTYBEES",
+  "short_regime_window": 50,
+  "long_regime_window": 200,
+  "oos_start_fraction": 0.5,
+  "momentum_lookback": 5,
+  "volume_lookback": 20,
+  "gap_vol_minimum_gap": 0.015,
+  "gap_vol_minimum_volume_ratio": 1.0,
+  "gap_run_minimum_gap": 0.02,
+  "fold_count": 3,
+  "entry_step": 5,
+  "round_trip_cost": 0.00283,
+  "walk_forward_strategy": {
+    "stop": 15,
+    "target": 30,
+    "holding": 30,
+    "positions": 3,
+    "vol_target": 0.2
+  },
+  "comparison_signals": ["gap_vol", "gap_run_5"],
+  "comparison_regimes": ["200d", "dual", "none"],
+  "comparison_strategies": [
+    {"stop": 15, "target": 30, "holding": 30, "positions": 3, "vol_target": 0.2},
+    {"stop": 10, "target": 20, "holding": 20, "positions": 5, "vol_target": 0.2},
+    {"stop": 15, "target": 25, "holding": 30, "positions": 5, "vol_target": 0.2},
+    {"stop": 7, "target": 14, "holding": 20, "positions": 5, "vol_target": 0.2}
+  ],
+  "maximum_drawdown_pct": -30,
+  "minimum_rebalances": 10,
+  "intraday_summary_file": null,
+  "intraday_marker_minimum_sharpe": 5,
+  "intraday_marker_minimum_rebalances": 15
+}

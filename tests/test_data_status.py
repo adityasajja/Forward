@@ -7,15 +7,20 @@ from datetime import date, datetime
 import pandas as pd
 from fastapi.testclient import TestClient
 
-from atr.api.main import app
-from atr.market_calendar import IST, NSEMarketCalendar
-from atr.services.data_status import build_status, classify, expected_session, sessions_behind
+from forward.api.main import app
+from forward.data.data_status import CachedMarketDataStatusAdapter
+from forward.market_calendar import IST, NSEMarketCalendar
+from forward.services.data_status import build_status, classify, expected_session, sessions_behind
 
 CAL = NSEMarketCalendar(holidays=set())
 
 
 def at(y, m, d, h, mi=0):
     return datetime(y, m, d, h, mi, tzinfo=IST)
+
+
+def status(data_root, now, calendar=CAL):
+    return build_status(CachedMarketDataStatusAdapter(data_root), now, calendar=calendar)
 
 
 class TestExpectedSession:
@@ -55,14 +60,14 @@ def _write(path, last: date, n=30):
 
 class TestDemo:
     def test_a_marked_directory_is_reported_as_demo(self, tmp_path):
-        assert build_status(tmp_path, at(2026, 7, 8, 11), CAL)["demo"] is False
+        assert status(tmp_path, at(2026, 7, 8, 11))["demo"] is False
         (tmp_path / ".demo").write_text("x")
-        assert build_status(tmp_path, at(2026, 7, 8, 11), CAL)["demo"] is True
+        assert status(tmp_path, at(2026, 7, 8, 11))["demo"] is True
 
 
 class TestBuild:
     def test_an_empty_data_root_says_missing_not_fresh(self, tmp_path):
-        out = build_status(tmp_path, at(2026, 7, 8, 11), CAL)
+        out = status(tmp_path, at(2026, 7, 8, 11))
         assert out["overall"] == "missing"
         assert {s["status"] for s in out["sources"]} == {"missing"}
         assert all(s["as_of"] is None for s in out["sources"])
@@ -70,20 +75,14 @@ class TestBuild:
     def test_reports_each_source_with_its_age(self, tmp_path):
         _write(tmp_path / "iifl_daily" / "NSEEQ" / "RELIANCE-EQ.parquet", date(2026, 7, 7))
         _write(tmp_path / "iifl_daily" / "INDICES" / "NIFTY50.parquet", date(2026, 7, 3))
-        (tmp_path / "iifl_daily" / "INDICES" / "NIFTY50.source").write_text("Yahoo public bars")
-        out = build_status(tmp_path, at(2026, 7, 8, 11), CAL)
+        (tmp_path / "iifl_daily" / "INDICES" / "NIFTY50.source").write_text("IIFL history")
+        out = status(tmp_path, at(2026, 7, 8, 11))
         prices, index = out["sources"]
         assert out["expected_session"] == "2026-07-07"
         assert (prices["status"], prices["sessions_behind"]) == ("fresh", 0)
         assert (index["status"], index["sessions_behind"]) == ("stale", 2)
-        assert index["origin"] == "Yahoo public bars"
+        assert index["origin"] == "IIFL history"
         assert out["overall"] == "stale"  # the worst source decides
-
-    def test_the_topup_job_is_reported_when_it_has_run(self, tmp_path):
-        (tmp_path / "eod_refresh.json").write_text('{"ran_at": "2026-07-07T11:00:00+00:00", "ran_date_ist": "2026-07-07", "names": 10, "ok": 8, "fail": 2}')
-        out = build_status(tmp_path, at(2026, 7, 8, 11), CAL)
-        assert out["topup"]["updated"] == 8 and out["topup"]["failed"] == 2
-
 
 def test_the_route_requires_a_login(fresh_env):
     assert TestClient(app, client=("127.0.0.1", 1)).get("/api/v1/data/status").status_code == 401
@@ -101,8 +100,8 @@ def test_the_route_returns_the_shape(fresh_env, master):
 def test_the_nightly_check_flags_a_split_like_jump_and_status_reports_it(tmp_path):
     import pandas as pd
 
-    from atr.data import quality
-    from atr.data.eod_refresh import cache_dir
+    from forward.data import quality
+    from forward.data.eod_refresh import cache_dir
 
     root = cache_dir(tmp_path)
     root.mkdir(parents=True)

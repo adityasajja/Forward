@@ -1,0 +1,31 @@
+{
+  "base_strategy_config": "config/study_intraweek_target.json",
+  "minimum_training_samples": 1500,
+  "stop_fraction": 0.05,
+  "top_conditions": 10,
+  "condition_sizes": [1, 2, 3],
+  "minimum_late_average_fraction": 0.0,
+  "volatility_quantiles": {
+    "jumpy": 0.8,
+    "calm": 0.2
+  },
+  "conditions": {
+    "weekly_return_down_fraction": -0.03,
+    "weekly_return_up_fraction": 0.03,
+    "monthly_return_down_fraction": -0.1,
+    "monthly_return_up_fraction": 0.1,
+    "rsi_oversold": 30,
+    "rsi_overbought": 70,
+    "rsi_mid_range": [45, 60],
+    "ema50_above_fraction": 0.0,
+    "ema50_below_fraction": -0.05,
+    "near_52_week_high_fraction": -0.05,
+    "far_from_52_week_high_fraction": -0.3,
+    "gap_up_fraction": 0.01,
+    "gap_down_fraction": -0.01,
+    "market_return_down_fraction": -0.01,
+    "market_return_up_fraction": 0.01
+  },
+  "random_seed": 3,
+  "randomized_search_trials": 5
+}

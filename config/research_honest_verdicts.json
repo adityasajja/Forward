@@ -1,0 +1,27 @@
+{
+  "daily_data_directory": "data/iifl_daily/NSEEQ",
+  "selected_panel_file": "data/signals/panel_nseeq_120.parquet",
+  "output_file": "data/signals/evidence.json",
+  "minimum_history_bars": 1000,
+  "trading_days_per_year": 252,
+  "monthly_period": "ME",
+  "high_volatility_lookback_days": 126,
+  "warmup_months": 6,
+  "minimum_cross_section_symbols": 20,
+  "high_volatility_fraction": 0.2,
+  "overlay_volatility_lookback_days": 20,
+  "overlay_target_annual_volatility": 0.15,
+  "overlay_maximum_weight": 1.0,
+  "overlay_split_fractions": [
+    0.3,
+    0.4,
+    0.5,
+    0.6,
+    0.7,
+    0.8
+  ],
+  "high_volatility_factor_trial_count": 7,
+  "overlay_trial_count": 5,
+  "selection_gap_trial_count": 1,
+  "minimum_yearly_observations": 6
+}

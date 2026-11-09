@@ -1,0 +1,15 @@
+{
+  "frequency": "1min",
+  "index_exchange": "INDICES",
+  "options_exchange": "NSEFO",
+  "runner": {
+    "poll_timeout": 1.0,
+    "square_off_time": "15:15:00",
+    "warmup_bars": 0,
+    "max_history_bars": 2000,
+    "max_runtime_seconds": null,
+    "flatten_on_stop": true,
+    "square_off_enabled": false,
+    "max_snapshot_age_seconds": 300.0
+  }
+}

@@ -7,7 +7,7 @@ filter, or volatility targeting -- raises the Sharpe *and* cuts the drawdown,
 after real costs, in both halves of the sample.
 
 Everything that decides whether a result is real (costs, metrics, the lag, the
-split) comes from ``atr.research.hunt``; this file owns only the signals.
+split) comes from ``forward.research.hunt``; this file owns only the signals.
 
 Two data facts shape the design:
 
@@ -27,12 +27,11 @@ Out:  data/research/regime_overlay.json
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from atr.research.hunt import (
+from forward.research.hunt import (
     ETF_COSTS,
     TRADING_DAYS,
     Result,
@@ -44,9 +43,11 @@ from atr.research.hunt import (
     split_halves,
     stock_universe,
 )
+from forward.data.cached_market_frames import CachedMarketFramesAdapter
+from forward.config.settings import research_data_root
 
-ROOT = Path(__file__).resolve().parents[1]
-OUT = ROOT / "data" / "research" / "regime_overlay.json"
+OUT = research_data_root() / "research" / "regime_overlay.json"
+HISTORY = CachedMarketFramesAdapter()
 
 RISK = "NIFTYBEES"
 GOLD = "GOLDBEES"
@@ -77,7 +78,9 @@ def build_panel(cash_yield: float = CASH_YIELD) -> pd.DataFrame:
     supply one. Results are reported at 6% and again at 0% so the sensitivity of
     every conclusion to this number is visible.
     """
-    panel = load_panel([RISK, GOLD], etf=True, min_bars=2000).dropna()
+    panel = load_panel(
+        [RISK, GOLD], history=HISTORY, etf=True, min_bars=2000
+    ).dropna()
     daily = (1 + cash_yield) ** (1 / TRADING_DAYS) - 1
     panel[CASH] = 100.0 * (1 + daily) ** np.arange(len(panel))
     return panel
@@ -89,7 +92,11 @@ def breadth_series(index: pd.DatetimeIndex, window: int) -> pd.Series:
     Survivorship-biased by construction (these are today's names), so the level
     of the breadth reading is optimistic; only its time variation is used.
     """
-    stocks = load_panel(stock_universe(min_bars=1500), min_bars=1500)
+    stocks = load_panel(
+        stock_universe(HISTORY, min_bars=1500),
+        history=HISTORY,
+        min_bars=1500,
+    )
     above = stocks > stocks.rolling(window, min_periods=window).mean()
     valid = stocks.rolling(window, min_periods=window).mean().notna()
     frac = above.where(valid).sum(axis=1) / valid.sum(axis=1).replace(0, np.nan)

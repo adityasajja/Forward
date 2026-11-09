@@ -24,7 +24,7 @@ sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import strategy_hunt as sh
-from atr.research.hunt import (
+from forward.research.hunt import (
     STOCK_COSTS, ETF_COSTS, Result, TRADING_DAYS,
     buy_and_hold, run_weights, deflated_sharpe,
 )
@@ -50,22 +50,6 @@ TOP_CONFIGS = [
 def load_ohlc_cached(symbols, index):
     """Load OHLCV for symbols, cached per call (called once per universe)."""
     return sh._load_ohlc_for_panel(symbols, index)
-
-
-def test_config_oos(panel, sig_fn, kwargs, k, step, sizing, start, end, costs):
-    """Test a single config on a specific panel period. Returns metrics dict."""
-    sig = sig_fn(panel, **kwargs) if not _needs_ohlc(sig_fn) else None
-    invvol = 1.0 / panel.pct_change().rolling(63, min_periods=40).std()
-    invvol = invvol.replace([np.inf, -np.inf], np.nan)
-    weights = sh._build_weights(panel, sig, invvol, panel.index[0],
-                                panel.index[-1], k, step, sizing)
-    if weights.empty:
-        return {"error": "empty weights"}
-    result = run_weights(panel, weights, costs)
-    m = result.metrics()
-    if m["years"] < 1:
-        return {"error": f"too few years: {m['years']}"}
-    return sh._slim_metrics(m)
 
 
 def validate_top_configs(symbols, start, end):

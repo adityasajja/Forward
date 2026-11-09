@@ -11,12 +11,16 @@ from datetime import UTC, datetime
 
 import pytest
 
-from atr.appdb.repositories import UserRepository
-from atr.execution.oms import OrderDraft, RiskDecision, manual_idempotency_key
-from atr.market_calendar import IST
-from atr.services.execution import VENUE_ACCEPTED, ExecutionService, VenueOutcome
-from atr.services.orders import OrderService
-from atr.services.risk import LiveGuards, RiskStateService, nse_accepting_orders
+from forward.appdb.identity_repository import UserRepository
+from forward.appdb.order_storage import SqlOrderStorage
+from forward.appdb.risk_state_storage import SqlRiskStateStorage
+from forward.config.settings import get_settings
+from forward.execution.oms import OrderDraft, RiskDecision, manual_idempotency_key
+from forward.execution.venue import VENUE_ACCEPTED, VenueOutcome
+from forward.market_calendar import IST
+from forward.services.execution import ExecutionService
+from forward.services.orders import OrderService
+from forward.services.risk import LiveGuards, RiskStateService, nse_accepting_orders
 
 MON_10AM = datetime(2026, 7, 6, 10, 30, tzinfo=IST)  # a trading Monday
 
@@ -28,34 +32,49 @@ def at(day, h, m=0):
 @pytest.fixture()
 def trader(app_db):
     with app_db.session() as session:
-        return UserRepository.create(session, email="t@example.com", username="t", password_hash="x", role="trader")["user_id"]
+        return UserRepository.create(
+            session, email="t@example.com", username="t", password_hash="x", role="trader"
+        )["user_id"]
 
 
 def _draft(user_id, **kw):
-    base = {"user_id": user_id, "symbol": "RELIANCE", "side": "BUY", "quantity": 10, "mode": "LIVE",
-            "order_type": "LIMIT", "limit_price": 2500.0, "requested_price": 2500.0}
+    base = {
+        "user_id": user_id,
+        "symbol": "RELIANCE",
+        "side": "BUY",
+        "quantity": 10,
+        "mode": "LIVE",
+        "order_type": "LIMIT",
+        "limit_price": 2500.0,
+        "requested_price": 2500.0,
+    }
     base.update(kw)
     return OrderDraft(**base)
 
 
 class TestMarketHours:
-    @pytest.mark.parametrize(("when", "open_"), [
-        (at(6, 10, 30), True),     # Monday mid-session
-        (at(6, 9, 0), True),       # pre-open opens the window
-        (at(6, 15, 30), True),
-        (at(6, 8, 59), False),
-        (at(6, 15, 31), False),
-        (at(4, 11, 0), False),     # a Saturday
-        (at(5, 11, 0), False),     # a Sunday
-    ])
+    @pytest.mark.parametrize(
+        ("when", "open_"),
+        [
+            (at(6, 10, 30), True),  # Monday mid-session
+            (at(6, 9, 0), True),  # pre-open opens the window
+            (at(6, 15, 30), True),
+            (at(6, 8, 59), False),
+            (at(6, 15, 31), False),
+            (at(4, 11, 0), False),  # a Saturday
+            (at(5, 11, 0), False),  # a Sunday
+        ],
+    )
     def test_the_window(self, when, open_):
         assert nse_accepting_orders(when) is open_
 
     def test_an_exchange_holiday_is_closed_even_in_hours(self):
-        assert nse_accepting_orders(datetime(2026, 10, 2, 11, 0, tzinfo=IST)) is False  # Gandhi Jayanti
+        assert (
+            nse_accepting_orders(datetime(2026, 10, 2, 11, 0, tzinfo=IST)) is False
+        )  # Gandhi Jayanti
 
     def test_a_utc_timestamp_is_read_in_ist(self):
-        assert nse_accepting_orders(datetime(2026, 7, 6, 5, 0, tzinfo=UTC)) is True    # 10:30 IST
+        assert nse_accepting_orders(datetime(2026, 7, 6, 5, 0, tzinfo=UTC)) is True  # 10:30 IST
         assert nse_accepting_orders(datetime(2026, 7, 6, 11, 0, tzinfo=UTC)) is False  # 16:30 IST
 
     def _guard(self, now, enforce=True):
@@ -83,7 +102,7 @@ class TestMarketHours:
 
 class TestDefaultCap:
     def _service(self, app_db, trader):
-        risk = RiskStateService(app_db)
+        risk = RiskStateService(SqlRiskStateStorage(app_db), get_settings())
         risk.set_execution_mode("live", reason="test", actor="t")
         sent = []
 
@@ -93,7 +112,13 @@ class TestDefaultCap:
                 return VenueOutcome(status=VENUE_ACCEPTED, broker_order_id="B1")
 
         gate = risk.gate(portfolio=_Flat(), instruments=_instruments, now=lambda: MON_10AM)
-        return ExecutionService(orders=OrderService(app_db, risk_gate=gate), venue=Venue()), sent, risk
+        return (
+            ExecutionService(
+                orders=OrderService(SqlOrderStorage(app_db), risk_gate=gate), venue=Venue()
+            ),
+            sent,
+            risk,
+        )
 
     def test_with_no_limit_set_a_big_live_order_is_refused(self, app_db, trader):
         svc, sent, _ = self._service(app_db, trader)
@@ -117,21 +142,21 @@ class TestDefaultCap:
         assert svc2.place(_draft(trader, quantity=1000)).status != "REJECTED" and len(sent2) == 1
 
     def test_paper_orders_are_not_capped(self, app_db, trader):
-        risk = RiskStateService(app_db)  # paper by default
+        risk = RiskStateService(SqlRiskStateStorage(app_db), get_settings())  # paper by default
         gate = risk.gate(portfolio=_Flat(), instruments=_instruments, now=lambda: at(4, 11, 0))
         assert gate(_draft(trader, mode="PAPER", quantity=100000)).allowed
 
 
 class TestWhatTheUiIsTold:
     def test_live_reports_the_default_cap_and_the_missing_daily_loss_limit(self, app_db):
-        risk = RiskStateService(app_db)
+        risk = RiskStateService(SqlRiskStateStorage(app_db), get_settings())
         risk.set_execution_mode("live", reason="t", actor="t")
         prot = risk.snapshot().as_dict()["live_protections"]
         assert prot["defaults_applied"] == {"max_order_notional": 200_000.0}
         assert prot["warnings"] == ["no_daily_loss_limit"]
 
     def test_setting_the_limits_clears_the_default_and_the_warning(self, app_db):
-        risk = RiskStateService(app_db)
+        risk = RiskStateService(SqlRiskStateStorage(app_db), get_settings())
         risk.set_limits({"max_order_notional": 500_000, "max_daily_loss": 25_000}, actor="t")
         prot = risk.snapshot().as_dict()["live_protections"]
         assert prot["defaults_applied"] == {} and prot["warnings"] == []
@@ -144,7 +169,9 @@ class TestDuplicateManualOrders:
         assert a != manual_idempotency_key(user_id="u", client_order_id="abc-12346")
         assert a != manual_idempotency_key(user_id="v", client_order_id="abc-12345")
 
-    def test_a_double_click_places_one_order_and_a_second_deliberate_order_places_another(self, app_db, trader):
+    def test_a_double_click_places_one_order_and_a_second_deliberate_order_places_another(
+        self, app_db, trader
+    ):
         sent = []
 
         class Venue:
@@ -152,12 +179,23 @@ class TestDuplicateManualOrders:
                 sent.append(d)
                 return VenueOutcome(status=VENUE_ACCEPTED, broker_order_id=f"B{len(sent)}")
 
-        svc = ExecutionService(orders=OrderService(app_db, risk_gate=lambda d: RiskDecision.ok()), venue=Venue())
+        svc = ExecutionService(
+            orders=OrderService(SqlOrderStorage(app_db), risk_gate=lambda d: RiskDecision.ok()),
+            venue=Venue(),
+        )
         key = manual_idempotency_key(user_id=trader, client_order_id="click-0001")
         first = svc.place(_draft(trader), idempotency_key=key)
         again = svc.place(_draft(trader), idempotency_key=key)
-        assert first.created and again.duplicate and again.order_id == first.order_id and len(sent) == 1
-        other = svc.place(_draft(trader), idempotency_key=manual_idempotency_key(user_id=trader, client_order_id="click-0002"))
+        assert (
+            first.created
+            and again.duplicate
+            and again.order_id == first.order_id
+            and len(sent) == 1
+        )
+        other = svc.place(
+            _draft(trader),
+            idempotency_key=manual_idempotency_key(user_id=trader, client_order_id="click-0002"),
+        )
         assert other.created and other.order_id != first.order_id and len(sent) == 2
 
 
@@ -166,13 +204,14 @@ class _Flat:
     """A portfolio holding nothing, which is all the notional checks need."""
 
     def position(self, symbol):
-        from atr.core.models import Instrument, Position
+        from forward.core.instrument_models import Instrument
+        from forward.core.portfolio_models import Position
 
         return Position(instrument=Instrument(symbol=symbol))
 
 
 def _instruments(symbol, exchange):
-    from atr.core.models import Instrument
+    from forward.core.instrument_models import Instrument
 
     return Instrument(symbol=symbol, exchange=exchange, currency="INR")
 
@@ -183,23 +222,41 @@ class _Book:
         self.held, self.pnl, self.readable = held, pnl, readable
 
     def position(self, symbol):
-        from atr.core.models import Instrument, Position
+        from forward.core.instrument_models import Instrument
+        from forward.core.portfolio_models import Position
 
-        return Position(instrument=Instrument(symbol=symbol), quantity=self.held, avg_price=100.0, last_price=100.0)
+        return Position(
+            instrument=Instrument(symbol=symbol),
+            quantity=self.held,
+            avg_price=100.0,
+            last_price=100.0,
+        )
 
     def day_pnl(self):
         return self.pnl if self.readable else None
 
 
 def _gate(book, limit):
-    from atr.execution.oms import LimitsRiskGate
-    from atr.execution.risk import RiskEngine, RiskLimits
+    from forward.execution.oms import LimitsRiskGate
+    from forward.execution.risk import RiskEngine, RiskLimits
 
-    return LimitsRiskGate(engine=RiskEngine(RiskLimits(max_daily_loss=limit)), portfolio=book, instruments=_instruments)
+    return LimitsRiskGate(
+        engine=RiskEngine(RiskLimits(max_daily_loss=limit)),
+        portfolio=book,
+        instruments=_instruments,
+    )
 
 
 def _d(side="BUY"):
-    return OrderDraft(user_id="u", symbol="INFY", exchange="NSE", side=side, quantity=1, order_type="LIMIT", limit_price=100.0)
+    return OrderDraft(
+        user_id="u",
+        symbol="INFY",
+        exchange="NSE",
+        side=side,
+        quantity=1,
+        order_type="LIMIT",
+        limit_price=100.0,
+    )
 
 
 class TestDailyLoss:
@@ -221,7 +278,15 @@ class TestDailyLoss:
 
 class TestPriceBand:
     def test_far_limit_refused_near_allowed(self):
-        far = OrderDraft(user_id="u", symbol="INFY", exchange="NSE", side="BUY", quantity=1, order_type="LIMIT", limit_price=1000.0)
+        far = OrderDraft(
+            user_id="u",
+            symbol="INFY",
+            exchange="NSE",
+            side="BUY",
+            quantity=1,
+            order_type="LIMIT",
+            limit_price=1000.0,
+        )
         r = _gate(_Book(), None)(far)
         assert not r.allowed and r.code == "price_band"
         assert _gate(_Book(), None)(_d()).allowed
@@ -237,16 +302,24 @@ class _Multi(_Book):
         return {s: self.position(s) for s in self.held_map}
 
     def position(self, symbol):
-        from atr.core.models import Instrument, Position
+        from forward.core.instrument_models import Instrument
+        from forward.core.portfolio_models import Position
 
-        return Position(instrument=Instrument(symbol=symbol), quantity=self.held_map.get(symbol, 0.0), avg_price=100.0, last_price=100.0)
+        return Position(
+            instrument=Instrument(symbol=symbol),
+            quantity=self.held_map.get(symbol, 0.0),
+            avg_price=100.0,
+            last_price=100.0,
+        )
 
 
 def _gate2(book, **limits):
-    from atr.execution.oms import LimitsRiskGate
-    from atr.execution.risk import RiskEngine, RiskLimits
+    from forward.execution.oms import LimitsRiskGate
+    from forward.execution.risk import RiskEngine, RiskLimits
 
-    return LimitsRiskGate(engine=RiskEngine(RiskLimits(**limits)), portfolio=book, instruments=_instruments)
+    return LimitsRiskGate(
+        engine=RiskEngine(RiskLimits(**limits)), portfolio=book, instruments=_instruments
+    )
 
 
 class TestBookLimits:
@@ -262,7 +335,9 @@ class TestBookLimits:
     def test_gross_exposure_cap_and_exit(self):
         r = _gate2(_Multi({"A": 1}, gross=99_950.0), max_gross_exposure=100_000.0)(_d())
         assert not r.allowed and r.code == "max_gross_exposure"
-        assert _gate2(_Multi({"INFY": 5}, gross=99_950.0), max_gross_exposure=100_000.0)(_d("SELL")).allowed
+        assert _gate2(_Multi({"INFY": 5}, gross=99_950.0), max_gross_exposure=100_000.0)(
+            _d("SELL")
+        ).allowed
 
     def test_unreadable_book_fails_closed(self):
         book = _Multi({})

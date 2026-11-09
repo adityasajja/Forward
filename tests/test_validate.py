@@ -13,9 +13,9 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from atr.backtest.engine import BacktestConfig
-from atr.data.synthetic import SyntheticConfig, SyntheticFeed
-from atr.research.validate import (
+from forward.backtest.engine import BacktestConfig
+from forward.data.synthetic import SyntheticConfig, SyntheticFeed
+from forward.research.validate import (
     ValidationConfig,
     WalkForwardConfig,
     buy_and_hold_equity,
@@ -25,7 +25,7 @@ from atr.research.validate import (
     probabilistic_sharpe_ratio,
     walk_forward,
 )
-from atr.strategy.strategies.sma_crossover import SmaCrossover
+from forward.strategy.strategies.sma_crossover import SmaCrossover
 
 
 def _feed(days: int = 7, symbols=("AAPL",)):
@@ -107,7 +107,7 @@ def test_buy_and_hold_tracks_prices():
 
 def test_buy_and_hold_carries_price_through_missing_bars():
     """A symbol missing from a snapshot must not be valued at zero."""
-    from atr.core.models import Bar, MarketSnapshot
+    from forward.core.market_models import Bar, MarketSnapshot
 
     ts = [datetime(2024, 1, 1, 9, 30), datetime(2024, 1, 1, 9, 31)]
     snaps = [
@@ -210,8 +210,8 @@ def test_verdict_can_pass_on_strong_evidence():
 
     Without this, a harness that always says FAIL would look like it works.
     """
-    from atr.backtest.metrics import compute_metrics
-    from atr.research.validate import _verdict
+    from forward.backtest.metrics import compute_metrics
+    from forward.research.validate import _verdict
 
     idx = pd.date_range("2024-01-01", periods=1000, freq="D")
     rng = np.random.default_rng(3)
@@ -241,7 +241,7 @@ def test_warmup_lets_a_slow_strategy_trade_in_a_short_window():
     That failure is silent and looks identical to "the strategy has no edge",
     which makes it the most dangerous kind of bug in a validation harness.
     """
-    from atr.signals.strategy import SignalEntryStrategy
+    from forward.signals.strategy import SignalEntryStrategy
 
     feed = _feed(days=7)
     strategy_kwargs = {"min_history_bars": 110, "lookback": 120, "allocation": 0.2}
@@ -301,7 +301,7 @@ def test_to_frame_has_one_row_per_fold():
 # Report wording: a probability must not be labelled as a Sharpe ratio
 # --------------------------------------------------------------------------
 def _metrics(sharpe, total_return=20.0, max_dd=12.0, trades=200):
-    from atr.backtest.metrics import Metrics
+    from forward.backtest.metrics import Metrics
 
     return Metrics(
         start_equity=100_000.0, end_equity=120_000.0,
@@ -318,7 +318,7 @@ def _metrics(sharpe, total_return=20.0, max_dd=12.0, trades=200):
 
 def _verdict_for(dsr: float, hurdle: float):
     """Build a Verdict from synthetic fold/metric stand-ins."""
-    from atr.research.validate import _verdict
+    from forward.research.validate import _verdict
 
     return _verdict(
         [],

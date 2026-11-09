@@ -1,0 +1,25 @@
+{
+  "base_strategy_config": "config/study_intraweek_target.json",
+  "stop_fraction": 0.05,
+  "day_trade_reference_notional": 100000.0,
+  "delivery_reference_notional": 1000000.0,
+  "slippage_scenarios": [0.0005, 0.001],
+  "minimum_condition_samples": 500,
+  "day_trade_costs": {
+    "name": "NSE day-trade share",
+    "stt_buy": 0.0,
+    "stt_sell": 0.00025,
+    "stamp_buy": 0.00003,
+    "exchange": 0.0000297,
+    "sebi": 0.000001,
+    "gst": 0.18,
+    "brokerage_pct": 0.0003,
+    "brokerage_cap": 20.0,
+    "slippage": 0.0005
+  },
+  "conditions": {
+    "gap_down_one_pct": -0.01,
+    "gap_down_two_pct": -0.02,
+    "market_return_up_pct": 0.01
+  }
+}

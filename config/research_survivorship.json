@@ -1,0 +1,9 @@
+{
+  "daily_data_directory": "data/iifl_daily/NSEEQ",
+  "selected_panel_file": "data/signals/panel_nseeq_120.parquet",
+  "minimum_history_bars": 1000,
+  "trading_days_per_year": 252,
+  "name_return_quantiles": [0.1, 0.9],
+  "panel_labels": ["all cached with long history", "selected liquidity panel"],
+  "aligned_panel_labels": ["all cached aligned dates", "selected panel aligned dates"]
+}

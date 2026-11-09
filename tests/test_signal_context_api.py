@@ -10,8 +10,8 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from atr.appdb.repositories import UserRepository
-from atr.signal_context.service import get_signal_context_service
+from forward.appdb.identity_repository import UserRepository
+from forward.wiring.signal_context import get_signal_context_service
 
 BASE = "/api/v1/signal-context"
 
@@ -59,8 +59,7 @@ def _seed_context(app_db, user_id: str, signal_id: str = "TCS:2024-06-03") -> No
         sector_hint=sector,
         when=when,
     )
-    with app_db.session() as session:
-        service.record(session, context, user_id=user_id)
+    service.record(context, user_id)
 
 
 def _owner_id(app_db) -> str:

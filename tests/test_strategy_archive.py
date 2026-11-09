@@ -1,12 +1,14 @@
 """Removing a strategy erases it and everything that came from it, unless a paper run is live."""
 
+import pytest
+
 CONFIG = {
     "symbols": ["RELIANCE"],
     "exchange": "NSEEQ",
     "timeframe": "1d",
-    "order_value": 250_000.0,
     "lookback_days": 400,
     "max_open_positions": 1,
+    "signal_basis": "closed_bar",
 }
 
 
@@ -89,29 +91,18 @@ def test_the_researched_stock_list_is_offered_for_a_paper_run(auth_client):
     assert body["total"] == len(body["symbols"])
 
 
-def test_a_name_the_feed_would_misread_is_given_its_exact_spelling(monkeypatch):
-    from types import SimpleNamespace
-
-    from atr.services import strategies as router
+def test_a_name_the_feed_would_misread_is_given_its_exact_spelling():
+    from forward.instruments.strategy_universe import ResearchedStrategyUniverse
 
     class Master:
-        def load_cached(self, exchanges):
-            pass
-
         def find(self, symbol, exchange):
-            table = {"LT-EQ": 11483, "ABB-EQ": 5}
-            if symbol not in table:
+            if symbol not in {"LT-EQ", "ABB-EQ"}:
                 raise KeyError(symbol)
-            return SimpleNamespace(conid=table[symbol])
 
-    monkeypatch.setattr("atr.brokers.iifl.contracts.InstrumentMaster", Master)
-    # the prefix search finds nothing for LT, and the right contract for ABB
-    monkeypatch.setattr(
-        "atr.scanner.resolve_conid",
-        lambda master, name, exchange: (_ for _ in ()).throw(KeyError(name)) if name == "LT" else 5,
-    )
-
-    assert router.broker_safe(["LT", "ABB", "NOTLISTED"]) == ["LT-EQ", "ABB", "NOTLISTED"]
+    assert ResearchedStrategyUniverse._exact_contract_symbol(Master(), "LT") == "LT-EQ"
+    assert ResearchedStrategyUniverse._exact_contract_symbol(Master(), "ABB-EQ") == "ABB-EQ"
+    with pytest.raises(KeyError, match="NOTLISTED-EQ"):
+        ResearchedStrategyUniverse._exact_contract_symbol(Master(), "NOTLISTED")
 
 
 # ---- deleting one version ------------------------------------------------

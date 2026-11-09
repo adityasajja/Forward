@@ -12,7 +12,7 @@ import pathlib
 
 from sqlalchemy import inspect
 
-from atr.appdb.schema import app_metadata
+from forward.appdb.metadata import app_metadata
 
 DOCS = pathlib.Path(__file__).resolve().parents[1] / "docs" / "DATA_MODEL.md"
 
@@ -80,8 +80,7 @@ def test_create_all_produces_exactly_the_expected_tables():
 
 def test_the_data_model_document_describes_every_table(app_db):
     """A table the code writes and the doc does not mention is one nobody finds."""
-    if not DOCS.exists():  # pragma: no cover - docs ship with the repo
-        return
+    assert DOCS.is_file(), f"required data model document is missing: {DOCS}"
     text = DOCS.read_text(encoding="utf-8")
     missing = sorted(name for name in EXPECTED_TABLES if f"`{name}`" not in text)
     assert missing == [], f"docs/DATA_MODEL.md does not mention: {missing}"

@@ -1,6 +1,6 @@
-"""Generate the ATR desktop icon (multi-size ICO) with no third-party deps.
+"""Generate the Forward desktop icon (multi-size ICO) with no third-party deps.
 
-Outputs assets/atr.ico (16..256px). Also writes a 256px PNG copy.
+Outputs assets/forward.ico (16..256px). Also writes a 256px PNG copy.
 """
 
 from __future__ import annotations
@@ -101,9 +101,9 @@ def main() -> None:
     for size in (16, 32, 48, 64, 128, 256):
         images.append((size, _png(size, size, render_px(size))))
 
-    (assets / "atr.ico").write_bytes(_ico(images))
-    (assets / "atr-256.png").write_bytes(images[-1][1])
-    print(f"wrote {assets / 'atr.ico'} ({len(images)} sizes) and atr-256.png")
+    (assets / "forward.ico").write_bytes(_ico(images))
+    (assets / "forward-256.png").write_bytes(images[-1][1])
+    print(f"wrote {assets / 'forward.ico'} ({len(images)} sizes) and forward-256.png")
 
 
 if __name__ == "__main__":

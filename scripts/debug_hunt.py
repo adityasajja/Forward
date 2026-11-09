@@ -1,37 +1,83 @@
-import sys, traceback
-sys.path.insert(0, 'src')
-sys.path.insert(0, 'scripts')
-try:
-    import strategy_hunt as sh
-    from atr.research.hunt import run_weights, STOCK_COSTS, buy_and_hold
-    from pathlib import Path
-    import pandas as pd, numpy as np
+"""Inspect one configured strategy-hunt research window."""
 
-    ROOT = Path('.').resolve()
-    syms = list(set(sh.parse_universe(ROOT / 'data' / 'universe' / 'n50.txt') +
-                   sh.parse_universe(ROOT / 'data' / 'universe' / 'mid150.txt')))
-    print('Loaded', len(syms), 'symbols')
-    panel = sh.build_universe_panel(syms, pd.Timestamp('2020-01-01'), pd.Timestamp('2024-05-15'), min_bars=250)
-    print('Panel:', panel.shape)
-    mid = len(panel) // 2
-    train_panel = panel.iloc[:mid]
-    print('Train panel:', train_panel.shape)
+from __future__ import annotations
 
-    # Benchmark
-    bh = buy_and_hold(train_panel, panel.columns[0], STOCK_COSTS)
-    bhm = bh.metrics()
-    print('B&H CAGR:', bhm['cagr_pct'], 'Sharpe:', bhm['sharpe'], 'Weekly:', bhm.get('weekly_mean_pct', 'N/A'))
-    print('B&H metrics keys:', list(bhm.keys()))
+import argparse
+import json
+from pathlib import Path
 
-    sig = sh.signal_momentum(train_panel, lookback=5)
-    invvol = 1.0 / train_panel.pct_change().rolling(63, min_periods=40).std()
-    invvol = invvol.replace([np.inf, -np.inf], np.nan)
-    weights = sh._build_weights(train_panel, sig, invvol, train_panel.index[0], train_panel.index[-1], 10, 5, 'equal')
-    print('Weights:', weights.shape, 'sum:', weights.sum().sum(), 'NaN count:', weights.isna().sum().sum())
-    result = run_weights(train_panel, weights, STOCK_COSTS)
-    m = result.metrics()
-    print('Strategy CAGR:', m['cagr_pct'], 'Sharpe:', m['sharpe'], 'Weekly:', m.get('weekly_mean_pct', 'N/A'))
-    print('Strategy metrics keys:', list(m.keys()))
-    print('Returns len:', len(result.returns), 'nonzero:', (result.returns != 0).sum())
-except Exception:
-    traceback.print_exc()
+import numpy as np
+import pandas as pd
+import strategy_hunt as hunt
+
+from forward.research.hunt import Costs, buy_and_hold, run_weights
+
+ROOT = Path(__file__).resolve().parents[1]
+CONFIG_PATH = ROOT / "config" / "debug_hunt.json"
+
+
+def main() -> int:
+    """Run the diagnostic with its explicit parameter file."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", type=Path, default=CONFIG_PATH)
+    config_path = parser.parse_args().config
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    print(f"Configuration: {config_path.resolve()}")
+    symbols = list(dict.fromkeys(
+        symbol
+        for relative_path in config["universe_files"]
+        for symbol in hunt.parse_universe(ROOT / relative_path)
+    ))
+    costs = Costs(**config["costs"])
+    print("Loaded", len(symbols), "symbols")
+    panel = hunt.build_universe_panel(
+        symbols,
+        pd.Timestamp(config["from_date"]),
+        pd.Timestamp(config["to_date"]),
+        min_bars=config["minimum_bars"],
+    )
+    print("Panel:", panel.shape)
+    split_index = int(len(panel) * config["split_fraction"])
+    train_panel = panel.iloc[:split_index]
+    print("Train panel:", train_panel.shape)
+
+    benchmark = buy_and_hold(train_panel, panel.columns[0], costs)
+    benchmark_metrics = benchmark.metrics()
+    print(
+        "B&H CAGR:", benchmark_metrics["cagr_pct"],
+        "Sharpe:", benchmark_metrics["sharpe"],
+        "Weekly:", benchmark_metrics.get("weekly_mean_pct", "N/A"),
+    )
+    print("B&H metrics keys:", list(benchmark_metrics.keys()))
+
+    signal = hunt.signal_momentum(train_panel, lookback=config["momentum_lookback"])
+    inverse_volatility = 1.0 / train_panel.pct_change().rolling(
+        config["inverse_volatility_lookback"],
+        min_periods=config["inverse_volatility_minimum_periods"],
+    ).std()
+    inverse_volatility = inverse_volatility.replace([np.inf, -np.inf], np.nan)
+    weights = hunt._build_weights(
+        train_panel,
+        signal,
+        inverse_volatility,
+        train_panel.index[0],
+        train_panel.index[-1],
+        config["weighting_lookback"],
+        config["weighting_step"],
+        config["weighting_mode"],
+    )
+    print("Weights:", weights.shape, "sum:", weights.sum().sum(), "NaN count:", weights.isna().sum().sum())
+    result = run_weights(train_panel, weights, costs)
+    metrics = result.metrics()
+    print(
+        "Strategy CAGR:", metrics["cagr_pct"],
+        "Sharpe:", metrics["sharpe"],
+        "Weekly:", metrics.get("weekly_mean_pct", "N/A"),
+    )
+    print("Strategy metrics keys:", list(metrics.keys()))
+    print("Returns len:", len(result.returns), "nonzero:", (result.returns != 0).sum())
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

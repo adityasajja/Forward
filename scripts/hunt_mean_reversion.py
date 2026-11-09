@@ -28,9 +28,8 @@ import json
 import numpy as np
 import pandas as pd
 
-from atr.research.hunt import (
+from forward.research.hunt import (
     ETF_COSTS,
-    ROOT,
     STOCK_COSTS,
     TRADING_DAYS,
     Result,
@@ -43,8 +42,11 @@ from atr.research.hunt import (
     split_halves,
     stock_universe,
 )
+from forward.data.cached_market_frames import CachedMarketFramesAdapter
+from forward.config.settings import research_data_root
 
-OUT = ROOT / "data" / "research" / "mean_reversion.json"
+OUT = research_data_root() / "research" / "mean_reversion.json"
+HISTORY = CachedMarketFramesAdapter()
 
 #: Liquidity is ranked on this window only. Ranking on the full sample would
 #: quietly import knowledge of which names stayed tradable.
@@ -59,12 +61,8 @@ def liquid_stocks(names: list[str], limit: int = MAX_STOCKS) -> list[str]:
     """Top ``limit`` names by median rupee volume in the *early* sub-window."""
     start, end = (pd.Timestamp(x) for x in LIQUIDITY_WINDOW)
     scored: list[tuple[float, str]] = []
-    for name in names:
-        path = ROOT / "data" / "iifl_daily" / "NSEEQ" / f"{name}.parquet"
-        try:
-            frame = pd.read_parquet(path, columns=["ts", "close", "volume"])
-        except Exception:  # noqa: BLE001 - a corrupt file is simply not in the universe
-            continue
+    for name, frame in HISTORY.frames("NSEEQ", names).items():
+        frame = frame[["ts", "close", "volume"]]
         window = frame[(frame["ts"] >= start) & (frame["ts"] <= end)]
         if len(window) < 200:
             continue
@@ -85,12 +83,8 @@ def liquid_etfs(names: list[str], min_rupee_volume: float = 5e5) -> list[str]:
     """
     start, end = (pd.Timestamp(x) for x in LIQUIDITY_WINDOW)
     keep = []
-    for name in names:
-        path = ROOT / "data" / "iifl_daily" / "ETF" / f"{name}.parquet"
-        try:
-            frame = pd.read_parquet(path, columns=["ts", "close", "volume"])
-        except Exception:  # noqa: BLE001
-            continue
+    for name, frame in HISTORY.frames("ETF", names).items():
+        frame = frame[["ts", "close", "volume"]]
         window = frame[(frame["ts"] >= start) & (frame["ts"] <= end)]
         if len(window) < 200:
             continue
@@ -266,10 +260,10 @@ def main() -> None:  # noqa: C901 - a research script is a sequence of experimen
     trials: list[dict] = []
 
     # -- universes ---------------------------------------------------------
-    stock_names = liquid_stocks(stock_universe(min_bars=1500))
-    stocks = load_panel(stock_names, min_bars=1500).ffill()
-    etf_names = etf_universe()
-    etfs = load_panel(etf_names, etf=True).ffill()
+    stock_names = liquid_stocks(stock_universe(HISTORY, min_bars=1500))
+    stocks = load_panel(stock_names, history=HISTORY, min_bars=1500).ffill()
+    etf_names = etf_universe(HISTORY)
+    etfs = load_panel(etf_names, history=HISTORY, etf=True).ffill()
     etfs_liquid = etfs[liquid_etfs(etf_names)].dropna(how="all")
     print(f"stocks {stocks.shape}  etfs {etfs.shape}  liquid etfs {etfs_liquid.shape}")
 

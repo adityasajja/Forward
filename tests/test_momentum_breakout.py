@@ -8,14 +8,13 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
-import pytest
-
-from atr.backtest.costs import SlippageModel
-from atr.backtest.engine import BacktestConfig, BacktestEngine
-from atr.core.enums import AssetClass
-from atr.core.models import Bar, Instrument, MarketSnapshot
-from atr.data.base import ListFeed
-from atr.strategy.strategies import MomentumBreakout
+from forward.backtest.engine import BacktestConfig, BacktestEngine
+from forward.core.costs import SlippageModel
+from forward.core.enums import AssetClass
+from forward.core.feeds import ListFeed
+from forward.core.instrument_models import Instrument
+from forward.core.market_models import Bar, MarketSnapshot
+from forward.strategy.strategies import MomentumBreakout
 
 EQ = Instrument(symbol="TEST", asset_class=AssetClass.EQUITY, currency="INR")
 
@@ -36,7 +35,7 @@ def _feed_with_volumes(prices, volumes, symbol="TEST"):
             ts=_START + timedelta(minutes=i),
             bars={symbol: _make_bar(_START + timedelta(minutes=i), p, volume=v)},
         )
-        for i, (p, v) in enumerate(zip(prices, volumes))
+        for i, (p, v) in enumerate(zip(prices, volumes, strict=True))
     ]
     return ListFeed(snaps, {symbol: EQ})
 
@@ -52,7 +51,7 @@ def _feed(prices, symbol="TEST", base_volume=10_000):
 
 
 def test_strategy_registered():
-    from atr.strategy.strategies import STRATEGIES
+    from forward.strategy.strategies import STRATEGIES
     assert "momentum_breakout" in STRATEGIES
     assert STRATEGIES["momentum_breakout"] is MomentumBreakout
 

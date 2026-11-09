@@ -21,7 +21,6 @@ import base64
 import json
 import os
 import subprocess
-import sys
 import time
 import urllib.request
 
@@ -29,11 +28,6 @@ import websockets
 
 PORT = 9223
 OUT_DIR = r"D:\ALGO\.workbuddy-ai\shots-paper"
-
-#: The probe's own session cookie. Reusing the browser's would work, but a
-#: cookie jar we control means the probe can assert on the API as the same
-#: principal the page is using, without guessing at the page's state.
-COOKIE = ""
 
 #: A sentence for the reason prompts. `pause` / `stop` / `reset` all require
 #: ``reason: str = Field(min_length=1)`` on the backend, so a blank string is a
@@ -320,12 +314,12 @@ def login() -> str:
     reads the probe credentials from the environment, and says so plainly when
     they are absent rather than failing later with a confusing 401.
     """
-    identifier = os.environ.get("ATR_PROBE_USER", "aditya")
-    password = os.environ.get("ATR_PROBE_PASSWORD")
-    if not password:
+    identifier = os.environ.get("FORWARD_PROBE_USER")
+    password = os.environ.get("FORWARD_PROBE_PASSWORD")
+    if not identifier or not password:
         raise SystemExit(
-            "set ATR_PROBE_PASSWORD (and optionally ATR_PROBE_USER) to a real "
-            "account on this instance; the probe drives the UI as that user."
+            "set FORWARD_PROBE_USER and FORWARD_PROBE_PASSWORD to a real account "
+            "on this instance; the probe drives the UI as that user."
         )
     body = json.dumps({"identifier": identifier, "password": password}).encode()
     req = urllib.request.Request(
@@ -369,7 +363,7 @@ class Checks:
 
 async def main() -> int:
     wait_for_backend()
-    token = COOKIE or login()
+    token = login()
     checks = Checks()
 
     proc = subprocess.Popen(
@@ -471,7 +465,7 @@ async def main() -> int:
             await cmd(
                 "Network.setCookie",
                 {
-                    "name": "atr_session",
+                    "name": "forward_session",
                     "value": token,
                     "domain": "127.0.0.1",
                     "path": "/",
@@ -1010,8 +1004,4 @@ async def main() -> int:
 
 
 if __name__ == "__main__":
-    # Optionally pass a token; otherwise the probe logs in with
-    # ATR_PROBE_USER / ATR_PROBE_PASSWORD.
-    if len(sys.argv) > 1:
-        COOKIE = sys.argv[1]
     raise SystemExit(asyncio.run(main()))

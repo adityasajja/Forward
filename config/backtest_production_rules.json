@@ -1,0 +1,49 @@
+{
+  "exchange": "NSEEQ",
+  "universe": [
+    "RELIANCE", "HDFCBANK", "ICICIBANK", "INFY", "TCS", "SBIN", "AXISBANK",
+    "KOTAKBANK", "LT", "TITAN", "SUNPHARMA", "ULTRACEMCO", "MARUTI",
+    "BHARTIARTL", "HCLTECH", "TATASTEEL", "WIPRO", "ADANIENT"
+  ],
+  "splits": [[500, 250], [400, 200], [600, 300], [700, 350]],
+  "backtest": {
+    "initial_cash": 100000.0,
+    "fill_on_next_open": true,
+    "participation_rate": 1.0,
+    "equity_margin_ratio": 1.0,
+    "enforce_margin": true,
+    "allow_short": true,
+    "risk_free_rate": 0.0,
+    "square_off_eod": false,
+    "entry_cutoff": "14:45",
+    "square_off_time": "15:15",
+    "risk": null,
+    "assert_invariants": true,
+    "warmup_bars": 0
+  },
+  "commission": {
+    "per_share": 0.005,
+    "per_contract": 0.85,
+    "min_per_order": 1.0,
+    "max_pct_of_trade": 0.01,
+    "pct_of_notional": 0.0003
+  },
+  "slippage": {
+    "bps": 5.0,
+    "ticks": 0.0,
+    "random_seed": null
+  },
+  "walk_forward": {
+    "step_bars": null,
+    "anchored": false,
+    "warmup_bars": 0,
+    "selection_metric": "sharpe"
+  },
+  "validation": {
+    "min_folds": 3,
+    "min_trades": 100,
+    "min_confidence": 0.95,
+    "max_drawdown_pct": 40.0,
+    "require_beat_benchmark": true
+  }
+}

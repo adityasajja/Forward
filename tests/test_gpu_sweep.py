@@ -5,7 +5,7 @@ import pytest
 
 pytest.importorskip("torch", reason="the tensor sweep needs torch (gpu dependency group)")
 
-from atr.compute.sweep import reference_sma_cross, sma_cross_sweep
+from forward.compute.sweep import reference_sma_cross, sma_cross_sweep
 
 
 def _prices(seed=3, bars=320, names=6):
@@ -50,6 +50,6 @@ def test_gpu_matches_cpu_when_available():
     close = _prices()
     a = sma_cross_sweep(close, [5, 10], [20, 40], device="cpu").rows
     b = sma_cross_sweep(close, [5, 10], [20, 40], device="cuda").rows
-    for x, y in zip(a, b):
+    for x, y in zip(a, b, strict=True):
         assert x["entries"] == y["entries"]
         assert x["total_return"] == pytest.approx(y["total_return"], abs=1e-4)

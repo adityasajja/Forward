@@ -1,0 +1,23 @@
+{
+  "daily_data_directory": "data/iifl_daily/NSEEQ",
+  "minimum_history_bars": 1000,
+  "trading_days_per_year": 252,
+  "split_fraction": 0.5,
+  "overlays": {
+    "vol_scale": {
+      "lookback_days": 20,
+      "target_annual_volatility": 0.15,
+      "maximum_weight": 1.0
+    },
+    "vol_brake": {
+      "median_lookback_days": 252
+    },
+    "trend": {
+      "moving_average_days": 200
+    },
+    "drawdown_brake": {
+      "trigger_drawdown_fraction": 0.1,
+      "reduced_weight": 0.5
+    }
+  }
+}

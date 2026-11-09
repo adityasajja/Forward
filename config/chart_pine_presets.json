@@ -1,0 +1,32 @@
+[
+  {
+    "name": "Golden EMA Cross (9 / 21)",
+    "description": "Fast trend direction using Exponential Moving Averages",
+    "code": "//@version=6\n// Golden EMA Cross Strategy\nfast = ta.ema(close, 9);\nslow = ta.ema(close, 21);\nplot(fast, \"EMA 9\", color.aqua, 2);\nplot(slow, \"EMA 21\", color.fuchsia, 2);"
+  },
+  {
+    "name": "Supertrend (10, 3.0)",
+    "description": "Volatility trailing stop and reversal trend indicator",
+    "code": "//@version=6\n// Classic Supertrend\n[trend, dir] = ta.supertrend(3.0, 10);\nplot(trend, \"Supertrend\", color.orange, 2);"
+  },
+  {
+    "name": "Bollinger Bands (20, 2.0)",
+    "description": "Standard deviation bands around 20-period SMA",
+    "code": "//@version=6\n// Bollinger Bands v6\n[basis, upper, lower] = ta.bb(close, 20, 2.0);\nplot(basis, \"Basis\", color.blue, 1);\nplot(upper, \"Upper Band\", color.green, 2);\nplot(lower, \"Lower Band\", color.red, 2);"
+  },
+  {
+    "name": "Hull Moving Average (HMA 20)",
+    "description": "Extremely smooth low-lag moving average",
+    "code": "//@version=6\n// Hull Moving Average\nh = ta.hma(close, 20);\nplot(h, \"HMA 20\", color.lime, 2);"
+  },
+  {
+    "name": "Keltner Channels (20, 1.5)",
+    "description": "ATR volatility envelope around EMA",
+    "code": "//@version=6\n// Keltner Channels\n[basis, upper, lower] = ta.kc(close, 20, 1.5);\nplot(basis, \"KC Basis\", color.yellow, 1);\nplot(upper, \"KC Upper\", color.teal, 2);\nplot(lower, \"KC Lower\", color.teal, 2);"
+  },
+  {
+    "name": "RSI Momentum Bands",
+    "description": "Custom overlay using 14-period RSI levels",
+    "code": "//@version=6\n// RSI with overbought / oversold horizontal levels\nr = ta.rsi(close, 14);\nplot(r, \"RSI 14\", color.purple, 2);\nhline(70, \"Overbought\", color.red);\nhline(30, \"Oversold\", color.green);"
+  }
+]

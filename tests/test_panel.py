@@ -6,7 +6,7 @@ import time
 import pandas as pd
 import pytest
 
-from atr.data import panel
+from forward.data import panel
 
 
 def _write(path, closes, start="2026-01-01"):
@@ -24,8 +24,7 @@ def _write(path, closes, start="2026-01-01"):
 
 
 @pytest.fixture()
-def source(tmp_path, monkeypatch):
-    monkeypatch.setattr(panel, "PANEL_ROOT", tmp_path / "panel")
+def source(tmp_path):
     panel.clear()
     panel._paths_for.cache_clear()
     src = tmp_path / "iifl_daily" / "NSEEQ"
@@ -78,9 +77,66 @@ def test_scans_are_rate_limited(source, monkeypatch):
 
 
 def test_load_cached_returns_copies_callers_may_modify(source, monkeypatch):
-    from atr.data import history
+    from forward.data import history
 
     monkeypatch.setattr(history, "CACHE_ROOT", source.parent)
     first = history.load_cached("NSEEQ")
     first["AAA-EQ"]["close"] = -1.0
     assert history.load_cached("NSEEQ")["AAA-EQ"]["close"].iloc[0] == 10.0
+
+def test_panel_persist_does_not_block_readers_and_coalesces_updates(source, monkeypatch):
+    import threading
+
+    panel.frames(source)
+    entered, release, read_done = threading.Event(), threading.Event(), threading.Event()
+    original_convert = panel.pl.from_pandas
+    original_thread = threading.Thread
+    workers = []
+    writes = []
+    original_write = panel._write_panel
+
+    def convert(frame, *args, **kwargs):
+        if not entered.is_set():
+            entered.set()
+            assert release.wait(5)
+        return original_convert(frame, *args, **kwargs)
+
+    def thread(*args, **kwargs):
+        result = original_thread(*args, **kwargs)
+        if kwargs.get('name') == 'forward-panel-persist':
+            workers.append(result)
+        return result
+
+    def write(frame, state, *args):
+        writes.append(dict(state))
+        return original_write(frame, state, *args)
+
+    monkeypatch.setattr(panel.pl, 'from_pandas', convert)
+    monkeypatch.setattr(panel.threading, 'Thread', thread)
+    monkeypatch.setattr(panel, '_write_panel', write)
+    _write(source / 'AAA-EQ.parquet', [10.0, 11.0, 13.0])
+    panel.frames(source, max_age=0)
+    assert entered.wait(2)
+    _write(source / 'AAA-EQ.parquet', [10.0, 11.0, 14.0, 15.0])
+    output = []
+
+    def read():
+        output.append(panel.frames(source, max_age=0)['AAA-EQ']['close'].iloc[-1])
+        read_done.set()
+
+    reader = original_thread(target=read)
+    reader.start()
+    try:
+        assert read_done.wait(0.5), 'reader blocked behind background conversion'
+        assert output == [15.0]
+        assert len(workers) == 1
+    finally:
+        release.set()
+        reader.join(5)
+        for worker in workers:
+            worker.join(5)
+            assert not worker.is_alive()
+    assert len(writes) == 2  # first snapshot, then coalesced latest state
+    assert writes[-1] == panel._scan(source)
+    panel.clear()
+    assert panel.frames(source)['AAA-EQ']['close'].iloc[-1] == 15.0

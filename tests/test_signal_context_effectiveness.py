@@ -6,9 +6,9 @@ The chain under test is the whole point of the Context-Aware Signal Engine:
            -> context effectiveness analysis -> statistical observation
 
 Nothing here is a stand-in. Contexts are recorded through
-:class:`~atr.signal_context.service.SignalContextService`; outcomes are resolved
+:class:`~forward.signal_context.service.SignalContextService`; outcomes are resolved
 from the real order book and trade journal; the analysis runs through
-:mod:`atr.research.learning_context`; and supported findings are persisted as
+:mod:`forward.research.learning_context`; and supported findings are persisted as
 learning observations. The suite also pins the non-interference promise: running
 the analysis changes no strategy, version or deployment.
 
@@ -20,26 +20,35 @@ keeps the fixture from depending on which way a random walk happened to lean.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 
-from atr.appdb.engine import utcnow
-from atr.appdb.repositories import (
-    DeploymentRepository,
-    LearningObservationRepository,
-    OrderRepository,
-    StrategyRepository,
-    TradeJournalRepository,
-    UserRepository,
-)
-from atr.appdb.schema import deployments, strategies, strategy_versions
-from atr.research.learning_evidence import (
+from forward.appdb.deployment_repository import DeploymentRepository
+from forward.appdb.engine import utcnow
+from forward.appdb.execution_schema import deployments
+from forward.appdb.identity_repository import UserRepository
+from forward.appdb.learning_observation_repository import LearningObservationRepository
+from forward.appdb.learning_storage import SqlLearningStorage
+from forward.appdb.order_repository import OrderRepository
+from forward.appdb.portfolio_storage import SqlPortfolioStorage
+from forward.appdb.strategy_backtest_schema import strategies, strategy_versions
+from forward.appdb.strategy_repository import StrategyRepository
+from forward.appdb.trade_journal_repository import TradeJournalRepository
+from forward.config.settings import get_settings
+from forward.core.learning_evidence import (
     CLASS_PAPER_FORWARD,
     GRADE_FORWARD,
 )
-from atr.services.learning import LearningDatasetBuilder
-from atr.signal_context.engine import SignalContextEngine
-from atr.signal_context.service import SignalContextService
+from forward.data.learning_artifacts import LocalLearningArtifactsAdapter
+from forward.services.learning_dataset import LearningDatasetBuilder
+from forward.signal_context.engine import SignalContextEngine
+from forward.signal_context.service import SignalContextService
+from tests.market_data_fakes import (
+    InMemoryMarketFramesPort,
+    signal_context_service_for_test,
+)
 
 HIGH_SCORE = 90
 LOW_SCORE = 10
@@ -211,10 +220,16 @@ def _table_rows(app_db, table) -> list[dict]:
 
 def test_forward_and_in_sample_outcomes_are_reported_separately(app_db):
     user_id = _make_user(app_db)
-    service = SignalContextService(db=app_db)
+    service = signal_context_service_for_test(
+        app_db,
+        data_root=Path(get_settings().research_data_directory),
+    )
 
     # One backtest context joined to a closed backtest trade (in-sample)...
-    from atr.appdb.repositories import BacktestArtefactRepository, BacktestRunRepository
+    from forward.appdb.backtest_repository import (
+        BacktestArtefactRepository,
+        BacktestRunRepository,
+    )
 
     with app_db.session() as session:
         run = BacktestRunRepository.create(
@@ -263,9 +278,7 @@ def test_forward_and_in_sample_outcomes_are_reported_separately(app_db):
         )
 
     # ...and one forward context joined to a closed paper trade.
-    _seed_forward(
-        app_db, service, user_id, prefix="FWD", count=1, score=90, return_pct=2.0
-    )
+    _seed_forward(app_db, service, user_id, prefix="FWD", count=1, score=90, return_pct=2.0)
 
     result = service.effectiveness(user_id, min_sample=MIN_SAMPLE)
 
@@ -290,7 +303,10 @@ def test_forward_and_in_sample_outcomes_are_reported_separately(app_db):
 
 def test_supported_forward_buckets_are_persisted_as_observations(app_db):
     user_id = _make_user(app_db)
-    service = SignalContextService(db=app_db)
+    service = signal_context_service_for_test(
+        app_db,
+        data_root=Path(get_settings().research_data_directory),
+    )
 
     _seed_forward(
         app_db, service, user_id, prefix="HI", count=12, score=HIGH_SCORE, return_pct=HIGH_RETURN
@@ -307,9 +323,7 @@ def test_supported_forward_buckets_are_persisted_as_observations(app_db):
     assert result["score_verdict"]["means"]["80-100"] == float(HIGH_RETURN)
     assert result["score_verdict"]["means"]["0-39"] == float(LOW_RETURN)
 
-    observations = service.record_effectiveness_observations(
-        user_id, min_sample=MIN_SAMPLE
-    )
+    observations = service.record_effectiveness_observations(user_id, min_sample=MIN_SAMPLE)
     assert observations, "a supported forward sample must produce an observation"
 
     buckets = {o["condition_bucket"] for o in observations}
@@ -334,7 +348,10 @@ def test_supported_forward_buckets_are_persisted_as_observations(app_db):
 
 def test_a_sample_below_the_floor_persists_nothing(app_db):
     user_id = _make_user(app_db)
-    service = SignalContextService(db=app_db)
+    service = signal_context_service_for_test(
+        app_db,
+        data_root=Path(get_settings().research_data_directory),
+    )
 
     _seed_forward(
         app_db, service, user_id, prefix="SM", count=3, score=HIGH_SCORE, return_pct=HIGH_RETURN
@@ -361,7 +378,10 @@ def test_a_sample_below_the_floor_persists_nothing(app_db):
 
 def test_effectiveness_leaves_strategy_and_deployment_tables_untouched(app_db):
     user_id = _make_user(app_db)
-    service = SignalContextService(db=app_db)
+    service = signal_context_service_for_test(
+        app_db,
+        data_root=Path(get_settings().research_data_directory),
+    )
 
     with app_db.session() as session:
         strategy = StrategyRepository.create(
@@ -408,11 +428,12 @@ def test_effectiveness_leaves_strategy_and_deployment_tables_untouched(app_db):
 # ---------------------------------------------------------------------------
 
 
-def test_a_forward_trade_appears_in_both_the_dataset_and_effectiveness(
-    app_db, tmp_path
-):
+def test_a_forward_trade_appears_in_both_the_dataset_and_effectiveness(app_db, tmp_path):
     user_id = _make_user(app_db)
-    service = SignalContextService(db=app_db)
+    service = signal_context_service_for_test(
+        app_db,
+        data_root=Path(get_settings().research_data_directory),
+    )
 
     signal_id = "LINK:2024-06-03"
     with app_db.session() as session:
@@ -460,7 +481,12 @@ def test_a_forward_trade_appears_in_both_the_dataset_and_effectiveness(
             exit_ts=utcnow(),
         )
 
-    dataset = LearningDatasetBuilder(db=app_db, cache_root=tmp_path, frames={}).build()
+    dataset = LearningDatasetBuilder(
+        portfolio_storage=SqlPortfolioStorage(app_db),
+        storage=SqlLearningStorage(app_db),
+        artifacts=LocalLearningArtifactsAdapter(tmp_path),
+        market_history=InMemoryMarketFramesPort({}),
+    ).build()
     assert len(dataset) == 1
     row = dataset.rows[0]
     assert row["evidence_class"] == CLASS_PAPER_FORWARD
@@ -479,11 +505,12 @@ def test_a_forward_trade_appears_in_both_the_dataset_and_effectiveness(
 def test_forward_return_pct_is_derived_from_the_episode_prices(app_db):
     """``trade_journal`` has no ``return_pct`` column; the service derives it."""
     user_id = _make_user(app_db)
-    service = SignalContextService(db=app_db)
-
-    _seed_forward(
-        app_db, service, user_id, prefix="PC", count=1, score=HIGH_SCORE, return_pct=2.5
+    service = signal_context_service_for_test(
+        app_db,
+        data_root=Path(get_settings().research_data_directory),
     )
+
+    _seed_forward(app_db, service, user_id, prefix="PC", count=1, score=HIGH_SCORE, return_pct=2.5)
 
     result = service.effectiveness(user_id, min_sample=MIN_SAMPLE)
     assert result["forward_with_metric"] == 1

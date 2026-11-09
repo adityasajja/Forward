@@ -27,7 +27,7 @@ from pathlib import Path
 
 import pytest
 
-from atr.research import learning_paper as paper
+from forward.research import learning_paper as paper
 
 # ---------------------------------------------------------------------------
 # fixtures
@@ -451,8 +451,8 @@ def test_the_ledger_module_imports_nothing_from_services():
             imported.add(node.module)
         elif isinstance(node, ast.Import):
             imported.update(alias.name for alias in node.names)
-    assert not any(name.startswith("atr.services") for name in imported), imported
-    assert not any(name.startswith("atr.appdb") for name in imported), imported
+    assert not any(name.startswith("forward.services") for name in imported), imported
+    assert not any(name.startswith("forward.appdb") for name in imported), imported
 
 
 def test_a_week_that_is_not_a_date_is_skipped(tmp_path: Path):

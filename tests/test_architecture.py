@@ -2,15 +2,16 @@
 
 A boundary that lives only in a README is a boundary that erodes. These tests
 parse every module's imports and fail on a forbidden edge, so a new ``from
-atr.appdb import ...`` inside the backtester is caught in CI instead of being
+forward.appdb import ...`` inside the backtester is caught in CI instead of being
 discovered when someone tries to extract a service.
 
 The rules, and why each one exists:
 
-* ``atr.core`` imports nothing else in ``atr`` — it is the vocabulary every other
+* ``forward.core`` imports no other package layer — it is the vocabulary every other
   layer speaks, so a dependency in it would be a cycle waiting to happen.
 * compute layers (``backtest``, ``research``, ``strategy``, ``signals``,
-  ``execution``) may not reach into ``api``, ``appdb``, ``services`` or ``auth``.
+  ``execution``) may not reach into ``api``, ``appdb``, ``services``, ``auth``
+  or ``data``.
   A backtest that can read a user table is a backtest that can be run as someone
   else, and a strategy that can place an order has no risk engine in front of it.
 * storage and adapter layers (``appdb``, ``data``, ``brokers``, ``auth``) may not
@@ -28,9 +29,9 @@ import pathlib
 
 import pytest
 
-SRC = pathlib.Path(__file__).resolve().parents[1] / "src" / "atr"
+SRC = pathlib.Path(__file__).resolve().parents[1] / "src" / "forward"
 
-#: Top-level package under src/atr → its layer name.
+#: Top-level package under src/forward → its layer name.
 LAYERS = {
     "core",
     "appdb",
@@ -44,13 +45,32 @@ LAYERS = {
     "strategy",
     "signals",
     "execution",
+    "analytics",
     "alerts",
+    "compute",
+    "config",
+    "infra",
+    "insights",
     "instruments",
     "audit",
     "live",
+    "jobs",
+    "market_intel",
+    "optimization",
+    "screener",
+    "signal_context",
 }
 
-COMPUTE = {"backtest", "research", "strategy", "signals", "execution"}
+COMPUTE = {
+    "backtest",
+    "research",
+    "strategy",
+    "signals",
+    "execution",
+    "compute",
+    "optimization",
+    "screener",
+}
 STORAGE = {"appdb", "data", "brokers", "auth"}
 
 
@@ -59,29 +79,42 @@ def _module_layer(path: pathlib.Path) -> str:
     return relative.parts[0] if len(relative.parts) > 1 else path.stem
 
 
-def _atr_imports(path: pathlib.Path) -> set[str]:
-    """Every ``atr.*`` module this file imports, absolute and relative-resolved."""
-    try:
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-    except (SyntaxError, UnicodeDecodeError):  # pragma: no cover - not our problem
-        return set()
+def _forward_imports(path: pathlib.Path) -> set[str]:
+    """Return each Forward module imported by a source file.
+
+    Args:
+        path: Python source file to inspect.
+
+    Returns:
+        Dotted Forward module names imported by the file.
+    """
+    tree = ast.parse(path.read_text(encoding="utf-8"))
 
     found: set[str] = set()
+    package = path.relative_to(SRC).parts[:-1]
     for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom) and node.module and node.module.startswith("atr"):
-            found.add(node.module)
-            for alias in node.names:
-                found.add(f"{node.module}.{alias.name}")
+        if isinstance(node, ast.ImportFrom):
+            if node.level:
+                package_end = len(package) - node.level + 1
+                module_parts = package[:package_end]
+                if node.module:
+                    module_parts += tuple(node.module.split("."))
+                module = ".".join(("forward", *module_parts))
+                found.add(module)
+                found.update(f"{module}.{alias.name}" for alias in node.names)
+            elif node.module and (node.module == "forward" or node.module.startswith("forward.")):
+                found.add(node.module)
+                found.update(f"{node.module}.{alias.name}" for alias in node.names)
         elif isinstance(node, ast.Import):
             for alias in node.names:
-                if alias.name.startswith("atr"):
+                if alias.name == "forward" or alias.name.startswith("forward."):
                     found.add(alias.name)
     return found
 
 
 def _imported_layers(path: pathlib.Path) -> set[str]:
     out: set[str] = set()
-    for dotted in _atr_imports(path):
+    for dotted in _forward_imports(path):
         parts = dotted.split(".")
         if len(parts) >= 2 and parts[1] in LAYERS:
             out.add(parts[1])
@@ -99,29 +132,28 @@ def test_there_is_something_to_check():
     assert {_module_layer(p) for p in modules} >= {"api", "auth", "appdb", "backtest", "strategy"}
 
 
-def test_core_depends_on_nothing_in_atr():
+def test_core_depends_on_no_other_forward_layer():
     offenders = []
     for path in _modules():
         if _module_layer(path) != "core":
             continue
         for imported in _imported_layers(path):
             if imported != "core":
-                offenders.append(f"{path.relative_to(SRC)} imports atr.{imported}")
-    assert offenders == [], f"atr.core must stay dependency-free: {offenders}"
+                offenders.append(f"{path.relative_to(SRC)} imports forward.{imported}")
+    assert offenders == [], f"forward.core must stay dependency-free: {offenders}"
 
 
 def test_compute_layers_do_not_reach_into_transport_persistence_or_identity():
-    forbidden = {"api", "appdb", "services", "auth"}
+    forbidden = {"api", "appdb", "services", "auth", "data"}
     offenders = []
     for path in _modules():
         layer = _module_layer(path)
         if layer not in COMPUTE:
             continue
         for imported in _imported_layers(path) & forbidden:
-            offenders.append(f"{path.relative_to(SRC)} imports atr.{imported}")
+            offenders.append(f"{path.relative_to(SRC)} imports forward.{imported}")
     assert offenders == [], (
-        "a backtest or strategy must not read the user store or the transport layer: "
-        f"{offenders}"
+        f"compute code must use ports instead of transport, storage, or data adapters: {offenders}"
     )
 
 
@@ -133,7 +165,7 @@ def test_storage_and_adapter_layers_do_not_import_the_api_or_services():
         if layer not in STORAGE:
             continue
         for imported in _imported_layers(path) & forbidden:
-            offenders.append(f"{path.relative_to(SRC)} imports atr.{imported}")
+            offenders.append(f"{path.relative_to(SRC)} imports forward.{imported}")
     assert offenders == [], f"dependencies must point inward: {offenders}"
 
 
@@ -146,7 +178,15 @@ def test_services_do_not_import_the_api():
     assert offenders == [], f"services must not depend on the transport layer: {offenders}"
 
 
-@pytest.mark.parametrize("path", sorted((SRC / "api" / "routers").glob("*.py")))
+@pytest.mark.parametrize(
+    "path",
+    sorted(
+        [
+            *(SRC / "api" / "legacy").glob("*.py"),
+            *(SRC / "api" / "routers").glob("*.py"),
+        ]
+    ),
+)
 def test_routes_go_through_services_not_storage(path: pathlib.Path):
     """A route that touches SQL or a broker directly is a route without an owner."""
     if path.name == "__init__.py":
@@ -154,7 +194,7 @@ def test_routes_go_through_services_not_storage(path: pathlib.Path):
     forbidden = {"appdb", "data", "brokers"}
     offenders = sorted(_imported_layers(path) & forbidden)
     assert offenders == [], (
-        f"{path.name} imports {offenders} directly; put the work in atr.services "
+        f"{path.name} imports {offenders} directly; put the work in forward.services "
         "so authorization and audit have one home per action"
     )
 

@@ -21,12 +21,13 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from atr.backtest.costs import SlippageModel
-from atr.backtest.engine import BacktestConfig, BacktestEngine
-from atr.core.enums import AssetClass
-from atr.core.models import Bar, Instrument, MarketSnapshot
-from atr.data.base import ListFeed
-from atr.strategy.strategies.alpha_candidates import (
+from forward.backtest.engine import BacktestConfig, BacktestEngine
+from forward.core.costs import SlippageModel
+from forward.core.enums import AssetClass
+from forward.core.feeds import ListFeed
+from forward.core.instrument_models import Instrument
+from forward.core.market_models import Bar, MarketSnapshot
+from forward.strategy.strategies.alpha_candidates import (
     ShortHorizonReversal,
     TrendFilteredExposure,
     VolatilityManaged,

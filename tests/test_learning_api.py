@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import json
 
-from atr.api.routers import learning as learning_router
+from forward.api.routers import learning as learning_router
 
 # ---------------------------------------------------------------------------
 # the surface is read-only
@@ -43,7 +43,7 @@ def test_the_learning_router_registers_no_mutating_route():
 
 
 def test_the_learning_router_is_registered():
-    from atr.api.routers import ROUTERS
+    from forward.api.routers import ROUTERS
 
     assert learning_router.router in ROUTERS
 
@@ -226,13 +226,13 @@ def test_the_learning_routes_require_authentication(client):
 def _write_paper_ledger() -> None:
     """Write a one-week forward ledger into the test's own data root.
 
-    ``fresh_env`` points ``ATR_DATA_ROOT`` at ``tmp_path/data``, so this lands
+    ``fresh_env`` points ``FORWARD_DATA_ROOT`` at ``tmp_path/data``, so this lands
     in the test's directory and never in the operator's real record.
     """
     import os
     from pathlib import Path
 
-    root = Path(os.environ["ATR_DATA_ROOT"]) / "paper_momentum"
+    root = Path(os.environ["FORWARD_DATA_ROOT"]) / "paper_momentum"
     root.mkdir(parents=True, exist_ok=True)
     (root / "picks.jsonl").write_text(
         json.dumps(
@@ -303,7 +303,8 @@ def test_a_paper_ledger_does_not_make_the_engine_mutate_anything(auth_client, ap
     """The read-only guarantee, re-asserted over HTTP with a non-empty book."""
     from sqlalchemy import func, select
 
-    from atr.appdb.schema import orders, strategies
+    from forward.appdb.execution_schema import orders
+    from forward.appdb.strategy_backtest_schema import strategies
 
     def fingerprint() -> tuple[int, int]:
         with app_db.session() as session:

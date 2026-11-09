@@ -26,10 +26,12 @@ Usage:
     ./.venv/Scripts/python.exe scripts/research_factor_scan.py
 """
 
-# ruff: noqa: I001 — the src/ path shim must run before the atr imports.
+# ruff: noqa: I001 — the src/ path shim must run before the Forward imports.
 from __future__ import annotations
 
 import sys
+import argparse
+import json
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -37,16 +39,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
-PANEL = Path("data/signals/panel_nseeq_120.parquet")
-HORIZON = 21  # trading days; one month
+ROOT = Path(__file__).resolve().parents[1]
+CONFIG_PATH = ROOT / "config" / "research_factor_scan.json"
 
 
-def load_panel() -> pd.DataFrame:
-    if not PANEL.exists():
-        raise SystemExit(f"missing {PANEL} — run scripts/validate_cross_sectional.py")
-    frame = pd.read_parquet(PANEL)
+def load_panel(config: dict) -> pd.DataFrame:
+    """Load the configured price panel."""
+    panel_path = ROOT / config["panel_file"]
+    frame = pd.read_parquet(panel_path)
     frame["ts"] = pd.to_datetime(frame["ts"])
-    return frame.pivot_table(index="ts", columns="symbol", values="close").sort_index()
+    close = frame.pivot_table(index="ts", columns="symbol", values="close").sort_index()
+    if close.empty:
+        raise ValueError(f"Configured price panel is empty: {panel_path}.")
+    return close
 
 
 def long_frame(*series: pd.Series, names: list[str]) -> pd.DataFrame:
@@ -55,19 +60,19 @@ def long_frame(*series: pd.Series, names: list[str]) -> pd.DataFrame:
     Stacking each Series separately produces MultiIndexes that pandas refuses to
     union; concatenating the *frames* first keeps one index all the way through.
     """
-    frames = [s.stack().rename(n) for s, n in zip(series, names)]
+    frames = [s.stack().rename(n) for s, n in zip(series, names, strict=True)]
     return pd.concat(frames, axis=1).dropna()
 
 
-def quintile_table(long: pd.DataFrame, factor: str, target: str = "fwd") -> pd.Series:
-    """Mean forward return per quintile of ``factor`` (Q1 = lowest factor)."""
+def quintile_table(long: pd.DataFrame, factor: str, config: dict, target: str = "fwd") -> pd.Series:
+    """Mean return per configured factor quantile (Q1 = lowest factor)."""
     ranked = long[factor].rank(method="first")
-    buckets = pd.qcut(ranked, 5, labels=False)
+    buckets = pd.qcut(ranked, config["quantile_count"], labels=False)
     return long.groupby(buckets)[target].mean() * 100.0
 
 
-def describe(long: pd.DataFrame, factor: str, high_is_good: bool) -> dict:
-    table = quintile_table(long, factor)
+def describe(long: pd.DataFrame, factor: str, high_is_good: bool, config: dict) -> dict:
+    table = quintile_table(long, factor, config)
     spread = float(table.iloc[-1] - table.iloc[0])
     if not high_is_good:
         spread = -spread
@@ -82,7 +87,7 @@ def describe(long: pd.DataFrame, factor: str, high_is_good: bool) -> dict:
     half = len(long) // 2
     first, second = long.iloc[:half], long.iloc[half:]
     def half_spread(part: pd.DataFrame) -> float:
-        t = quintile_table(part, factor)
+        t = quintile_table(part, factor, config)
         s = float(t.iloc[-1] - t.iloc[0])
         return s if high_is_good else -s
 
@@ -90,16 +95,17 @@ def describe(long: pd.DataFrame, factor: str, high_is_good: bool) -> dict:
         "quintiles": table,
         "spread_pct": spread,
         "monotone": monotone,
-        "steps_consistent": f"{consistent}/4",
+        "steps_consistent": f"{consistent}/{config['quantile_count'] - 1}",
         "spread_h1": half_spread(first),
         "spread_h2": half_spread(second),
     }
 
 
-def beta_of_top(long: pd.DataFrame, factor: str, high_is_good: bool) -> float:
+def beta_of_top(long: pd.DataFrame, factor: str, config: dict) -> float:
     """Beta of the factor's top quintile to the equal-weight market."""
     ranked = long[factor].rank(method="first")
-    top = long[pd.qcut(ranked, 5, labels=False) == 4]
+    top = long[pd.qcut(ranked, config["quantile_count"], labels=False)
+               == config["quantile_count"] - 1]
     market = long.groupby(level=0)["fwd"].mean()
     aligned = top.groupby(level=0)["fwd"].mean()
     joined = pd.concat([aligned.rename("top"), market.rename("mkt")], axis=1).dropna()
@@ -109,37 +115,53 @@ def beta_of_top(long: pd.DataFrame, factor: str, high_is_good: bool) -> float:
 
 
 def main() -> int:
-    close = load_panel()
+    """Run the configured, pre-registered factor scan."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", type=Path, default=CONFIG_PATH)
+    config_path = parser.parse_args().config
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    print(f"Configuration: {config_path.resolve()}")
+    close = load_panel(config)
     returns = close.pct_change()
-    fwd = close.pct_change(HORIZON).shift(-HORIZON)
+    horizon = config["forward_horizon_days"]
+    fwd = close.pct_change(horizon).shift(-horizon)
 
     # ---- factors, all lagged so only past information is used --------------
     factors: dict[str, tuple[pd.Series, bool]] = {
         # trailing return over several windows, skipping the last month
-        "mom_63_skip21": ((close.shift(21) / close.shift(84) - 1).shift(0), True),
-        "mom_126_skip21": ((close.shift(21) / close.shift(147) - 1), True),
-        "mom_252_skip21": ((close.shift(21) / close.shift(273) - 1), True),
-        # realised volatility, 126d
-        "vol_126": (returns.rolling(126).std(), False),
-        # distance from the trailing high (a "proximity to highs" factor)
-        "dist_high_252": (close / close.rolling(252).max(), True),
-        # trend: price relative to its own moving average
-        "px_sma50": (close / close.rolling(50).mean(), True),
-        "px_sma200": (close / close.rolling(200).mean(), True),
+        name: (
+            (close.shift(config["momentum_skip_days"]) / close.shift(history) - 1), True
+        )
+        for name, history in config["momentum_factors"].items()
     }
+    factors.update({
+        # realised volatility, 126d
+        config["volatility_factor_name"]: (
+            returns.rolling(config["volatility_lookback_days"]).std(), False
+        ),
+        # distance from the trailing high (a "proximity to highs" factor)
+        config["distance_high_factor_name"]: (
+            close / close.rolling(config["distance_high_lookback_days"]).max(), True
+        ),
+        # trend: price relative to its own moving average
+        **{
+            name: (close / close.rolling(window).mean(), True)
+            for name, window in config["moving_average_factors"].items()
+        },
+    })
 
     print(f"window : {close.index[0]:%Y-%m-%d} -> {close.index[-1]:%Y-%m-%d}")
-    print(f"names  : {close.shape[1]}   horizon: {HORIZON} sessions\n")
+    print(f"names  : {close.shape[1]}   horizon: {horizon} sessions\n")
 
     results: list[dict] = []
     for name, (series, high_is_good) in factors.items():
         long = long_frame(series.shift(1), fwd, names=[name, "fwd"])
         if long.empty:
             continue
-        info = describe(long, name, high_is_good)
+        info = describe(long, name, high_is_good, config)
         info["name"] = name
         info["n"] = len(long)
-        info["beta"] = beta_of_top(long, name, high_is_good)
+        info["beta"] = beta_of_top(long, name, config)
         results.append(info)
 
         q = info["quintiles"]
@@ -154,11 +176,12 @@ def main() -> int:
         print()
 
     print("=" * 72)
-    print("survivors — monotone, same sign in both halves, spread > 0.5%/mo:")
+    print(f"survivors — monotone, same sign in both halves, spread > "
+          f"{config['minimum_survivor_spread_pct']}%/month:")
     survivors = [
         r for r in results
         if r["monotone"]
-        and r["spread_pct"] > 0.5
+        and r["spread_pct"] > config["minimum_survivor_spread_pct"]
         and r["spread_h1"] > 0
         and r["spread_h2"] > 0
     ]

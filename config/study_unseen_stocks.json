@@ -1,0 +1,31 @@
+{
+  "exchange": "NSEEQ",
+  "minimum_universe_history_bars": 1500,
+  "minimum_symbol_history_bars": 200,
+  "minimum_weekly_cross_section": 200,
+  "forward_days": 5,
+  "hit_return_fraction": 0.02,
+  "rsi_period": 14,
+  "rsi_maximum": 30,
+  "volatility_lookback_days": 20,
+  "volatility_quantile": 0.8,
+  "liquidity_lookback_days": 20,
+  "liquid_value_threshold_crore": 2.0,
+  "crore_in_rupees": 10000000,
+  "week_period": "W-FRI",
+  "confidence_z": 1.96,
+  "minimum_signal_count": 30,
+  "busy_week_examples": 3,
+  "costs": {
+    "name": "NSE delivery share",
+    "stt_buy": 0.001,
+    "stt_sell": 0.001,
+    "stamp_buy": 0.00015,
+    "exchange": 0.0000297,
+    "sebi": 0.000001,
+    "gst": 0.18,
+    "brokerage_pct": 0.0003,
+    "brokerage_cap": 20.0,
+    "slippage": 0.0005
+  }
+}

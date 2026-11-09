@@ -21,7 +21,7 @@ from datetime import datetime, timedelta
 import pandas as pd
 import pytest
 
-from atr.data.hygiene import drop_reverting_spikes, reverting_spike_mask
+from forward.research.data_hygiene import drop_reverting_spikes, reverting_spike_mask
 
 START = datetime(2024, 1, 1)
 

@@ -1,4 +1,4 @@
-from atr.services.forward_check import MIN_FORWARD_TRADES, _stats, verdict
+from forward.services.forward_check import _stats, verdict
 
 
 def _s(trades, win, avg, pf=1.5):

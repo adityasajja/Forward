@@ -1,0 +1,16 @@
+{
+  "panel_file": "data/signals/panel_nseeq_120.parquet",
+  "forward_horizon_days": 21,
+  "volatility_lookback_days": 126,
+  "quantile_count": 5,
+  "stability_block_period": "6M",
+  "minimum_block_observations": 2000,
+  "minimum_year_observations": 2000,
+  "monthly_period": "ME",
+  "monthly_volatility_lookback": 6,
+  "minimum_cross_section_symbols": 20,
+  "one_way_cost_basis_points": 25,
+  "round_trips_per_rebalance": 2,
+  "basis_points_per_unit": 10000,
+  "months_per_year": 12
+}

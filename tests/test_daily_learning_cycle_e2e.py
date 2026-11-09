@@ -17,29 +17,34 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
 import pytest
 
-from atr.appdb.engine import AppDatabase
-from atr.appdb.repositories import (
-    LearningObservationRepository,
+from forward.appdb.daily_learning_storage import SqlDailyLearningStorage
+from forward.appdb.engine import AppDatabase
+from forward.appdb.identity_repository import UserRepository
+from forward.appdb.learning_observation_repository import LearningObservationRepository
+from forward.appdb.strategy_repository import StrategyRepository
+from forward.appdb.strategy_research_repository import (
     OptimizationRecommendationRepository,
-    StrategyRepository,
-    SystemStateRepository,
-    UserRepository,
 )
-from atr.data.synthetic import SyntheticConfig, SyntheticFeed
-from atr.research.learning_evidence import (
+from forward.appdb.strategy_research_storage import SqlStrategyResearchStorage
+from forward.config.settings import get_settings
+from forward.core.learning_evidence import (
     CLASS_BACKTEST,
     CLASS_PAPER_FORWARD,
     GRADE_FORWARD,
     GRADE_IN_SAMPLE,
 )
-from atr.services.daily_learning import DailyLearningCycleService, KEY_LAST_CYCLE
-from atr.services.learning import LearningDataset, LearningService
-from atr.services.optimization import OptimizationService
+from forward.data.synthetic import SyntheticConfig, SyntheticFeed
+from forward.services.daily_learning import DailyLearningCycleService
+from forward.services.learning import LearningService
+from forward.services.learning_dataset_model import LearningDataset
+from forward.services.optimization import OptimizationService
+from tests.market_data_fakes import signal_context_service_for_test
 
 IST = ZoneInfo("Asia/Kolkata")
 
@@ -102,8 +107,6 @@ def test_strategy(app_db: AppDatabase, test_user: dict[str, Any]) -> dict[str, A
         return strat
 
 
-
-
 @pytest.fixture
 def feed():
     return SyntheticFeed(
@@ -123,12 +126,38 @@ class MockLearningService(LearningService):
     def __init__(self, trades: list[dict[str, Any]]) -> None:
         self._mock_trades = trades
 
-    def dataset(self, refresh: bool = False) -> LearningDataset:
+    def dataset(self, *, refresh: bool = False, user_id: str | None = None) -> LearningDataset:
         return LearningDataset(
             rows=self._mock_trades,
             missing_features={},
             generated_at=datetime.now().isoformat(),
         )
+
+
+def _cycle_service(
+    app_db: AppDatabase,
+    learning_service: LearningService,
+    optimization_service: OptimizationService,
+) -> DailyLearningCycleService:
+    """Build the daily cycle with its required use cases.
+
+    Args:
+        app_db: Database used by the test storage and context adapters.
+        learning_service: Controlled evidence provider for this test.
+        optimization_service: Candidate optimization use case for this test.
+
+    Returns:
+        A fully configured daily learning cycle.
+    """
+    return DailyLearningCycleService(
+        storage=SqlDailyLearningStorage(app_db),
+        learning_service=learning_service,
+        optimization_service=optimization_service,
+        context_service=signal_context_service_for_test(
+            app_db,
+            data_root=Path(get_settings().research_data_directory),
+        ),
+    )
 
 
 def _generate_synthetic_trades(
@@ -189,12 +218,21 @@ def _generate_synthetic_trades(
 # ---------------------------------------------------------------------------
 
 
-def test_empty_trades_completes_safely(app_db: AppDatabase, test_strategy: dict[str, Any]):
+def test_empty_trades_completes_safely(
+    app_db: AppDatabase,
+    test_user: dict[str, Any],
+    test_strategy: dict[str, Any],
+):
     """If no forward trades exist, cycle exits safely with NO_DATA and explanation."""
     mock_learning = MockLearningService(trades=[])
-    cycle_service = DailyLearningCycleService(db=app_db, learning_service=mock_learning)
+    optimization_service = OptimizationService(
+        SqlStrategyResearchStorage(app_db), learning_service=mock_learning
+    )
+    cycle_service = _cycle_service(app_db, mock_learning, optimization_service)
 
-    report = cycle_service.run_cycle(strategy_id=test_strategy["strategy_id"])
+    report = cycle_service.run_cycle(
+        strategy_id=test_strategy["strategy_id"], user_id=test_user["user_id"]
+    )
     assert report.status == "NO_DATA"
     assert report.trades_processed == 0
     assert report.observations_generated == 0
@@ -203,20 +241,31 @@ def test_empty_trades_completes_safely(app_db: AppDatabase, test_strategy: dict[
     assert any("No genuine PAPER_FORWARD trades" in note for note in report.notes)
 
     # Durable system_state check
-    latest = cycle_service.get_latest_cycle()
+    latest = cycle_service.get_latest_cycle(test_user["user_id"])
     assert latest is not None
     assert latest["cycle_id"] == report.cycle_id
     assert latest["status"] == "NO_DATA"
 
 
-def test_insufficient_samples_withheld(app_db: AppDatabase, test_strategy: dict[str, Any]):
+def test_insufficient_samples_withheld(
+    app_db: AppDatabase,
+    test_user: dict[str, Any],
+    test_strategy: dict[str, Any],
+):
     """If n < 10 trades exist, strategy is flagged as insufficient and withheld from candidate generation."""
     # Only 5 trades
     trades = _generate_synthetic_trades(test_strategy["strategy_id"], count=5)
     mock_learning = MockLearningService(trades=trades)
-    cycle_service = DailyLearningCycleService(db=app_db, learning_service=mock_learning)
+    optimization_service = OptimizationService(
+        SqlStrategyResearchStorage(app_db), learning_service=mock_learning
+    )
+    cycle_service = _cycle_service(app_db, mock_learning, optimization_service)
 
-    report = cycle_service.run_cycle(strategy_id=test_strategy["strategy_id"], min_sample_size=10)
+    report = cycle_service.run_cycle(
+        strategy_id=test_strategy["strategy_id"],
+        min_sample_size=10,
+        user_id=test_user["user_id"],
+    )
     assert report.status == "INSUFFICIENT_SAMPLE"
     assert report.trades_processed == 5
     assert test_strategy["strategy_id"] in report.insufficient_data_strategies
@@ -227,6 +276,7 @@ def test_insufficient_samples_withheld(app_db: AppDatabase, test_strategy: dict[
 
 def test_end_to_end_daily_learning_cycle(
     app_db: AppDatabase,
+    test_user: dict[str, Any],
     test_strategy: dict[str, Any],
     feed: SyntheticFeed,
 ):
@@ -243,7 +293,6 @@ def test_end_to_end_daily_learning_cycle(
     → Asserts strategy version remains V1 unchanged (no live deployment).
     """
     strat_id = test_strategy["strategy_id"]
-
 
     # 1. Provide backtest baseline + genuine paper forward trades (n=30)
     backtest_trades = _generate_synthetic_trades(
@@ -265,17 +314,16 @@ def test_end_to_end_daily_learning_cycle(
 
     all_trades = backtest_trades + forward_trades
     mock_learning = MockLearningService(trades=all_trades)
-    opt_service = OptimizationService(db=app_db, learning_service=mock_learning)
-    cycle_service = DailyLearningCycleService(
-        db=app_db,
-        learning_service=mock_learning,
-        optimization_service=opt_service,
+    opt_service = OptimizationService(
+        SqlStrategyResearchStorage(app_db), learning_service=mock_learning
     )
+    cycle_service = _cycle_service(app_db, mock_learning, opt_service)
 
     # 2. Run Daily Learning Cycle
     report = cycle_service.run_cycle(
         strategy_id=strat_id,
         min_sample_size=10,
+        user_id=test_user["user_id"],
         feed=feed,
     )
 
@@ -289,10 +337,11 @@ def test_end_to_end_daily_learning_cycle(
 
     # 3. Verify Observations in Database
     with app_db.session() as session:
-        observations = LearningObservationRepository.list_observations(session, strategy_id=strat_id)
+        observations = LearningObservationRepository.list_observations(
+            session, strategy_id=strat_id
+        )
         assert len(observations) > 0
         for obs in observations:
-
             assert obs["sample_size"] >= 10
             assert obs["evidence_class"] == CLASS_PAPER_FORWARD
             assert obs["confidence"] is not None
@@ -308,20 +357,19 @@ def test_end_to_end_daily_learning_cycle(
             assert rec["parameter"] == "volume_multiple"
             assert rec["current_value"] == 1.5
 
-
     # 5. SAFEGUARD: Strategy Version V1 remains completely UNCHANGED (immutability)
     with app_db.session() as session:
-        v1 = StrategyRepository.get_version(session, strat_id, version=1)
+        v1 = StrategyRepository.version(session, strat_id, version=1)
         assert v1 is not None
         v1_def = json.loads(v1["definition"])
         assert v1_def["rules"]["entry"]["volume_multiple"] == 1.5
 
         # No V2 was created automatically
-        v2 = StrategyRepository.get_version(session, strat_id, version=2)
+        v2 = StrategyRepository.version(session, strat_id, version=2)
         assert v2 is None
 
     # 6. Verify Cycle Persistence in SystemState
-    latest_cycle = cycle_service.get_latest_cycle()
+    latest_cycle = cycle_service.get_latest_cycle(test_user["user_id"])
     assert latest_cycle is not None
     assert latest_cycle["cycle_id"] == report.cycle_id
     assert latest_cycle["trades_processed"] == 30

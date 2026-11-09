@@ -10,15 +10,23 @@ from __future__ import annotations
 
 import pytest
 
-from atr.brokers.iifl.broker import IiflBroker
-from atr.core.enums import OrderType, Side
-from atr.core.models import Instrument, Order
+from forward.brokers.iifl.broker import IiflBroker
+from forward.core.enums import OrderType, Side
+from forward.core.instrument_models import Instrument
+from forward.core.order_models import Order
 
 EQ = Instrument(symbol="RELIANCE-EQ", exchange="NSEEQ", conid=2885)
 
 
 def _broker(**kwargs) -> IiflBroker:
-    return IiflBroker(client=None, master=None, **kwargs)
+    return IiflBroker(
+        client=kwargs.pop("client", None),
+        master=kwargs.pop("master", None),
+        default_product="DELIVERY",
+        api_order_source="test",
+        market_protection_percent=0.5,
+        **kwargs,
+    )
 
 
 def _order(order_type=OrderType.MARKET, **kwargs) -> Order:
@@ -85,7 +93,7 @@ def test_order_tag_is_truncated():
 
 
 def test_instrument_without_conid_is_rejected():
-    from atr.brokers.base import BrokerError
+    from forward.brokers.base import BrokerError
 
     order = Order(instrument=Instrument(symbol="NOCONID"), side=Side.BUY, quantity=1)
     with pytest.raises(BrokerError, match="instrumentId"):
@@ -99,7 +107,7 @@ def test_derivatives_default_to_intraday_product():
 
 
 def test_order_tif_flows_into_validity():
-    from atr.core.enums import TimeInForce
+    from forward.core.enums import TimeInForce
 
     ioc = _order()
     ioc.tif = TimeInForce.IOC
@@ -129,7 +137,7 @@ def test_corrupt_order_book_rows_are_skipped_not_invented():
             ]
 
     master = SimpleNamespace(find=lambda symbol, exchange: EQ)
-    broker = IiflBroker(client=_Client(), master=master)
+    broker = _broker(client=_Client(), master=master)
     orders = broker.open_orders()
     assert len(orders) == 1
     assert orders[0].quantity == pytest.approx(10.0)
@@ -146,24 +154,31 @@ def test_v4_positions_envelope_is_unwrapped():
             ]}
 
     master = SimpleNamespace(find=lambda symbol, exchange: EQ)
-    positions = IiflBroker(client=_Client(), master=master).positions()
+    positions = _broker(client=_Client(), master=master).positions()
     assert len(positions) == 1
     assert positions[0].quantity == pytest.approx(5.0)
 
 
 def _broker_with_client(client) -> IiflBroker:
-    return IiflBroker(client=client, master=None)
+    return _broker(client=client, master=None)
 
 
 def test_expired_session_is_rejected_before_any_http(tmp_path):
     """A JWT past midnight IST must never be sent; log in again instead."""
     from datetime import UTC, datetime
 
-    from atr.brokers.iifl.auth import Session, SessionStore
-    from atr.brokers.iifl.client import IiflClient, SessionExpiredError
+    from forward.brokers.iifl.auth import Session, SessionStore
+    from forward.brokers.iifl.client import IiflClient, SessionExpiredError
 
     store = SessionStore(tmp_path / "sess.json")
-    client = IiflClient(app_key="k", app_secret="s", session_store=store, force_ipv4=False)
+    client = IiflClient(
+        app_key="k",
+        app_secret="s",
+        base_url="https://api.test/v1",
+        timeout=1,
+        session_store=store,
+        force_ipv4=False,
+    )
     client.session = Session(
         user_session="x.y.z", client_id="C",
         created_at=datetime(2024, 1, 1, tzinfo=UTC),
@@ -179,15 +194,22 @@ def test_a_401_drops_the_session_and_raises_expiry(tmp_path):
     """Keep sending a rejected token and every call 401s; forget it once."""
     from datetime import datetime
 
-    from atr.brokers.iifl.auth import Session, SessionStore
-    from atr.brokers.iifl.client import IiflClient, SessionExpiredError
+    from forward.brokers.iifl.auth import Session, SessionStore
+    from forward.brokers.iifl.client import IiflClient, SessionExpiredError
 
     class _Resp:
         status_code = 401
         text = "unauthorized"
 
     store = SessionStore(tmp_path / "sess.json")
-    client = IiflClient(app_key="k", app_secret="s", session_store=store, force_ipv4=False)
+    client = IiflClient(
+        app_key="k",
+        app_secret="s",
+        base_url="https://api.test/v1",
+        timeout=1,
+        session_store=store,
+        force_ipv4=False,
+    )
     client.session = Session(
         user_session="x.y.z", client_id="C", created_at=datetime.now().astimezone(),
     )
@@ -201,15 +223,22 @@ def test_mutations_do_not_retry_server_errors(tmp_path):
     """A 5xx after a POST may mean the order was placed: retrying doubles it."""
     from datetime import datetime
 
-    from atr.brokers.iifl.auth import Session, SessionStore
-    from atr.brokers.iifl.client import IiflClient, _NoRetry
+    from forward.brokers.iifl.auth import Session, SessionStore
+    from forward.brokers.iifl.client import IiflClient, _NoRetry
 
     class _Resp:
         status_code = 500
         text = "bad gateway"
 
     store = SessionStore(tmp_path / "sess.json")
-    client = IiflClient(app_key="k", app_secret="s", session_store=store, force_ipv4=False)
+    client = IiflClient(
+        app_key="k",
+        app_secret="s",
+        base_url="https://api.test/v1",
+        timeout=1,
+        session_store=store,
+        force_ipv4=False,
+    )
     client.session = Session(
         user_session="x.y.z", client_id="C", created_at=datetime.now().astimezone(),
     )

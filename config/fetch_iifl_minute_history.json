@@ -1,0 +1,20 @@
+{
+  "universe_files": [
+    "data/universe/n50.txt",
+    "data/universe/mid150.txt"
+  ],
+  "contracts_file": ".cache/contracts/NSEEQ.json",
+  "session_file": ".cache/iifl_session.json",
+  "output_directory": "data/iifl_1m",
+  "exchange": "NSEEQ",
+  "from_date": "01-Jan-2024",
+  "to_date": "19-Sep-2026",
+  "interval": "1m",
+  "minimum_cached_bars": 5000,
+  "request_pause_seconds": 0.5,
+  "max_workers": 4,
+  "parallel_timeout_seconds": 3600,
+  "symbol_suffixes": ["-EQ", "-BE", "-SM"],
+  "missing_contract_display_limit": 20,
+  "error_traceback_limit": 3
+}

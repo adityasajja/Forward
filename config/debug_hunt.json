@@ -1,0 +1,25 @@
+{
+  "universe_files": ["data/universe/n50.txt", "data/universe/mid150.txt"],
+  "from_date": "2020-01-01",
+  "to_date": "2024-05-15",
+  "minimum_bars": 250,
+  "split_fraction": 0.5,
+  "momentum_lookback": 5,
+  "inverse_volatility_lookback": 63,
+  "inverse_volatility_minimum_periods": 40,
+  "weighting_lookback": 10,
+  "weighting_step": 5,
+  "weighting_mode": "equal",
+  "costs": {
+    "name": "NSE delivery share",
+    "stt_buy": 0.001,
+    "stt_sell": 0.001,
+    "stamp_buy": 0.00015,
+    "exchange": 0.0000297,
+    "sebi": 0.000001,
+    "gst": 0.18,
+    "brokerage_pct": 0.0003,
+    "brokerage_cap": 20.0,
+    "slippage": 0.0005
+  }
+}

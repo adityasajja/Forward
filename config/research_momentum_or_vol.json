@@ -1,0 +1,13 @@
+{
+  "panel_file": "data/signals/panel_nseeq_120.parquet",
+  "forward_horizon_days": 21,
+  "momentum_recent_days": 21,
+  "momentum_history_days": 147,
+  "volatility_lookback_days": 126,
+  "volatility_bucket_count": 3,
+  "momentum_quantile_count": 5,
+  "volatility_quantile_count": 5,
+  "index_volatility_lookback_days": 20,
+  "time_series_volatility_quantiles": 5,
+  "trading_days_per_year": 252
+}

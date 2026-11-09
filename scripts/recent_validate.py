@@ -79,9 +79,6 @@ def run_strategy(close, high, low, signal, sl, tp, mh, k, step, costs,
                  regime_filter=None, vol_target=0.20, vol_window=20):
     n_dates, n_stocks = close.shape
     warmup = max(mh + 22, 22)
-    step = step
-    rb_dates = list(range(warmup, n_dates - max_holding_to_idx(mh), step))
-    # Simpler: rb_dates = range(warmup, n_dates - mh, step)
     rb_dates = list(range(warmup, n_dates - mh, step))
     if len(rb_dates) < 3:
         return {"error": "insufficient dates", "n_dates": n_dates}

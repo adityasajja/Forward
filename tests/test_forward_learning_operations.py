@@ -31,24 +31,48 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
 import pytest
 
-from atr.appdb.repositories import (
+from forward.appdb.backtest_repository import (
     BacktestArtefactRepository,
     BacktestRunRepository,
-    DeploymentRepository,
-    OrderEventRepository,
-    OrderRepository,
-    StrategyRepository,
-    TradeJournalRepository,
-    UserRepository,
 )
-from atr.research.learning_evidence import CLASS_PAPER_FORWARD, GRADE_FORWARD
-from atr.services.learning import LearningDatasetBuilder, LearningService
+from forward.appdb.daily_learning_storage import SqlDailyLearningStorage
+from forward.appdb.deployment_repository import DeploymentRepository
+from forward.appdb.learning_storage import SqlLearningStorage
+from forward.appdb.order_event_repository import OrderEventRepository
+from forward.appdb.order_storage import SqlOrderStorage
+from forward.appdb.paper_ledger_storage import SqlPaperLedgerStorage
+from forward.appdb.paper_runner_storage import SqlPaperRunnerStorage
+from forward.appdb.portfolio_storage import SqlPortfolioStorage
+from forward.appdb.risk_state_storage import SqlRiskStateStorage
+from forward.appdb.strategy_repository import StrategyRepository
+from forward.appdb.system_state_storage import SqlSystemStateStorage
+from forward.appdb.trade_journal_repository import TradeJournalRepository
+from forward.appdb.trade_journal_storage import SqlTradeJournalStorage
+from forward.config.settings import get_settings
+from forward.core.learning_evidence import CLASS_PAPER_FORWARD, GRADE_FORWARD
+from forward.data.cached_market_frames import CachedMarketFramesAdapter
+from forward.data.learning_artifacts import LocalLearningArtifactsAdapter
+from forward.data.vwap_liquidity import NseBhavcopyLiquidityAdapter
+from forward.market_calendar import get_market_calendar
+from forward.services.learning import LearningService
+from forward.services.learning_dataset import LearningDatasetBuilder
+from forward.services.paper_ledger import PaperLedger
+from forward.services.risk import RiskStateService
+from tests.market_data_fakes import (
+    InMemoryLearningArtifactsPort,
+    InMemoryMarketFramesPort,
+    NoopSignalContextEnricher,
+    signal_context_service_for_test,
+)
+from tests.order_fakes import order_instrument_lookup
+from tests.paper_price_fakes import StaticRunnerVenueProvider, no_live_price
 
 SYMBOL = "RELIANCE"
 EXCHANGE = "NSEEQ"
@@ -114,7 +138,7 @@ def _frame(seed: int, periods: int = 300, up: float = 0.001) -> pd.DataFrame:
 
 @pytest.fixture()
 def owner(app_db) -> str:
-    from atr.appdb.schema import users
+    from forward.appdb.account_schema import users
 
     with app_db.session() as session:
         session.execute(
@@ -163,9 +187,9 @@ def deployment(app_db, owner, strategy) -> str:
             status="RUNNING",
             config={
                 "symbols": [SYMBOL],
-                "exchange": EXCHANGE, "signal_basis": "live",
+                "exchange": EXCHANGE,
+                "signal_basis": "live",
                 "timeframe": "1d",
-                "order_value": 250_000.0,
                 "lookback_days": 400,
                 "max_open_positions": 1,
             },
@@ -174,21 +198,29 @@ def deployment(app_db, owner, strategy) -> str:
 
 
 def _flatten(app_db, deployment_id: str, *, multiplier: float) -> None:
-    from atr.execution.oms import OrderDraft
-    from atr.services import paper as paper_service
-    from atr.services.execution import ExecutionService
-    from atr.services.orders import get_order_service
-    from atr.services.paper import PaperLedger
+    from forward.execution.oms import OrderDraft
+    from forward.services import paper_venue as paper_service
+    from forward.services.execution import ExecutionService
+    from forward.services.orders import get_order_service
+    from forward.services.paper_ledger import PaperLedger
 
-    ledger = PaperLedger(db=app_db)
+    ledger = PaperLedger(storage=SqlPaperLedgerStorage(app_db), price_source=no_live_price)
     portfolio = ledger.portfolio(USER, deployment_id=deployment_id)
     position = portfolio.position(SYMBOL)
     quantity = abs(float(position.quantity))
     assert quantity > 0, "the entry must have filled before the exit is placed"
     exit_price = round(float(position.avg_price) * multiplier, 2)
     ExecutionService(
-        orders=get_order_service(portfolio=portfolio),
-        venue=paper_service.paper_venue(lambda s, e: exit_price),
+        orders=get_order_service(
+            instruments=order_instrument_lookup,
+            storage=SqlOrderStorage(app_db),
+            risk=RiskStateService(SqlRiskStateStorage(app_db), get_settings()),
+            portfolio=portfolio,
+        ),
+        venue=paper_service.paper_venue(
+            lambda s, e: exit_price,
+            instruments=order_instrument_lookup,
+        ),
     ).place(
         OrderDraft(
             user_id=USER,
@@ -207,20 +239,42 @@ def _flatten(app_db, deployment_id: str, *, multiplier: float) -> None:
 def genuine(app_db, owner, strategy, deployment, monkeypatch) -> dict:
     """One paper trade closed through the real chain, with its context recorded."""
     monkeypatch.setattr(
-        "atr.signals.engine.load_daily",
+        "forward.data.cached_market_frames.load_daily_from_cache",
         lambda symbol, exchange="NSEEQ", **kw: _daily(),
     )
-    from atr.services.journal import TradeJournalService
-    from atr.services.runner import PaperRunner
+    from forward.services.journal import TradeJournalService
+    from forward.services.runner import PaperRunner
 
-    runner = PaperRunner(db=app_db)
+    runner = PaperRunner(
+        interval_seconds=get_settings().runner_interval_seconds,
+        lookback_days=get_settings().runner_lookback_days,
+        minimum_sleep_seconds=get_settings().runner_min_sleep_seconds,
+        market_wait_seconds=get_settings().runner_market_wait_seconds,
+        symbol_retry_seconds=get_settings().deployment_symbol_retry_seconds,
+        signal_context=NoopSignalContextEnricher(),
+        calendar=get_market_calendar(),
+        venue_provider=StaticRunnerVenueProvider(
+            prices=no_live_price, instruments=order_instrument_lookup
+        ),
+        daily_history=CachedMarketFramesAdapter(),
+        vwap_liquidity=NseBhavcopyLiquidityAdapter(get_settings().research_data_directory),
+        sector_table={},
+        instrument_lookup=order_instrument_lookup,
+        journal_storage=SqlTradeJournalStorage(app_db),
+        portfolio_storage=SqlPortfolioStorage(app_db),
+        ledger=PaperLedger(storage=SqlPaperLedgerStorage(app_db), price_source=no_live_price),
+        order_storage=SqlOrderStorage(app_db),
+        runner_storage=SqlPaperRunnerStorage(app_db),
+        state_storage=SqlSystemStateStorage(app_db),
+        risk_state=RiskStateService(SqlRiskStateStorage(app_db), get_settings()),
+    )
     runner.sync_loops()
     frame = _daily()
     tick = round(float(frame["close"].tail(63).max()) * 0.995, 2)
     runner._loops[deployment].venue.prices = lambda s, e: tick
     runner.pass_once(now=SESSION)
 
-    journal = TradeJournalService(db=app_db)
+    journal = TradeJournalService(storage=SqlTradeJournalStorage(app_db), ledger=runner.ledger)
     journal.reconcile(USER, deployment)
     _flatten(app_db, deployment, multiplier=1.02)
     journal.reconcile(USER, deployment)
@@ -234,7 +288,7 @@ def genuine(app_db, owner, strategy, deployment, monkeypatch) -> dict:
 def _entry_signal_id(app_db, deployment_id: str) -> str | None:
     from sqlalchemy import select
 
-    from atr.appdb.schema import orders
+    from forward.appdb.execution_schema import orders
 
     with app_db.session() as session:
         row = session.execute(
@@ -249,7 +303,7 @@ def _entry_signal_id(app_db, deployment_id: str) -> str | None:
 def _entry_order_id(app_db, deployment_id: str) -> str:
     from sqlalchemy import select
 
-    from atr.appdb.schema import orders
+    from forward.appdb.execution_schema import orders
 
     with app_db.session() as session:
         row = session.execute(
@@ -265,9 +319,11 @@ def _entry_order_id(app_db, deployment_id: str) -> str:
 def _record_context(app_db, user_id: str, strategy: dict, signal_id: str) -> int:
     """A genuinely recorded context row for the signal — built by the engine,
     stored by the service, then joined back by the dataset builder."""
-    from atr.signal_context.service import SignalContextService
 
-    service = SignalContextService(db=app_db)
+    service = signal_context_service_for_test(
+        app_db,
+        data_root=Path(get_settings().research_data_directory),
+    )
     stock = _frame(11, up=0.002)
     bench = _frame(12)
     when = stock["ts"].iloc[250]
@@ -289,8 +345,7 @@ def _record_context(app_db, user_id: str, strategy: dict, signal_id: str) -> int
         sector_hint=sector,
         when=when,
     )
-    with app_db.session() as session:
-        service.record(session, context, user_id=user_id)
+    service.record(context, user_id)
     return int(context.context_score)
 
 
@@ -339,50 +394,80 @@ def book(app_db, owner, strategy, genuine, tmp_path) -> dict:
     """The genuine trade plus company: two earlier forward weeks, one backtest
     trade for the same strategy, and one still-open forward episode."""
     _seed_closed_forward(
-        app_db, strategy_id=strategy["strategy_id"], symbol="TCS",
-        weeks_ago=4, entry_price=100.0, exit_price=104.0,
+        app_db,
+        strategy_id=strategy["strategy_id"],
+        symbol="TCS",
+        weeks_ago=4,
+        entry_price=100.0,
+        exit_price=104.0,
     )
     _seed_closed_forward(
-        app_db, strategy_id=strategy["strategy_id"], symbol="INFY",
-        weeks_ago=2, entry_price=100.0, exit_price=99.0,
+        app_db,
+        strategy_id=strategy["strategy_id"],
+        symbol="INFY",
+        weeks_ago=2,
+        entry_price=100.0,
+        exit_price=99.0,
     )
     with app_db.session() as session:
         run = BacktestRunRepository.create(
-            session, user_id=owner, config={"strategy_id": strategy["strategy_id"]},
-            strategy_id=strategy["strategy_id"], strategy_version=1,
+            session,
+            user_id=owner,
+            config={"strategy_id": strategy["strategy_id"]},
+            strategy_id=strategy["strategy_id"],
+            strategy_version=1,
         )
         BacktestArtefactRepository.save_trades(
             session,
             run["run_id"],
             [
                 {
-                    "symbol": SYMBOL, "direction": "LONG", "quantity": 10,
-                    "entry_ts": datetime(2025, 6, 2), "entry_price": 100.0,
-                    "exit_ts": datetime(2025, 6, 9), "exit_price": 150.0,
-                    "gross_pnl": 500.0, "net_pnl": 490.0, "return_pct": 50.0,
-                    "strategy_id": strategy["strategy_id"], "strategy_version": 1,
+                    "symbol": SYMBOL,
+                    "direction": "LONG",
+                    "quantity": 10,
+                    "entry_ts": datetime(2025, 6, 2),
+                    "entry_price": 100.0,
+                    "exit_ts": datetime(2025, 6, 9),
+                    "exit_price": 150.0,
+                    "gross_pnl": 500.0,
+                    "net_pnl": 490.0,
+                    "return_pct": 50.0,
+                    "strategy_id": strategy["strategy_id"],
+                    "strategy_version": 1,
                 }
             ],
         )
         BacktestRunRepository.complete(session, run["run_id"], owner, metrics={})
         TradeJournalRepository.open_trade(
-            session, user_id=USER, symbol="HDFCBANK", side="BUY", quantity=10,
-            entry_price=50.0, entry_ts=datetime.now() - timedelta(hours=1),
-            strategy_id=strategy["strategy_id"], strategy_version=1,
+            session,
+            user_id=USER,
+            symbol="HDFCBANK",
+            side="BUY",
+            quantity=10,
+            entry_price=50.0,
+            entry_ts=datetime.now() - timedelta(hours=1),
+            strategy_id=strategy["strategy_id"],
+            strategy_version=1,
             evidence_grade=GRADE_FORWARD,
         )
     return {"strategy": strategy, "genuine": genuine}
 
 
 def _dataset(app_db, tmp_path):
-    builder = LearningDatasetBuilder(db=app_db, cache_root=tmp_path, frames={})
+    builder = LearningDatasetBuilder(
+        portfolio_storage=SqlPortfolioStorage(app_db),
+        storage=SqlLearningStorage(app_db),
+        artifacts=LocalLearningArtifactsAdapter(tmp_path),
+        market_history=InMemoryMarketFramesPort({}),
+    )
     return builder.build(user_id=USER)
 
 
 def _governance_snapshot(app_db) -> dict:
     from sqlalchemy import select
 
-    from atr.appdb.schema import deployments, strategies, strategy_versions
+    from forward.appdb.execution_schema import deployments
+    from forward.appdb.strategy_backtest_schema import strategies, strategy_versions
 
     with app_db.session() as session:
         return {
@@ -431,25 +516,32 @@ def test_closed_paper_trade_enters_the_dataset_with_context_and_execution(
 
     # The frame carries the retention columns.
     for column in (
-        "signal_id", "opening_order_id", "context_score",
-        "context_model_version", "context_class",
+        "signal_id",
+        "opening_order_id",
+        "context_score",
+        "context_model_version",
+        "context_class",
     ):
         assert column in dataset.frame().columns
 
     # Context analytics resolves the genuine forward outcome…
-    from atr.signal_context.service import SignalContextService
 
-    effectiveness = SignalContextService(db=app_db).effectiveness(
-        USER, strategy_id=strategy["strategy_id"]
-    )
+    effectiveness = signal_context_service_for_test(
+        app_db,
+        data_root=Path(get_settings().research_data_directory),
+    ).effectiveness(USER, strategy_id=strategy["strategy_id"])
     assert effectiveness["forward_n"] >= 1
     assert effectiveness["forward_with_metric"] >= 1
 
     # …and readiness sees the strategy accumulating evidence.
-    readiness = LearningService(db=app_db).readiness(user_id=USER)
-    entry = next(
-        s for s in readiness["strategies"] if s["strategy_id"] == strategy["strategy_id"]
-    )
+    readiness = LearningService(
+        artifacts=InMemoryLearningArtifactsPort(),
+        market_history=InMemoryMarketFramesPort({}),
+        portfolio_storage=SqlPortfolioStorage(app_db),
+        storage=SqlLearningStorage(app_db),
+        daily_learning_storage=SqlDailyLearningStorage(app_db),
+    ).readiness(user_id=USER)
+    entry = next(s for s in readiness["strategies"] if s["strategy_id"] == strategy["strategy_id"])
     assert entry["forward_trades"] == 3
     assert entry["state"] == "NOT READY"
     assert entry["next_gate"] == {"required": 10, "have": 3, "status": "INSUFFICIENT"}
@@ -461,10 +553,14 @@ def test_in_sample_backtest_never_counts_as_forward(app_db, book, tmp_path, stra
     dataset = _dataset(app_db, tmp_path)
     assert dataset.grade_counts()["in_sample"] >= 1
 
-    readiness = LearningService(db=app_db).readiness(user_id=USER)
-    entry = next(
-        s for s in readiness["strategies"] if s["strategy_id"] == strategy["strategy_id"]
-    )
+    readiness = LearningService(
+        artifacts=InMemoryLearningArtifactsPort(),
+        market_history=InMemoryMarketFramesPort({}),
+        portfolio_storage=SqlPortfolioStorage(app_db),
+        storage=SqlLearningStorage(app_db),
+        daily_learning_storage=SqlDailyLearningStorage(app_db),
+    ).readiness(user_id=USER)
+    entry = next(s for s in readiness["strategies"] if s["strategy_id"] == strategy["strategy_id"])
     # Three forward weeks — the +50% backtest is evidence of nothing.
     assert entry["forward_trades"] == 3
     assert entry["summary"]["stats"]["mean"] != 50.0
@@ -476,10 +572,14 @@ def test_open_episodes_contribute_no_number(app_db, book, tmp_path, strategy):
     assert open_rows, "the fixture holds one still-open episode"
     assert all(r.get("return_pct") is None for r in open_rows)
 
-    readiness = LearningService(db=app_db).readiness(user_id=USER)
-    entry = next(
-        s for s in readiness["strategies"] if s["strategy_id"] == strategy["strategy_id"]
-    )
+    readiness = LearningService(
+        artifacts=InMemoryLearningArtifactsPort(),
+        market_history=InMemoryMarketFramesPort({}),
+        portfolio_storage=SqlPortfolioStorage(app_db),
+        storage=SqlLearningStorage(app_db),
+        daily_learning_storage=SqlDailyLearningStorage(app_db),
+    ).readiness(user_id=USER)
+    entry = next(s for s in readiness["strategies"] if s["strategy_id"] == strategy["strategy_id"])
     assert entry["open_forward_trades"] == 1
     # The mean is over measured outcomes only: recompute it here from the rows
     # the dataset holds, on the metric the summary resolved to.
@@ -498,10 +598,14 @@ def test_open_episodes_contribute_no_number(app_db, book, tmp_path, strategy):
 
 
 def test_evidence_accumulates_week_by_week(app_db, book, tmp_path, strategy):
-    readiness = LearningService(db=app_db).readiness(user_id=USER)
-    entry = next(
-        s for s in readiness["strategies"] if s["strategy_id"] == strategy["strategy_id"]
-    )
+    readiness = LearningService(
+        artifacts=InMemoryLearningArtifactsPort(),
+        market_history=InMemoryMarketFramesPort({}),
+        portfolio_storage=SqlPortfolioStorage(app_db),
+        storage=SqlLearningStorage(app_db),
+        daily_learning_storage=SqlDailyLearningStorage(app_db),
+    ).readiness(user_id=USER)
+    entry = next(s for s in readiness["strategies"] if s["strategy_id"] == strategy["strategy_id"])
     progression = entry["progression"]
     assert len(progression) >= 2, "trades land in distinct weeks"
     assert progression[-1]["cumulative"] == 3
@@ -511,15 +615,19 @@ def test_evidence_accumulates_week_by_week(app_db, book, tmp_path, strategy):
 
 
 def test_unlinked_rows_are_flagged_not_dropped(app_db, book, tmp_path, strategy):
-    readiness = LearningService(db=app_db).readiness(user_id=USER)
+    readiness = LearningService(
+        artifacts=InMemoryLearningArtifactsPort(),
+        market_history=InMemoryMarketFramesPort({}),
+        portfolio_storage=SqlPortfolioStorage(app_db),
+        storage=SqlLearningStorage(app_db),
+        daily_learning_storage=SqlDailyLearningStorage(app_db),
+    ).readiness(user_id=USER)
     by_code = {i["code"]: i for i in readiness["quality_issues"]}
     assert "missing_execution" in by_code
     assert by_code["missing_execution"]["count"] >= 2
     assert by_code["missing_execution"]["explanation"]
     # Flagged rows are still evidence: the count did not shrink.
-    entry = next(
-        s for s in readiness["strategies"] if s["strategy_id"] == strategy["strategy_id"]
-    )
+    entry = next(s for s in readiness["strategies"] if s["strategy_id"] == strategy["strategy_id"])
     assert entry["forward_trades"] == 3
 
 
@@ -529,20 +637,25 @@ def test_unlinked_rows_are_flagged_not_dropped(app_db, book, tmp_path, strategy)
 
 
 def test_provenance_survives_reconcile_and_rebuild(app_db, book, tmp_path, genuine):
-    from atr.execution.oms import PROVENANCE_FORWARD, PROVENANCE_KEY
-    from atr.services.journal import TradeJournalService
+    from forward.execution.oms import PROVENANCE_FORWARD, PROVENANCE_KEY
+    from forward.services.journal import TradeJournalService
+    from forward.services.paper_ledger import PaperLedger
 
     order_id = _entry_order_id(app_db, genuine["deployment_id"])
     with app_db.session() as session:
         raws = [
-            e.get("raw") for e in OrderEventRepository.history(session, order_id)
+            e.get("raw")
+            for e in OrderEventRepository.history(session, order_id)
             if e.get("to_status") == "NEW"
         ]
     raw = json.loads(raws[0]) if isinstance(raws[0], str) else raws[0]
     assert raw.get(PROVENANCE_KEY) == PROVENANCE_FORWARD
 
     before = {r["trade_ref"]: r["evidence_grade"] for r in _dataset(app_db, tmp_path).rows}
-    TradeJournalService(db=app_db).reconcile(USER, genuine["deployment_id"])
+    TradeJournalService(
+        storage=SqlTradeJournalStorage(app_db),
+        ledger=PaperLedger(storage=SqlPaperLedgerStorage(app_db), price_source=no_live_price),
+    ).reconcile(USER, genuine["deployment_id"])
     after = {r["trade_ref"]: r["evidence_grade"] for r in _dataset(app_db, tmp_path).rows}
     assert before == after, "reconcile must not move a single grade"
     genuine_refs = [
@@ -557,12 +670,14 @@ def test_provenance_survives_reconcile_and_rebuild(app_db, book, tmp_path, genui
 def test_no_repository_method_can_rewrite_provenance():
     mutating = {"update", "delete", "rewrite", "set_provenance", "set_grade", "amend"}
     event_writers = {
-        name for name in dir(OrderEventRepository)
+        name
+        for name in dir(OrderEventRepository)
         if name in mutating or "stamp" in name or "provenance" in name
     } - {"append"}
     assert event_writers == set(), f"append-only log grew writers: {event_writers}"
     journal_writers = {
-        name for name in dir(TradeJournalRepository)
+        name
+        for name in dir(TradeJournalRepository)
         if "grade" in name.lower() or "evidence" in name.lower()
     }
     assert journal_writers == set(), f"journal grew grade writers: {journal_writers}"
@@ -574,15 +689,23 @@ def test_no_repository_method_can_rewrite_provenance():
 
 
 def test_readiness_reads_without_writing(app_db, book, tmp_path, strategy):
-    from atr.signal_context.service import SignalContextService
 
-    service = LearningService(db=app_db)
+    service = LearningService(
+        artifacts=InMemoryLearningArtifactsPort(),
+        market_history=InMemoryMarketFramesPort({}),
+        portfolio_storage=SqlPortfolioStorage(app_db),
+        storage=SqlLearningStorage(app_db),
+        daily_learning_storage=SqlDailyLearningStorage(app_db),
+    )
     before = _governance_snapshot(app_db)
 
     service.dataset(refresh=True, user_id=USER)
     service.readiness(user_id=USER)
     service.forward_evidence_counts(user_id=USER)
-    SignalContextService(db=app_db).effectiveness(USER)
+    signal_context_service_for_test(
+        app_db,
+        data_root=Path(get_settings().research_data_directory),
+    ).effectiveness(USER)
 
     assert _governance_snapshot(app_db) == before
 

@@ -14,7 +14,13 @@ from __future__ import annotations
 
 import pytest
 
-from atr.screener.conditions import (
+from forward.config.settings import get_settings
+from forward.core.errors import ScreenerError
+from forward.data.screener_market import (
+    ScreenerMarketDataAdapter,
+    clear_screener_frame_cache,
+)
+from forward.screener.conditions import (
     ConditionError,
     Group,
     Leaf,
@@ -24,29 +30,51 @@ from atr.screener.conditions import (
     parse_node,
     validate_tree,
 )
-from atr.screener.indicators import (
+from forward.screener.indicators import (
     AVAILABLE_INDICATORS,
     INDICATOR_INDEX,
     indicator_series,
     last_value,
     resolve_indicator,
 )
-from atr.screener.service import (
-    ScreenerError,
-    load_frames,
-    rank_rows,
-    reset_screener_service,
-)
+from forward.screener.service import ScreenerConfig, ScreenerService, rank_rows
+
+
+def _screener_config() -> ScreenerConfig:
+    """Build the same required policy used by application composition."""
+    values = get_settings().ui_screener
+    return ScreenerConfig(
+        max_leaves=int(values["max_leaves"]),
+        max_group_count=int(values["max_group_count"]),
+        min_bars=int(values["min_bars"]),
+        worker_count=int(values["worker_count"]),
+        default_sort=str(values["default_sort"]),
+        default_universe=str(values["default_universe"]),
+        default_exchange=str(values["default_exchange"]),
+        default_result_limit=int(values["default_result_limit"]),
+        default_sort_descending=bool(values["default_sort_descending"]),
+    )
 
 
 @pytest.fixture()
-def screener(fresh_env, master):
+def screener(fresh_env, master, app_db):
     """A screener service over the synthetic cache, with a cold frame cache."""
-    reset_screener_service()
-    from atr.screener.service import ScreenerService
+    from forward.appdb.screener_storage import SqlScreenerStorageAdapter
 
-    yield ScreenerService()
-    reset_screener_service()
+    market_data = ScreenerMarketDataAdapter(
+        master, cache_ttl_seconds=get_settings().screener_frame_cache_seconds
+    )
+    clear_screener_frame_cache()
+    yield ScreenerService(SqlScreenerStorageAdapter(app_db), market_data, _screener_config())
+    clear_screener_frame_cache()
+
+
+@pytest.fixture()
+def screener_market(master):
+    """A market-data adapter over the synthetic history cache."""
+    return ScreenerMarketDataAdapter(
+        master, cache_ttl_seconds=get_settings().screener_frame_cache_seconds
+    )
 
 
 @pytest.fixture()
@@ -57,7 +85,7 @@ def users(app_db) -> tuple[str, str]:
     cannot be made up: the database enforces ownership rather than trusting the
     service to check it.
     """
-    from atr.appdb.repositories import UserRepository
+    from forward.appdb.identity_repository import UserRepository
 
     with app_db.session() as session:
         first = UserRepository.create(
@@ -78,9 +106,7 @@ def reliance(master):
     """
     import pandas as pd
 
-    from atr.instruments.service import get_instrument_master
-
-    owner = get_instrument_master()
+    owner = master
     record = owner.get("RELIANCE")
     return pd.read_parquet(owner.cache_root / record.cache_file)
 
@@ -495,10 +521,10 @@ class TestService:
         ordered = [r["symbol"] for r in rank_rows(rows, "rel_volume")]
         assert ordered == ["AAA", "ZZZ"]
 
-    def test_an_unknown_sort_field_falls_back_to_the_default(self):
+    def test_an_unknown_sort_field_is_rejected(self):
         rows = [{"symbol": "A", "rel_volume": 1.0}, {"symbol": "B", "rel_volume": 5.0}]
-        ordered = [r["symbol"] for r in rank_rows(rows, "definitely_not_a_field")]
-        assert ordered == ["B", "A"]  # DEFAULT_SORT is rel_volume, descending
+        with pytest.raises(ScreenerError, match="unknown sort field"):
+            rank_rows(rows, "definitely_not_a_field")
 
     def test_the_result_reports_what_it_scanned(self, screener):
         """``scanned`` and ``as_of`` are how a user knows the screen ran over the
@@ -532,11 +558,11 @@ class TestService:
         report = screener.validate({"indicator": "rsi", "op": "<", "value": 70})
         assert report["valid"] is True
 
-    def test_frames_are_cached_across_runs(self, screener):
+    def test_frames_are_cached_across_runs(self, screener_market):
         """Reading the cache twice must not re-read it: the TTL cache is what
         makes a UI usable at all."""
-        first = load_frames("NSEEQ")
-        second = load_frames("NSEEQ")
+        first = screener_market.frames("NSEEQ")
+        second = screener_market.frames("NSEEQ")
         assert first is second
 
 
@@ -550,22 +576,20 @@ class TestUniverseCoverage:
     names — an 84% silent omission.
     """
 
-    def test_frames_are_keyed_by_bare_ticker_not_filename(self, master):
+    def test_frames_are_keyed_by_bare_ticker_not_filename(self, screener_market):
         """``load_frames`` must re-key by ticker, or every lookup misses."""
-        frames = load_frames("NSEEQ", force=True)
+        frames = screener_market.frames("NSEEQ", force=True)
         assert frames, "no frames loaded"
         dashed = [k for k in frames if k.endswith("-EQ")]
         assert not dashed, f"frames still keyed by filename: {dashed[:5]}"
 
-    def test_every_universe_member_resolves_to_a_frame(self, master):
+    def test_every_universe_member_resolves_to_a_frame(self, master, screener_market):
         """Every symbol a universe advertises as scannable must actually load.
 
         This is the assertion that would have caught the 435/2,654 bug: the
         universe reported one size and the scan quietly evaluated another.
         """
-        from atr.instruments.service import get_instrument_master
-
-        owner = get_instrument_master()
+        owner = master
         expected = sorted(
             r.symbol
             for r in owner.snapshot().records.values()
@@ -573,21 +597,17 @@ class TestUniverseCoverage:
         )
         assert expected, "the synthetic cache produced no NSEEQ records"
 
-        frames = load_frames("NSEEQ", expected, force=True)
+        frames = screener_market.frames("NSEEQ", expected, force=True)
         missing = [s for s in expected if s not in frames]
         assert not missing, f"{len(missing)} of {len(expected)} scannable symbols did not load"
 
-    def test_a_subset_read_matches_a_full_read(self, master):
+    def test_a_subset_read_matches_a_full_read(self, screener_market):
         """The two code paths must agree. ``run`` passes an explicit symbol list
         (the subset path) while a bare ``load_frames`` takes the full path; when
         these disagreed, the scan and the universe report contradicted each
         other."""
-        from atr.instruments.service import get_instrument_master
-
-        owner = get_instrument_master()
-        symbols = sorted(owner.snapshot().records.keys())
-        full = load_frames("NSEEQ", force=True)
-        subset = load_frames("NSEEQ", list(full.keys()), force=True)
+        full = screener_market.frames("NSEEQ", force=True)
+        subset = screener_market.frames("NSEEQ", list(full.keys()), force=True)
         assert set(subset.keys()) == set(full.keys())
 
     def test_a_symbol_present_in_a_universe_can_be_scanned(self, screener):
@@ -709,19 +729,26 @@ class TestSavedScans:
     def test_update_rejects_an_invalid_definition(self, screener, users):
         owner, _ = users
         saved = screener.save(
-            owner, name="Valid", definition={"conditions": {"indicator": "rsi", "op": "<", "value": 70}}
+            owner,
+            name="Valid",
+            definition={"conditions": {"indicator": "rsi", "op": "<", "value": 70}},
         )
         with pytest.raises(ScreenerError):
             screener.update_saved(
                 owner, saved["scan_id"], definition={"conditions": {"indicator": "rsl", "op": ">"}}
             )
         # The original must survive a rejected edit.
-        assert screener.get_saved(owner, saved["scan_id"])["definition"]["conditions"]["indicator"] == "rsi"
+        assert (
+            screener.get_saved(owner, saved["scan_id"])["definition"]["conditions"]["indicator"]
+            == "rsi"
+        )
 
     def test_update_cannot_touch_another_users_scan(self, screener, users):
         owner, intruder = users
         saved = screener.save(
-            owner, name="Private", definition={"conditions": {"indicator": "rsi", "op": "<", "value": 70}}
+            owner,
+            name="Private",
+            definition={"conditions": {"indicator": "rsi", "op": "<", "value": 70}},
         )
         with pytest.raises(ScreenerError) as excinfo:
             screener.update_saved(intruder, saved["scan_id"], name="Hijacked")
@@ -740,7 +767,9 @@ class TestSavedScans:
         """Editing a scan without renaming it must not collide with itself."""
         owner, _ = users
         saved = screener.save(
-            owner, name="Unchanged", definition={"conditions": {"indicator": "rsi", "op": "<", "value": 70}}
+            owner,
+            name="Unchanged",
+            definition={"conditions": {"indicator": "rsi", "op": "<", "value": 70}},
         )
         updated = screener.update_saved(
             owner,
@@ -899,7 +928,7 @@ class TestLayering:
         from pathlib import Path
 
         offenders: list[str] = []
-        root = Path("src/atr/screener")
+        root = Path("src/forward/screener")
         for path in root.rglob("*.py"):
             tree = ast.parse(path.read_text(encoding="utf-8"))
             for node in ast.walk(tree):
@@ -909,6 +938,6 @@ class TestLayering:
                     names = [node.module or ""]
                 else:
                     continue
-                if any(name.startswith("atr.api") for name in names):
+                if any(name.startswith("forward.api") for name in names):
                     offenders.append(f"{path.name}:{node.lineno} -> {names}")
         assert not offenders, "the screener imports the API:\n" + "\n".join(offenders)

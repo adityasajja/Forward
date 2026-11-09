@@ -6,7 +6,7 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
-from atr.api.main import app
+from forward.api.main import app
 
 
 @pytest.fixture()
@@ -22,7 +22,7 @@ def owner(fresh_env, master) -> TestClient:
 
 
 def test_starter_flow_on_an_empty_database(owner, market_cache, monkeypatch):
-    monkeypatch.setattr("atr.research.hunt.STOCKS", market_cache / "iifl_daily" / "NSEEQ")
+    monkeypatch.setattr("forward.research.hunt.STOCKS", market_cache / "iifl_daily" / "NSEEQ")
     seeded = owner.post("/api/v1/strategies/seed")
     assert seeded.status_code in (200, 201), seeded.text
     body = seeded.json()

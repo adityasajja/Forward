@@ -1,1 +1,0 @@
-"""ATR — algorithmic trading backend."""

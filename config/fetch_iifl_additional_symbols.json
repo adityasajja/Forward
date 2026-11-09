@@ -1,0 +1,16 @@
+{
+  "symbols": [
+    "AXISBANK", "SBIN", "BAJFINANCE", "BAJAJFINSV", "DRREDDY",
+    "ASIANPAINT", "SUNPHARMA", "HCLTECH", "ITC", "JSWSTEEL",
+    "ADANIPORTS", "CIPLA", "POWERGRID", "NTPC", "ONGC", "M&M"
+  ],
+  "exchange": "NSEEQ",
+  "interval": "1m",
+  "from_date": "2025-09-01",
+  "to_date": "2026-09-15",
+  "cache_directory": "data/iifl_1min",
+  "chunk_days": 45,
+  "pause_between_chunks_seconds": 0.05,
+  "pause_between_symbols_seconds": 1.0,
+  "skip_existing_cache": true
+}

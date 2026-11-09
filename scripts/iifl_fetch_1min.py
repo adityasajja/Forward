@@ -18,10 +18,10 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from atr.brokers.iifl.auth import SessionStore, Session  # noqa: E402
-from atr.brokers.iifl.client import IiflClient  # noqa: E402
-from atr.brokers.iifl.contracts import InstrumentMaster  # noqa: E402
-from atr.config.settings import get_settings  # noqa: E402
+from forward.brokers.iifl.auth import SessionStore, Session, login_url  # noqa: E402
+from forward.brokers.iifl.client import IiflClient  # noqa: E402
+from forward.brokers.iifl.contracts import InstrumentMaster  # noqa: E402
+from forward.config.settings import get_settings  # noqa: E402
 
 p = print
 def P(*a, **kw): kw.setdefault("flush", True); p(*a, **kw)
@@ -31,7 +31,7 @@ def P(*a, **kw): kw.setdefault("flush", True); p(*a, **kw)
 def fetch_1min(client, exchange, instrument_id, symbol, from_dt, to_dt,
                max_days=25, sleep=0.15):
     """Fetch 1-minute candles in chunks (API limit ~25 trading days per request)."""
-    from atr.brokers.iifl.client import _fmt_date
+    from forward.brokers.iifl.client import _fmt_date
     from_dt_str = _fmt_date(from_dt)
     to_dt_str = _fmt_date(to_dt)
 

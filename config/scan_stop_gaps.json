@@ -1,0 +1,4 @@
+{
+  "examples_to_display": 10,
+  "overshoot_threshold_percentage_points": 0.5
+}

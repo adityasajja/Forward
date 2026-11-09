@@ -1,0 +1,27 @@
+{
+  "data_directory": "data/iifl_daily/NSEEQ",
+  "minimum_history_bars": 300,
+  "split_fraction": 0.5,
+  "momentum_days": [1, 20],
+  "forward_days": [5, 20],
+  "trend_days": 50,
+  "high_lookback_days": 252,
+  "high_minimum_periods": 120,
+  "relative_volume_days": 20,
+  "breakout_days": 20,
+  "minimum_samples": 300,
+  "setups": {
+    "breakout_volume_ratio": 1.5,
+    "leader_resting_relative_strength": 10.0,
+    "leader_resting_off_high_min_pct": -12.0,
+    "leader_resting_off_high_max_pct": -3.0,
+    "leader_resting_daily_return_min_pct": -3.0,
+    "leader_resting_daily_return_max_pct": 1.0,
+    "leader_at_high_relative_strength": 15.0,
+    "leader_at_high_max_off_pct": -3.0,
+    "strong_run_relative_strength": 25.0,
+    "oversold_return_pct": -20.0
+  },
+  "breadth_bins": [0, 25, 35, 50, 65, 101],
+  "breadth_labels": ["<25%", "25-35%", "35-50%", "50-65%", ">65%"]
+}

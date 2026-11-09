@@ -1,14 +1,19 @@
 """IIFL's documented per-endpoint limits, applied before every call."""
 
-import pytest
-
 import multiprocessing
 import time
 
 import httpx
+import pytest
 
-from atr.brokers.iifl.client import IiflApiError, IiflClient, _is_retryable
-from atr.brokers.iifl.ratelimit import MemoryWindow, RateLimits, SharedWindow, allowed, bucket_for
+from forward.brokers.iifl.client import IiflApiError, IiflClient, _is_retryable
+from forward.brokers.iifl.ratelimit import (
+    MemoryWindow,
+    RateLimits,
+    SharedWindow,
+    allowed,
+    bucket_for,
+)
 
 
 class Clock:
@@ -167,16 +172,15 @@ def test_separate_processes_together_stay_within_the_limit(tmp_path):
         assert len([t for t in rows if start <= t < start + 1.0]) <= allowed(3)
 
 
-def test_a_broken_shared_file_falls_back_to_this_process_and_never_blocks_a_call(tmp_path):
+def test_a_broken_shared_file_stops_the_request():
     class Broken:
         def try_take(self, key, limit, clock):
             raise OSError("disk full")
 
     clock = Clock()
     rl = RateLimits(Broken(), now=clock.now, sleep=clock.sleep)
-    for _ in range(2):
-        assert rl.wait("GET", "/holdings") == 0
-    assert rl.wait("GET", "/holdings") > 0  # still limited, by the in-process count
+    with pytest.raises(OSError, match="disk full"):
+        rl.wait("GET", "/holdings")
 
 
 # -- a 429 is retried with backoff, other client errors are not ---------------------------------
@@ -188,8 +192,9 @@ def test_429_is_retryable_but_other_client_errors_are_not():
 
 
 def test_the_client_waits_its_turn_and_retries_a_429(tmp_path, monkeypatch):
-    from atr.brokers.iifl.auth import Session, SessionStore
     from datetime import datetime
+
+    from forward.brokers.iifl.auth import Session, SessionStore
 
     answers = [httpx.Response(429), httpx.Response(200, json={"status": "Ok", "result": []})]
     calls = []
@@ -199,7 +204,14 @@ def test_the_client_waits_its_turn_and_retries_a_429(tmp_path, monkeypatch):
         return answers.pop(0)
 
     store = SessionStore(tmp_path / "session.json")
-    client = IiflClient(session_store=store)
+    client = IiflClient(
+        app_key="test-key",
+        app_secret="test-secret",
+        base_url="https://api.test/v1",
+        timeout=1,
+        session_store=store,
+        force_ipv4=False,
+    )
     client._http = httpx.Client(base_url="https://api.test/v1", transport=httpx.MockTransport(handler))
     client.set_session(Session("tok", "C1", datetime.now().astimezone()))
     monkeypatch.setattr("time.sleep", lambda s: None)  # skip the backoff wait

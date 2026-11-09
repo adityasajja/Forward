@@ -34,6 +34,8 @@ Usage:
 from __future__ import annotations
 
 import sys
+import argparse
+import json
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -41,34 +43,52 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
-PANEL = Path("data/signals/panel_nseeq_120.parquet")
-HORIZON = 21
+ROOT = Path(__file__).resolve().parents[1]
+CONFIG_PATH = ROOT / "config" / "research_momentum_or_vol.json"
 
 
-def load_close() -> pd.DataFrame:
-    frame = pd.read_parquet(PANEL)
+def load_close(config: dict) -> pd.DataFrame:
+    """Load configured close prices by date and symbol."""
+    frame = pd.read_parquet(ROOT / config["panel_file"])
     frame["ts"] = pd.to_datetime(frame["ts"])
-    return frame.pivot_table(index="ts", columns="symbol", values="close").sort_index()
+    close = frame.pivot_table(index="ts", columns="symbol", values="close").sort_index()
+    if close.empty:
+        raise ValueError("The configured panel has no close-price observations.")
+    return close
 
 
-def spread_by(long: pd.DataFrame, bucket_col: str, factor: str, n: int = 5) -> pd.Series:
+def spread_by(long: pd.DataFrame, factor: str, quantile_count: int) -> pd.Series:
+    """Return forward means by configured factor quantile."""
     ranked = long[factor].rank(method="first")
-    labels = pd.qcut(ranked, n, labels=False)
+    labels = pd.qcut(ranked, quantile_count, labels=False)
     return long.groupby(labels)["fwd"].mean() * 100.0
 
 
 def main() -> int:
-    close = load_close()
+    """Compare momentum and volatility hypotheses using configured inputs."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", type=Path, default=CONFIG_PATH)
+    config_path = parser.parse_args().config
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    print(f"Configuration: {config_path.resolve()}")
+    close = load_close(config)
     returns = close.pct_change()
-    fwd = close.pct_change(HORIZON).shift(-HORIZON)
-    mom = (close.shift(21) / close.shift(147) - 1).shift(1)
-    vol = returns.rolling(126).std().shift(1)
+    horizon = config["forward_horizon_days"]
+    fwd = close.pct_change(horizon).shift(-horizon)
+    mom = (
+        close.shift(config["momentum_recent_days"])
+        / close.shift(config["momentum_history_days"])
+        - 1
+    ).shift(1)
+    vol = returns.rolling(config["volatility_lookback_days"]).std().shift(1)
 
     long = pd.concat(
         [mom.stack().rename("mom"), vol.stack().rename("vol"), fwd.stack().rename("fwd")],
         axis=1,
     ).dropna()
 
+    if long.empty:
+        raise ValueError("The configured panel has no rows after factor warmup.")
     print(f"n = {len(long):,} symbol-months, "
           f"{close.index[0]:%Y-%m} -> {close.index[-1]:%Y-%m}\n")
 
@@ -78,12 +98,14 @@ def main() -> int:
     print("    -> momentum is", "strongly" if abs(rank_corr) > 0.6 else "only weakly",
           "related to volatility\n")
 
-    print("    momentum quintile spread WITHIN each vol tercile:")
+    print("    momentum quantile spread WITHIN each vol bucket:")
     long = long.copy()
-    long["vter"] = pd.qcut(long["vol"].rank(method="first"), 3, labels=False)
-    for v in range(3):
+    long["vter"] = pd.qcut(
+        long["vol"].rank(method="first"), config["volatility_bucket_count"], labels=False
+    )
+    for v in range(config["volatility_bucket_count"]):
         part = long[long["vter"] == v]
-        table = spread_by(part, "vter", "mom")
+        table = spread_by(part, "mom", config["momentum_quantile_count"])
         print(f"      vol T{v + 1} (n={len(part):,}): "
               + "  ".join(f"Q{i + 1} {x:+.2f}%" for i, x in enumerate(table))
               + f"   spread {table.iloc[-1] - table.iloc[0]:+.2f}%")
@@ -93,29 +115,35 @@ def main() -> int:
     market = long.groupby(level=0)["fwd"].mean()
     long["mkt"] = long.index.get_level_values(0).map(market)
     long["exc"] = long["fwd"] - long["mkt"]
-    table = spread_by(long, "vter", "mom")
     print("(b) momentum quintiles on BETA-DEMEANED forward return (excess vs EW):")
     ranked = long["mom"].rank(method="first")
-    labels = pd.qcut(ranked, 5, labels=False)
+    labels = pd.qcut(ranked, config["momentum_quantile_count"], labels=False)
     excess_table = long.groupby(labels)["exc"].mean() * 100.0
     print("      " + "  ".join(f"Q{i + 1} {x:+.2f}%" for i, x in enumerate(excess_table))
           + f"   spread {excess_table.iloc[-1] - excess_table.iloc[0]:+.2f}%")
     print()
 
     # ---- cross-sectional vol, beta-demeaned --------------------------------
-    vol_table = long.groupby(pd.qcut(long["vol"].rank(method="first"), 5, labels=False))["exc"].mean() * 100.0
+    vol_table = long.groupby(pd.qcut(
+        long["vol"].rank(method="first"), config["volatility_quantile_count"], labels=False
+    ))["exc"].mean() * 100.0
     print("    vols quintiles on BETA-DEMEANED return (the honest cross-sectional test):")
     print("      " + "  ".join(f"Q{i + 1} {x:+.2f}%" for i, x in enumerate(vol_table))
           + f"   spread {vol_table.iloc[-1] - vol_table.iloc[0]:+.2f}%")
     print("    -> a spread near zero means the cross-sectional vol effect was beta\n")
 
     # ---- time-series: does low index vol precede high index return? --------
-    ew = returns.mean(axis=1).fillna(0)
+    ew = returns.mean(axis=1)
     idx = (1 + ew).cumprod()
-    idx_vol = ew.rolling(20).std() * np.sqrt(252)
-    fwd_idx = idx.pct_change(HORIZON).shift(-HORIZON) * 100
+    idx_vol = (
+        ew.rolling(config["index_volatility_lookback_days"]).std()
+        * np.sqrt(config["trading_days_per_year"])
+    )
+    fwd_idx = idx.pct_change(horizon).shift(-horizon) * 100
     ts = pd.concat([idx_vol.rename("v"), fwd_idx.rename("f")], axis=1).dropna()
-    ts_table = ts.groupby(pd.qcut(ts["v"].rank(method="first"), 5, labels=False))["f"].mean()
+    ts_table = ts.groupby(pd.qcut(
+        ts["v"].rank(method="first"), config["time_series_volatility_quantiles"], labels=False
+    ))["f"].mean()
     print("(c) TIME-SERIES: index vol quintile -> mean forward 21d return")
     print("      " + "  ".join(f"Q{i + 1} {x:+.2f}%" for i, x in enumerate(ts_table))
           + f"   spread {ts_table.iloc[-1] - ts_table.iloc[0]:+.2f}%")

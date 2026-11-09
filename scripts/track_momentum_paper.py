@@ -29,7 +29,6 @@ from __future__ import annotations
 import argparse
 import json
 import statistics
-import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -37,30 +36,15 @@ import numpy as np
 import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
-DAILY = ROOT / "data" / "iifl_daily" / "NSEEQ"
-PICKS_JSON = ROOT / "data" / "self_learning" / "weekly_stock_picks.json"
-LEDGER = ROOT / "data" / "paper_momentum"
-PICKS_LOG = LEDGER / "picks.jsonl"
-SETTLE_LOG = LEDGER / "settlements.jsonl"
-
-#: The rule the weekly job actually applies, and whose stats it quotes: rank the
-#: liquid universe by 26-week momentum, hold the top 10. The near-52w-high and
-#: volume-surge conditions were tested and add nothing (lift 1.00–1.05x), so the
-#: ranking is momentum alone — label the picks with the stats of *that* rule,
-#: not of a filter the selection does not apply.
-FILTER = "top_decile_ret_26w"
-TARGET = 0.05
-SETTLE_DAYS = 7
+CONFIG_PATH = ROOT / "config" / "track_momentum_paper.json"
 
 
-def load_close(symbol: str) -> pd.Series | None:
-    path = DAILY / f"{symbol}.parquet"
+def load_close(symbol: str, data_directory: Path) -> pd.Series | None:
+    """Load one symbol's daily close series from the configured cache."""
+    path = data_directory / f"{symbol}.parquet"
     if not path.exists():
         return None
-    try:
-        df = pd.read_parquet(path, columns=["ts", "close"])
-    except Exception:  # noqa: BLE001
-        return None
+    df = pd.read_parquet(path, columns=["ts", "close"])
     df = df.dropna(subset=["close"])
     df = df[df["close"] > 0].sort_values("ts")
     if df.empty:
@@ -97,9 +81,7 @@ def read_jsonl(path: Path) -> list[dict]:
             try:
                 out.append(json.loads(line))
             except json.JSONDecodeError:
-                # A half-written line is not a record. Skip it rather than
-                # letting a parse error discard the whole history.
-                continue
+                raise ValueError(f"Invalid JSON record in {path}.") from None
     return out
 
 
@@ -109,20 +91,20 @@ def append_jsonl(path: Path, record: dict) -> None:
         fh.write(json.dumps(record, sort_keys=True) + "\n")
 
 
-def settle() -> int:
+def settle(config: dict, picks_log: Path, settle_log: Path) -> int:
     """Score any recorded week whose outcome is now knowable."""
-    picks = read_jsonl(PICKS_LOG)
-    done = {r["week"] for r in read_jsonl(SETTLE_LOG)}
+    picks = read_jsonl(picks_log)
+    done = {r["week"] for r in read_jsonl(settle_log)}
     n = 0
     for rec in picks:
         week = rec["week"]
         if week in done:
             continue
         entry_ts = pd.Timestamp(week)
-        exit_ts = entry_ts + pd.Timedelta(days=SETTLE_DAYS)
+        exit_ts = entry_ts + pd.Timedelta(days=config["settlement_days"])
         returns, missing = {}, []
         for p in rec["picks"]:
-            s = load_close(p["symbol"])
+            s = load_close(p["symbol"], ROOT / config["daily_data_directory"])
             if s is None:
                 missing.append(p["symbol"])
                 continue
@@ -138,80 +120,86 @@ def settle() -> int:
             print(f"  {week}: not settleable yet (no data through {exit_ts.date()})")
             continue
         vals = np.array(list(returns.values()))
-        append_jsonl(SETTLE_LOG, {
-            "week": week,
-            "settled_at": datetime.now().isoformat(timespec="seconds"),
-            "exit_window_end": str(exit_ts.date()),
-            "returns": returns,
-            "n_settled": len(returns),
-            "missing": missing,
-            "portfolio_return": round(float(vals.mean()), 6),
-            "hits_ge_5pct": int((vals >= TARGET).sum()),
-            "hit_rate_ge_5pct": round(float((vals >= TARGET).mean()), 4),
-            "best": round(float(vals.max()), 4),
-            "worst": round(float(vals.min()), 4),
-        })
+        target = config["target_return_fraction"]
+        append_jsonl(
+            settle_log,
+            {
+                "week": week,
+                "settled_at": datetime.now().isoformat(timespec="seconds"),
+                "exit_window_end": str(exit_ts.date()),
+                "returns": returns,
+                "n_settled": len(returns),
+                "missing": missing,
+                "portfolio_return": round(float(vals.mean()), 6),
+                "hits_ge_target": int((vals >= target).sum()),
+                "hit_rate_ge_target": round(float((vals >= target).mean()), 4),
+                "best": round(float(vals.max()), 4),
+                "worst": round(float(vals.min()), 4),
+            },
+        )
         n += 1
-        print(f"  settled {week}: basket {vals.mean() * 100:+.2f}%  "
-              f"{(vals >= TARGET).sum()}/{len(vals)} picks ≥5%  "
-              f"(best {vals.max() * 100:+.1f}%, worst {vals.min() * 100:+.1f}%)")
+        print(
+            f"  settled {week}: basket {vals.mean() * 100:+.2f}%  "
+            f"{(vals >= target).sum()}/{len(vals)} picks ≥{target:.0%}  "
+            f"(best {vals.max() * 100:+.1f}%, worst {vals.min() * 100:+.1f}%)"
+        )
     return n
 
 
-def record() -> int:
+def record(config: dict, picks_log: Path) -> int:
     """Log the current week's picks with their entry prices, before the outcome."""
-    if not PICKS_JSON.exists():
-        print("no picks file — run research_weekly_stock_picks.py first", file=sys.stderr)
-        return 0
-    data = json.loads(PICKS_JSON.read_text(encoding="utf8"))
+    picks_source = ROOT / config["picks_source_file"]
+    data = json.loads(picks_source.read_text(encoding="utf8"))
     week = data.get("latest_week")
     if not week:
         return 0
-    existing = {r["week"] for r in read_jsonl(PICKS_LOG)}
+    existing = {r["week"] for r in read_jsonl(picks_log)}
     if week in existing:
         print(f"  {week} already recorded")
         return 0
 
-    entry = data["picks"].get(FILTER)
+    filter_name = config["filter_name"]
+    entry = data["picks"].get(filter_name)
     if not entry:
-        print(f"  filter {FILTER} absent from picks file", file=sys.stderr)
-        return 0
-    hist = data["filters"].get(FILTER, {})
+        raise ValueError(f"Configured filter {filter_name!r} is absent from picks source.")
+    hist = data["filters"].get(filter_name, {})
     ts = pd.Timestamp(week)
     picks = []
     for p in entry["names"]:
-        s = load_close(p["symbol"])
+        s = load_close(p["symbol"], ROOT / config["daily_data_directory"])
         px = close_at(s, ts) if s is not None else None
         if px is None or not np.isfinite(px) or px <= 0:
-            print(f"  no entry price for {p['symbol']} — skipped", file=sys.stderr)
-            continue
+            raise ValueError(f"No valid entry close for configured pick {p['symbol']}.")
         picks.append({"symbol": p["symbol"], "entry": round(px, 4)})
     if not picks:
         return 0
 
-    append_jsonl(PICKS_LOG, {
-        "week": week,
-        "recorded_at": datetime.now().isoformat(timespec="seconds"),
-        "filter": FILTER,
-        "n_picks": len(picks),
-        "picks": picks,
-        # The expectation is written down now, before the outcome exists. A
-        # prediction recorded after the fact is not a prediction.
-        "backtest_expectation": {
-            "mean_weekly_pct": hist.get("mean_next_week_pct"),
-            "hit_rate_ge_5pct": hist.get("hit_rate_ge_5pct"),
-            "pct_le_minus5pct": hist.get("pct_le_minus5pct"),
-            "source": "weekly_stock_picks.json filters." + FILTER,
+    append_jsonl(
+        picks_log,
+        {
+            "week": week,
+            "recorded_at": datetime.now().isoformat(timespec="seconds"),
+            "filter": filter_name,
+            "n_picks": len(picks),
+            "picks": picks,
+            # The expectation is written down now, before the outcome exists. A
+            # prediction recorded after the fact is not a prediction.
+            "backtest_expectation": {
+                "mean_weekly_pct": hist.get("mean_next_week_pct"),
+                "hit_rate_ge_target": hist.get("hit_rate_ge_5pct"),
+                "pct_le_minus5pct": hist.get("pct_le_minus5pct"),
+                "source": "weekly_stock_picks.json filters." + filter_name,
+            },
         },
-    })
-    print(f"  recorded {week}: {len(picks)} picks — "
-          + ", ".join(p["symbol"] for p in picks))
+    )
+    print(f"  recorded {week}: {len(picks)} picks — " + ", ".join(p["symbol"] for p in picks))
     return 1
 
 
-def status() -> None:
-    picks = {r["week"]: r for r in read_jsonl(PICKS_LOG)}
-    settles = read_jsonl(SETTLE_LOG)
+def status(config: dict, picks_log: Path, settle_log: Path) -> None:
+    """Print paper outcomes from the configured append-only ledger."""
+    picks = {r["week"]: r for r in read_jsonl(picks_log)}
+    settles = read_jsonl(settle_log)
     if not picks:
         print("no paper record yet")
         return
@@ -223,43 +211,55 @@ def status() -> None:
         return
 
     rets = [s["portfolio_return"] for s in settles]
-    hits = [s["hit_rate_ge_5pct"] for s in settles]
+    hits = [s["hit_rate_ge_target"] for s in settles]
     # Backfilled weeks carry no expectation, so filter the Nones out rather
     # than crashing — and report how many settled weeks the comparison covers.
-    exp_mean = [picks[s["week"]]["backtest_expectation"]["mean_weekly_pct"]
-                for s in settles if s["week"] in picks
-                and picks[s["week"]]["backtest_expectation"]["mean_weekly_pct"] is not None]
-    exp_hit = [picks[s["week"]]["backtest_expectation"]["hit_rate_ge_5pct"]
-               for s in settles if s["week"] in picks
-               and picks[s["week"]]["backtest_expectation"]["hit_rate_ge_5pct"] is not None]
+    exp_mean = [
+        picks[s["week"]]["backtest_expectation"]["mean_weekly_pct"]
+        for s in settles
+        if s["week"] in picks
+        and picks[s["week"]]["backtest_expectation"]["mean_weekly_pct"] is not None
+    ]
+    exp_hit = [
+        picks[s["week"]]["backtest_expectation"]["hit_rate_ge_target"]
+        for s in settles
+        if s["week"] in picks
+        and picks[s["week"]]["backtest_expectation"]["hit_rate_ge_target"] is not None
+    ]
 
     equity = float(np.prod([1 + r for r in rets]))
     print(f"\n  weeks settled      {len(rets)}")
     print(f"  basket mean/week   {100 * statistics.fmean(rets):+.3f}%")
-    print(f"  per-pick hit ≥5%   {100 * statistics.fmean(hits):.2f}%   "
-          f"(backtest expects 20.17%)")
+    target_pct = config["target_return_fraction"] * 100
+    print(
+        f"  per-pick hit ≥{target_pct:g}%   {100 * statistics.fmean(hits):.2f}%   "
+        f"(backtest expects {config['historical_expected_hit_rate_pct']:.2f}%)"
+    )
     print(f"  cumulative         {100 * (equity - 1):+.2f}%")
     print(f"  best / worst week  {100 * max(rets):+.2f}% / {100 * min(rets):+.2f}%")
     wins = sum(1 for r in rets if r > 0)
     print(f"  positive weeks     {wins}/{len(rets)}")
     if exp_mean:
-        print(f"\n  vs backtest, on the {len(exp_mean)} live weeks that carry an "
-              f"expectation:")
+        print(f"\n  vs backtest, on the {len(exp_mean)} live weeks that carry an expectation:")
         print(f"    basket mean/week {100 * statistics.fmean(exp_mean):+.3f}%")
         print(f"    per-pick hit     {statistics.fmean(exp_hit):.2f}%")
 
     # A forward record needs ~a year before it can distinguish anything. Say so
     # rather than letting a handful of weeks read as confirmation.
-    if len(rets) < 52:
-        print(f"\n  NOTE: {len(rets)} of ~52 weeks needed. Too short to confirm or "
-              f"refute the backtest — treat it as a running sanity check only.")
+    if len(rets) < config["status_minimum_settled_weeks"]:
+        print(
+            f"\n  NOTE: {len(rets)} of ~{config['status_minimum_settled_weeks']} weeks needed. Too short to confirm or "
+            f"refute the backtest — treat it as a running sanity check only."
+        )
     print("\n  per week:")
     for s in sorted(settles, key=lambda x: x["week"]):
-        print(f"    {s['week']}  {100 * s['portfolio_return']:+6.2f}%  "
-              f"{s['hits_ge_5pct']}/{s['n_settled']} ≥5%")
+        print(
+            f"    {s['week']}  {100 * s['portfolio_return']:+6.2f}%  "
+            f"{s['hits_ge_target']}/{s['n_settled']} ≥{target_pct:g}%"
+        )
 
 
-def backfill(n_weeks: int) -> int:
+def backfill(n_weeks: int, config: dict, picks_log: Path) -> int:
     """Write picks for the last N historical weeks, so the settlement path is exercised.
 
     These weeks are **in-sample** — the rule was selected on this history — so
@@ -268,14 +268,11 @@ def backfill(n_weeks: int) -> int:
     the panel and then settle it from the *daily cache*: if the two agree, both
     the panel and this ledger are validated against each other.
     """
-    panel_path = ROOT / "data" / "self_learning" / "stock_week_panel.parquet"
-    if not panel_path.exists():
-        print("no panel — run research_weekly_stock_picks.py --rebuild", file=sys.stderr)
-        return 0
+    panel_path = ROOT / config["backfill_panel_file"]
     panel = pd.read_parquet(panel_path)
     panel = panel[np.isfinite(panel["next_ret"]) & ~panel["extreme"]]
     weeks = sorted(panel["week"].unique())[-n_weeks:]
-    existing = {r["week"] for r in read_jsonl(PICKS_LOG)}
+    existing = {r["week"] for r in read_jsonl(picks_log)}
     n = 0
     for wk in weeks:
         week = str(pd.Timestamp(wk).date())
@@ -287,49 +284,67 @@ def backfill(n_weeks: int) -> int:
         # 26-week momentum and hold the top 10. Applying all three quantile
         # masks here would leave ~0.1% of the universe and silently backfill
         # nothing — which is what the first attempt did.
-        if len(grp) < 10:
+        if len(grp) < config["backfill_pick_count"]:
             continue
         picks = [
-            {"symbol": r["symbol"], "entry": round(float(r["close"]), 4),
-             "panel_next_ret": round(float(r["next_ret"]), 6)}
-            for _, r in grp.nlargest(10, "ret_26w").iterrows()
+            {
+                "symbol": r["symbol"],
+                "entry": round(float(r["close"]), 4),
+                "panel_next_ret": round(float(r["next_ret"]), 6),
+            }
+            for _, r in grp.nlargest(config["backfill_pick_count"], "ret_26w").iterrows()
         ]
-        append_jsonl(PICKS_LOG, {
-            "week": week,
-            "recorded_at": datetime.now().isoformat(timespec="seconds"),
-            "filter": FILTER,
-            "source": "backfill (in-sample — harness validation only)",
-            "n_picks": len(picks),
-            "picks": picks,
-            "backtest_expectation": {
-                "mean_weekly_pct": None, "hit_rate_ge_5pct": None,
-                "source": "n/a — backfilled week",
+        append_jsonl(
+            picks_log,
+            {
+                "week": week,
+                "recorded_at": datetime.now().isoformat(timespec="seconds"),
+                "filter": config["filter_name"],
+                "source": "backfill (in-sample — harness validation only)",
+                "n_picks": len(picks),
+                "picks": picks,
+                "backtest_expectation": {
+                    "mean_weekly_pct": None,
+                    "hit_rate_ge_target": None,
+                    "source": "n/a — backfilled week",
+                },
             },
-        })
+        )
         n += 1
     print(f"  backfilled {n} weeks")
     return n
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser()
+    """Settle and record the configured momentum paper ledger."""
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--config", type=Path, default=CONFIG_PATH)
     ap.add_argument("--status", action="store_true")
-    ap.add_argument("--backfill", type=int, default=0,
-                    help="write picks for the last N historical weeks to exercise "
-                         "the settlement path (in-sample; harness validation only)")
+    ap.add_argument(
+        "--backfill",
+        type=int,
+        default=0,
+        help="write picks for the last N historical weeks to exercise "
+        "the settlement path (in-sample; harness validation only)",
+    )
     args = ap.parse_args()
-    LEDGER.mkdir(parents=True, exist_ok=True)
+    config = json.loads(args.config.read_text(encoding="utf-8"))
+    print(f"Configuration: {args.config.resolve()}")
+    ledger = ROOT / config["ledger_directory"]
+    picks_log = ledger / "picks.jsonl"
+    settle_log = ledger / "settlements.jsonl"
+    ledger.mkdir(parents=True, exist_ok=True)
     if args.status:
-        status()
+        status(config, picks_log, settle_log)
         return 0
     if args.backfill:
-        backfill(args.backfill)
+        backfill(args.backfill, config, picks_log)
     print("settling outstanding weeks…")
-    settle()
+    settle(config, picks_log, settle_log)
     print("recording the current week…")
-    record()
+    record(config, picks_log)
     print()
-    status()
+    status(config, picks_log, settle_log)
     return 0
 
 

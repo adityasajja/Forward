@@ -19,34 +19,65 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from atr.appdb.engine import AppDatabase, reset_app_db_cache
-from atr.auth.rate_limit import reset_rate_limiter
-from atr.auth.service import reset_auth_service
-from atr.config.settings import get_settings
-from atr.instruments.service import InstrumentMaster, reset_instrument_master
+from forward.appdb.engine import AppDatabase, reset_app_db_cache
+from forward.config.settings import get_settings
+from forward.data.instrument_catalog import InstrumentMaster
+
+
+class EmptyCachedInstrumentHistory:
+    """Return no cached instrument data to paper runner unit tests."""
+
+    def get(self, symbol: str):
+        """Return no instrument record.
+
+        Args:
+            symbol: Instrument symbol requested by the runner.
+
+        Returns:
+            No instrument record.
+        """
+        return None
+
+    def daily_bars(self, cache_file: str | None):
+        """Return no daily bars.
+
+        Args:
+            cache_file: Cache key requested by the runner.
+
+        Returns:
+            No daily frame.
+        """
+        return None
+
+
+def empty_cached_instrument_history_port() -> EmptyCachedInstrumentHistory:
+    """Build the empty history adapter used by paper runner tests.
+
+    Returns:
+        An adapter that has no listed instruments or cached bars.
+    """
+    return EmptyCachedInstrumentHistory()
 
 
 @pytest.fixture()
 def fresh_env(tmp_path, monkeypatch):
     """Isolated settings + singletons for one test."""
     monkeypatch.setenv("APP_DB_URL", f"sqlite:///{(tmp_path / 'app.db').as_posix()}")
-    # The learning engine reads flat files (the paper ledger, the sector CSVs)
-    # from a data root that defaults to the working directory. Pointing it at
-    # tmp_path is what stops a test asserting "the book is empty" from instead
-    # reading the operator's real paper record — which is exactly what happened
-    # the first time the ledger became a source.
-    monkeypatch.setenv("ATR_DATA_ROOT", str(tmp_path / "data"))
-    monkeypatch.setenv("ATR_SECRET_KEY", "unit-test-key")
+    # Keep flat-file consumers on test-owned data. Learning reads its explicit
+    # research directory; signal context uses its configured market-data root.
+    monkeypatch.setenv("FORWARD_DATA_ROOT", str(tmp_path / "data"))
+    monkeypatch.setenv("RESEARCH_DATA_DIRECTORY", str(tmp_path / "data"))
+    monkeypatch.setenv("FORWARD_SECRET_KEY", "unit-test-key")
     # Live-order tests place orders at whatever time the suite runs; the market-hours guard has its own
     # tests that inject a clock.
     monkeypatch.setenv("ENFORCE_MARKET_HOURS", "false")
     # The audit file sink defaults to <repo>/data/audit: without this, every test run appended to the
     # operator's real audit log.
-    monkeypatch.setenv("ATR_AUDIT_PATH", str(tmp_path / "audit.jsonl"))
+    monkeypatch.setenv("FORWARD_AUDIT_PATH", str(tmp_path / "audit.jsonl"))
     # scrypt is deliberately ~0.2s per hash in production; every API test creates
     # accounts, so that cost was paid dozens of times per file. The cost factor
     # is stored in each hash, so verification still runs the real code path.
-    monkeypatch.setattr("atr.auth.passwords._N", 2**4)
+    monkeypatch.setattr("forward.auth.passwords._N", 2**4)
     # The broker session is a cwd-relative file by default; without this a test
     # run on a machine with a live login talks to the operator's real broker.
     monkeypatch.setenv("IIFL_SESSION_CACHE", str(tmp_path / "iifl_session.json"))
@@ -66,41 +97,40 @@ def fresh_env(tmp_path, monkeypatch):
 def _reset_all() -> None:
     get_settings.cache_clear()
     reset_app_db_cache()
+    from forward.wiring.audit import reset_audit_log_adapter
+    from forward.wiring.auth import reset_auth_service, reset_rate_limiter
+    from forward.wiring.broker_access import reset_broker_access
+
+    reset_audit_log_adapter()
+    reset_broker_access()
     reset_auth_service()
     reset_rate_limiter()
-    reset_instrument_master()
     # The learning service caches a built dataset for the process. Leaving it
     # alive across tests hands the next test a dataset built against the
     # previous test's database and data root.
-    from atr.services.learning import reset_learning_service
+    from forward.services.learning import reset_learning_service
 
     reset_learning_service()
-    # The screener caches both a frame map and (historically) a database handle.
-    # Leaving it out of this list let one test's cached state survive into the
-    # next, which surfaced as a foreign-key failure on a row whose parent the
-    # previous test had created.
-    from atr.screener.service import reset_screener_service
+    from forward.data.screener_market import clear_screener_frame_cache
 
-    reset_screener_service()
-    # The backtest service owns a worker pool. Leaving it alive across tests
-    # lets a run from one test finish and write into the next test's database.
-    from atr.services.backtests import reset_backtest_service
+    clear_screener_frame_cache()
+    # Composed research services share the signal-context adapter and its
+    # configured database and data root.
+    from forward.composition import (
+        reset_backtest_service,
+        reset_daily_learning_service,
+        reset_insights_service,
+    )
+    from forward.wiring.market_intel import reset_market_intel_service
+    from forward.wiring.self_learning import reset_self_learning_engine
+    from forward.wiring.signal_context import reset_signal_context_service
 
     reset_backtest_service()
-    # The signal context service caches a per-date universe scan and holds a
-    # MarketIntelService over the previous test's data root. Leaving it alive
-    # hands the next test contexts scored against stale breadth.
-    from atr.signal_context.service import reset_signal_context_service
-
+    reset_daily_learning_service()
     reset_signal_context_service()
-    # The attribution service holds a database handle and a frame map. Leaving it
-    # alive lets a test that attributed nothing still read the previous test's
-    # rows, which would make an idempotency assertion pass for the wrong reason.
-    from atr.services.attribution import reset_attribution_service
-
-    reset_attribution_service()
-
-
+    reset_self_learning_engine()
+    reset_market_intel_service()
+    reset_insights_service()
 @pytest.fixture()
 def app_db(fresh_env) -> AppDatabase:
     db = AppDatabase()
@@ -167,11 +197,9 @@ def _price_frame(seed: int, periods: int = 300) -> pd.DataFrame:
 
 
 @pytest.fixture()
-def master(market_cache, monkeypatch) -> InstrumentMaster:
-    """An InstrumentMaster over the synthetic cache, installed as the singleton."""
-    instance = InstrumentMaster(cache_root=market_cache)
-    monkeypatch.setattr("atr.instruments.service._master", instance)
-    return instance
+def master(market_cache) -> InstrumentMaster:
+    """An instrument catalog over the synthetic market-data cache."""
+    return InstrumentMaster(cache_root=market_cache)
 
 
 @pytest.fixture()
@@ -185,7 +213,7 @@ def client(fresh_env, master):
     """
     from fastapi.testclient import TestClient
 
-    from atr.api.main import app
+    from forward.api.main import app
 
     return TestClient(app, client=("127.0.0.1", 51234))
 
@@ -195,7 +223,7 @@ def auth_client(fresh_env, master):
     """TestClient with the owner account already bootstrapped."""
     from fastapi.testclient import TestClient
 
-    from atr.api.main import app
+    from forward.api.main import app
 
     test_client = TestClient(app, client=("127.0.0.1", 51234))
     response = test_client.post(

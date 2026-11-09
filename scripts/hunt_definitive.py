@@ -5,15 +5,14 @@ OOS period: 2023-05-11 → 2026-09-17
 
 This script:
 1. Backtests the strategy on daily data with full metrics
-2. Includes an intraday backtest engine (ready for 1-minute data once authenticated)
-3. Generates an equity curve plot
-4. Saves detailed results
+2. Reports walk-forward sub-periods and parameter sensitivity
+3. Saves detailed results
 """
 from __future__ import annotations
 import json
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -28,8 +27,6 @@ def P(*a, **k): k.setdefault("flush", True); p(*a, **k)
 
 
 sys.path.insert(0, str(ROOT / "src"))
-from atr.brokers.iifl.auth import login_url  # noqa: E402
-from atr.config.settings import get_settings  # noqa: E402
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Data loading
@@ -288,30 +285,6 @@ def run_strategy(close, high, low, signal, sl_pct, tp_pct, max_holding, k, step,
         "rebalance_dates": [d.strftime("%Y-%m-%d") for d in date_idx] if all_dates else [],
         "cumulative_curve": [round(float(v), 4) for v in cum],
     }
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Intraday backtest engine (ready for 1-minute data)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def run_intraday_strategy(ohlc_1min, signal_func, sl_pct=1.0, tp_pct=2.0,
-                          max_holding_bars=120, k=5, costs=COST,
-                          regime_filter=None):
-    """Backtest strategy on 1-minute bar data.
-
-    Args:
-        ohlc_1min: dict of symbol -> DataFrame with [ts, open, high, low, close, volume]
-            indexed at 1-minute frequency
-        signal_func: function(ohlc_1min_at_t) -> dict[symbol, score]
-        sl_pct: stop-loss percentage (intraday, typically 1-3%)
-        tp_pct: take-profit percentage (intraday, typically 0.5-3%)
-        max_holding_bars: max bars to hold (e.g., 120 = 2 hours)
-    """
-    # This is the engine that will be used once we have 1-minute data.
-    # Strategy: enter at market on signal, exit on SL/TP/max-holding
-    # Intraday stops/targets can be much tighter (1% SL, 2% TP) for faster
-    # turnover and more compounding opportunities.
-    pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────

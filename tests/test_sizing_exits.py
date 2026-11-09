@@ -1,4 +1,4 @@
-"""Protective-exit tests for `atr.backtest.sizing.SizedStrategy` — the wrapper
+"""Protective-exit tests for `forward.backtest.sizing.SizedStrategy` — the wrapper
 that turns a strategy's bare order into a sized position with stop/target/
 trailing exits. No existing test exercised this mechanism at all before now.
 """
@@ -7,15 +7,14 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
-import pytest
-
-from atr.backtest.costs import SlippageModel
-from atr.backtest.engine import BacktestConfig, BacktestEngine
-from atr.backtest.sizing import ExitPlan, SizedStrategy, SizingPlan
-from atr.core.enums import AssetClass
-from atr.core.models import Bar, Instrument, MarketSnapshot
-from atr.data.base import ListFeed
-from atr.strategy.base import Strategy
+from forward.backtest.engine import BacktestConfig, BacktestEngine
+from forward.backtest.sizing import ExitPlan, SizedStrategy, SizingPlan
+from forward.core.costs import SlippageModel
+from forward.core.enums import AssetClass
+from forward.core.feeds import ListFeed
+from forward.core.instrument_models import Instrument
+from forward.core.market_models import Bar, MarketSnapshot
+from forward.strategy.base import Strategy
 
 EQ = Instrument(symbol="TEST", asset_class=AssetClass.EQUITY, currency="INR")
 

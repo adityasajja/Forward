@@ -32,6 +32,8 @@ Usage:
 from __future__ import annotations
 
 import sys
+import argparse
+import json
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -39,28 +41,41 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
-PANEL = Path("data/signals/panel_nseeq_120.parquet")
-HORIZON = 21
+ROOT = Path(__file__).resolve().parents[1]
+CONFIG_PATH = ROOT / "config" / "research_vol_factor_stress.json"
 
 
-def load_close() -> pd.DataFrame:
-    frame = pd.read_parquet(PANEL)
+def load_close(config: dict) -> pd.DataFrame:
+    """Load the configured panel and return closes by symbol."""
+    frame = pd.read_parquet(ROOT / config["panel_file"])
     frame["ts"] = pd.to_datetime(frame["ts"])
-    return frame.pivot_table(index="ts", columns="symbol", values="close").sort_index()
+    close = frame.pivot_table(index="ts", columns="symbol", values="close").sort_index()
+    if close.empty:
+        raise ValueError("The configured panel has no close-price observations.")
+    return close
 
 
-def quintile_means(long: pd.DataFrame, factor: str, target: str = "exc") -> pd.Series:
-    labels = pd.qcut(long[factor].rank(method="first"), 5, labels=False)
+def quintile_means(long: pd.DataFrame, factor: str, config: dict, target: str = "exc") -> pd.Series:
+    """Return configured quantile means for a factor."""
+    labels = pd.qcut(long[factor].rank(method="first"), config["quantile_count"], labels=False)
     return long.groupby(labels)[target].mean() * 100.0
 
 
 def main() -> int:
-    close = load_close()
+    """Run configured factor robustness checks."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", type=Path, default=CONFIG_PATH)
+    config_path = parser.parse_args().config
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    print(f"Configuration: {config_path.resolve()}")
+    close = load_close(config)
     returns = close.pct_change()
-    fwd = close.pct_change(HORIZON).shift(-HORIZON)
-    vol = returns.rolling(126).std().shift(1)
+    fwd = close.pct_change(config["forward_horizon_days"]).shift(-config["forward_horizon_days"])
+    vol = returns.rolling(config["volatility_lookback_days"]).std().shift(1)
 
     long = pd.concat([vol.stack().rename("vol"), fwd.stack().rename("fwd")], axis=1).dropna()
+    if long.empty:
+        raise ValueError("The configured panel has no observations after factor warmup.")
     market = long.groupby(level=0)["fwd"].mean()
     long["mkt"] = long.index.get_level_values(0).map(market)
     long["exc"] = long["fwd"] - long["mkt"]
@@ -70,7 +85,7 @@ def main() -> int:
           f"n={len(long):,}\n")
 
     # ---- 1 & 2: monotone on excess, and both halves -----------------------
-    table = quintile_means(long, "vol")
+    table = quintile_means(long, "vol", config)
     print("1) beta-demeaned quintiles (Q5 = highest vol)")
     print("   " + "  ".join(f"Q{i + 1} {x:+.2f}%" for i, x in enumerate(table)))
     print(f"   spread {table.iloc[-1] - table.iloc[0]:+.2f}%  "
@@ -79,22 +94,20 @@ def main() -> int:
     mid = close.index[len(close.index) // 2]
     for label, mask in [("first half", dates <= mid), ("second half", dates > mid)]:
         part = long[mask]
-        t = quintile_means(part, "vol")
+        t = quintile_means(part, "vol", config)
         print(f"   {label:<12} Q1 {t.iloc[0]:+.2f}%  Q5 {t.iloc[-1]:+.2f}%  "
               f"spread {t.iloc[-1] - t.iloc[0]:+.2f}%")
     print()
 
     # ---- 3: rolling 6-month blocks ---------------------------------------
     print("2) rolling 6-month blocks (spread Q5-Q1, excess)")
-    blocks = pd.Series(dates, index=long.index).dt.to_period("6M")
+    blocks = pd.Series(dates, index=long.index).dt.to_period(config["stability_block_period"])
     spreads = []
-    for period, idx in blocks.groupby(blocks).groups.items() if False else []:
-        pass
     parts = long.groupby(blocks.values)
     for period, part in parts:
-        if len(part) < 2000:
+        if len(part) < config["minimum_block_observations"]:
             continue
-        t = quintile_means(part, "vol")
+        t = quintile_means(part, "vol", config)
         s = t.iloc[-1] - t.iloc[0]
         spreads.append(s)
         bar = "#" * max(int(abs(s) * 4), 1)
@@ -107,7 +120,7 @@ def main() -> int:
     print("3) calendar year (spread Q5-Q1, excess)")
     years = pd.Series(dates, index=long.index).dt.year
     for year, part in long.groupby(years.values):
-        if len(part) < 2000:
+        if len(part) < config["minimum_year_observations"]:
             continue
         t = quintile_means(part, "vol")
         print(f"   {year}  Q1 {t.iloc[0]:+6.2f}%  Q5 {t.iloc[-1]:+6.2f}%  "
@@ -115,28 +128,28 @@ def main() -> int:
     print()
 
     # ---- 5: turnover -----------------------------------------------------
-    monthly = close.resample("ME").last()
-    vol_m = monthly.pct_change().rolling(6).std().shift(1)
+    monthly = close.resample(config["monthly_period"]).last()
+    vol_m = monthly.pct_change().rolling(config["monthly_volatility_lookback"]).std().shift(1)
     top_sets = []
-    for i in range(6, len(monthly) - 1):
+    for i in range(config["monthly_volatility_lookback"], len(monthly) - 1):
         v = vol_m.iloc[i].dropna()
-        if len(v) < 20:
+        if len(v) < config["minimum_cross_section_symbols"]:
             continue
-        top_sets.append(set(v.nlargest(len(v) // 5).index))
+        top_sets.append(set(v.nlargest(max(len(v) // config["quantile_count"], 1)).index))
     turns = []
-    for a, b in zip(top_sets, top_sets[1:]):
+    for a, b in zip(top_sets, top_sets[1:], strict=False):
         if a:
             turns.append(1 - len(a & b) / len(a))
     turn = float(np.mean(turns)) if turns else float("nan")
     print(f"4) monthly turnover of the top quintile: {turn * 100:.0f}% of names "
           f"replaced each rebalance")
-    cost_bps = 25  # round trip incl. slippage, a conservative Indian large-cap est.
-    drag = turn * 2 * cost_bps / 10_000 * 100
+    cost_bps = config["one_way_cost_basis_points"]
+    drag = turn * config["round_trips_per_rebalance"] * cost_bps / config["basis_points_per_unit"] * 100
     print(f"   at {cost_bps}bps per round trip -> ~{drag:.2f}%/month of drag "
-          f"({drag * 12:.1f}%/yr)")
+          f"({drag * config['months_per_year']:.1f}%/yr)")
     spread = table.iloc[-1] - table.iloc[0]
     print(f"   net edge ~{spread - drag:+.2f}%/month  "
-          f"({(spread - drag) * 12:+.1f}%/yr)")
+          f"({(spread - drag) * config['months_per_year']:+.1f}%/yr)")
     return 0
 
 

@@ -1,4 +1,4 @@
-"""Tests for `atr.signals.divergence` — RSI divergence detection.
+"""Tests for `forward.signals.divergence` — RSI divergence detection.
 
 The naive "RSI is higher at the second low" test false-positives constantly:
 RSI is bounded and mean-reverting, so it very often reads *higher* at a
@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from atr.signals.divergence import detect_rsi_divergence
+from forward.signals.divergence import detect_rsi_divergence
 
 
 def _bar(close: float) -> dict:

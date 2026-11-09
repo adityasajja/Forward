@@ -2,8 +2,14 @@
 
 import pytest
 
-from atr.api.stream import TickBroadcaster
-from atr.brokers.iifl.codec import decode_index_packet
+from forward.api.stream import TickBroadcaster
+from forward.brokers.iifl.codec import decode_index_packet
+from forward.core.market_models import LiveMarketQuote
+from forward.data.observed_bars import ObservedBars
+from tests.market_data_fakes import (
+    InMemoryLiveMarketFeed,
+    InMemoryTickCandleAggregation,
+)
 
 # Real packets captured on 1 Oct 2026 (the market was closed, so each carries the last
 # session's values), with the figures the exchange itself reported for that session.
@@ -30,11 +36,13 @@ def test_a_malformed_packet_is_rejected_not_misread(bad):
 
 
 def test_broadcaster_keeps_the_latest_quote_per_index():
-    b = TickBroadcaster()
+    b = TickBroadcaster(
+        InMemoryLiveMarketFeed(), InMemoryTickCandleAggregation(), ObservedBars()
+    )
     b._index_topics = {"nseeq/999920000": "NIFTY 50", "nsefo/999920019": "INDIA VIX"}
-    b._on_bridge_index("nseeq/999920000", decode_index_packet(NIFTY))
-    b._on_bridge_index("nsefo/999920019", decode_index_packet(VIX))
-    b._on_bridge_index("nseeq/unknown", decode_index_packet(NIFTY))  # not subscribed: ignored
+    b._on_index_feed("nseeq/999920000", _quote(NIFTY))
+    b._on_index_feed("nsefo/999920019", _quote(VIX))
+    b._on_index_feed("nseeq/unknown", _quote(NIFTY))  # not subscribed: ignored
 
     quotes = b.latest_indices()
     assert set(quotes) == {"NIFTY 50", "INDIA VIX"}
@@ -42,34 +50,46 @@ def test_broadcaster_keeps_the_latest_quote_per_index():
     assert quotes["INDIA VIX"]["age_s"] >= 0
 
 
+def _quote(packet: bytes) -> LiveMarketQuote:
+    """Map the decoded broker packet to the application quote model."""
+    tick = decode_index_packet(packet)
+    return LiveMarketQuote(
+        last=tick.ltp,
+        quantity=tick.last_traded_quantity,
+        volume=tick.traded_volume,
+        high=tick.high,
+        low=tick.low,
+        open=tick.open,
+        close=tick.close,
+        traded_at=tick.last_traded_time,
+    )
+
+
 def test_ensure_indices_without_a_session_reports_unavailable(monkeypatch):
-    b = TickBroadcaster()
-    monkeypatch.setattr(b, "_ensure_bridge", lambda: False)
+    b = TickBroadcaster(
+        InMemoryLiveMarketFeed(is_connected=False),
+        InMemoryTickCandleAggregation(),
+        ObservedBars(),
+    )
+    monkeypatch.setattr(b, "_ensure_live_feed", lambda: False)
     assert b.ensure_indices() is False
     assert b.latest_indices() == {}
 
 
 def test_ensure_indices_subscribes_once(monkeypatch):
-    class FakeBridge:
-        def __init__(self):
-            self.calls = []
-
-        def subscribe_index(self, topics):
-            self.calls.append(list(topics))
-
-    b = TickBroadcaster()
-    b._bridge = FakeBridge()
-    monkeypatch.setattr(b, "_ensure_bridge", lambda: True)
+    feed = InMemoryLiveMarketFeed()
+    b = TickBroadcaster(feed, InMemoryTickCandleAggregation(), ObservedBars())
+    monkeypatch.setattr(b, "_ensure_live_feed", lambda: True)
     assert b.ensure_indices() and b.ensure_indices()
-    assert b._bridge.calls == [["nseeq/999920000", "nsefo/999920019"]]  # not repeated
+    assert feed.index_subscriptions == [["nseeq/999920000", "nsefo/999920019"]]
 
 
 def test_live_endpoint_shape(monkeypatch):
     from fastapi.testclient import TestClient
 
-    from atr.api import deps, stream
-    from atr.api.deps import anonymous_principal
-    from atr.api.main import app
+    from forward.api import deps, stream
+    from forward.api.deps import anonymous_principal
+    from forward.api.main import app
 
     class FakeBroadcaster:
         def ensure_indices(self):

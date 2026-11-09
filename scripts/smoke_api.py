@@ -9,9 +9,9 @@ worked on four hardcoded ports.
 
 Start a server on a store nobody cares about, then point this at it:
 
-    PYTHONPATH=src APP_DB_URL="sqlite:///.smoke/run.db" ATR_SECRET_KEY=smoke-key \\
+    PYTHONPATH=src APP_DB_URL="sqlite:///.smoke/run.db" FORWARD_SECRET_KEY=smoke-key \\
       ENV=dev ALLOW_SIGNUP=false .venv/Scripts/python.exe -m uvicorn \\
-      atr.api.main:app --host 127.0.0.1 --port 8899
+      forward.api.main:app --host 127.0.0.1 --port 8899
 
     PYTHONPATH=src .venv/Scripts/python.exe scripts/smoke_api.py http://127.0.0.1:8899
 
@@ -95,7 +95,7 @@ def main() -> int:
         headers={"Origin": ORIGIN},
     )
     check("POST /auth/bootstrap is 201", created.status_code == 201, created.text[:200])
-    check("a session cookie was set", "atr_session" in client.cookies)
+    check("a session cookie was set", "forward_session" in client.cookies)
 
     me = client.get("/api/v1/auth/me").json()
     check("the first account is the owner", me["role"] == "owner", me.get("role", "?"))

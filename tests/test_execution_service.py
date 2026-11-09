@@ -19,21 +19,20 @@ from typing import Any
 
 import pytest
 
-from atr.appdb.repositories import UserRepository
-from atr.execution.oms import OrderDraft
-from atr.services.execution import (
+from forward.appdb.identity_repository import UserRepository
+from forward.appdb.order_storage import SqlOrderStorage
+from forward.brokers.venue import BrokerVenue, outcome_from_broker_order
+from forward.core.errors import VenueError
+from forward.execution.oms import OrderDraft
+from forward.execution.venue import (
     VENUE_ACCEPTED,
     VENUE_FILLED,
     VENUE_PARTIAL,
     VENUE_REJECTED,
-    BrokerVenue,
-    ExecutionService,
-    VenueError,
     VenueOutcome,
-    outcome_from_broker_order,
-    resolve_order_type,
 )
-from atr.services.orders import OrderService
+from forward.services.execution import ExecutionService
+from forward.services.orders import OrderService
 
 
 @pytest.fixture()
@@ -75,34 +74,22 @@ def _draft(user_id: str, **overrides) -> OrderDraft:
 
 
 def _service(app_db, venue) -> ExecutionService:
-    from atr.execution.oms import RiskDecision
+    from forward.execution.oms import RiskDecision
 
     def allow(draft: OrderDraft) -> RiskDecision:  # noqa: ARG001
         return RiskDecision.ok()
 
     return ExecutionService(
-        orders=OrderService(app_db, risk_gate=allow), venue=venue
+        orders=OrderService(SqlOrderStorage(app_db), risk_gate=allow), venue=venue
     )
 
 
 # =========================================================================== order types
-def test_the_stop_loss_market_spelling_resolves_to_the_enum_that_exists():
-    """``OrderType.SL_MARKET`` never existed. This is the regression pin.
-
-    The signal-execute route used it on its *second* leg, so the entry order had
-    already gone to the exchange when the ``AttributeError`` fired — a live
-    position with no stop and a 500 the operator could not interpret.
-    """
-    from atr.core.enums import OrderType
-
-    assert resolve_order_type("SL-M") == "STOP"
-    assert resolve_order_type("sl-m") == "STOP"
-    assert OrderType(resolve_order_type("SL-M")) is OrderType.STOP
 
 
 def test_every_accepted_spelling_resolves_to_a_real_enum_member():
     """A spelling pointing at a name the enum lacks is the same bug again."""
-    from atr.core.enums import OrderType
+    from forward.core.enums import OrderType
 
     for spelling in ("MARKET", "LIMIT", "STOP", "STOP_LIMIT", "SL", "SL-M", "SL-L",
                      "stop_market", "sl m"):
@@ -183,12 +170,12 @@ def test_the_lifecycle_is_reconstructable_after_a_venue_round_trip(app_db, trade
 # =========================================================================== refusals
 def test_a_risk_rejection_never_reaches_the_venue(app_db, trader):
     """The whole point of the gate: a refused order must not be transmitted."""
-    from atr.execution.oms import RiskDecision
+    from forward.execution.oms import RiskDecision
 
     venue = _RecordingVenue()
     service = ExecutionService(
         orders=OrderService(
-            app_db, risk_gate=lambda d: RiskDecision.reject("daily loss limit", "daily_loss")
+            SqlOrderStorage(app_db), risk_gate=lambda d: RiskDecision.reject("daily loss limit", "daily_loss")
         ),
         venue=venue,
     )
@@ -295,7 +282,7 @@ class _FakeMaster:
         self.lookups: list[tuple[str, str]] = []
 
     def find(self, symbol: str, exchange: str):
-        from atr.core.models import Instrument
+        from forward.core.instrument_models import Instrument
 
         self.lookups.append((symbol, exchange))
         return Instrument(symbol=symbol, exchange=exchange, multiplier=1.0)
@@ -308,7 +295,7 @@ class _FakeBroker:
         self.status = status
 
     def place_order(self, order):
-        from atr.core.enums import OrderStatus
+        from forward.core.enums import OrderStatus
 
         order.status = OrderStatus(self.status)
         order.broker_order_id = "BR-99"
@@ -325,7 +312,7 @@ def test_the_adapter_puts_the_trigger_where_the_broker_reads_it(app_db, trader):
     with no trigger price.
     """
     broker = _FakeBroker()
-    venue = BrokerVenue(broker=broker)
+    venue = BrokerVenue(broker=broker, instruments=broker.master.find)
     venue.submit(
         _draft(trader, side="SELL", order_type="SL-M", stop_price=2450.0, limit_price=None)
     )
@@ -336,15 +323,19 @@ def test_the_adapter_puts_the_trigger_where_the_broker_reads_it(app_db, trader):
     assert placed.order_type.value == "STOP"
 
 
-def test_the_adapter_resolves_the_instrument_through_the_broker_master(app_db, trader):
+def test_the_adapter_resolves_the_instrument_through_the_injected_catalog(app_db, trader):
     broker = _FakeBroker()
-    BrokerVenue(broker=broker).submit(_draft(trader, symbol="tcs", exchange="NSEEQ"))
+    BrokerVenue(broker=broker, instruments=broker.master.find).submit(
+        _draft(trader, symbol="tcs", exchange="NSEEQ")
+    )
     assert broker.master.lookups == [("tcs", "NSEEQ")]
 
 
 def test_the_adapter_passes_the_product_through(app_db, trader):
     broker = _FakeBroker()
-    BrokerVenue(broker=broker).submit(_draft(trader, product="CNC"))
+    BrokerVenue(broker=broker, instruments=broker.master.find).submit(
+        _draft(trader, product="CNC")
+    )
     assert broker.placed[0].broker_params["product"] == "CNC"
 
 
@@ -356,29 +347,37 @@ def test_the_adapter_passes_the_product_through(app_db, trader):
         ("PARTIALLY_FILLED", VENUE_PARTIAL),
         ("FILLED", VENUE_FILLED),
         ("REJECTED", VENUE_REJECTED),
-        ("CANCELLED", VENUE_ACCEPTED),
+        ("CANCELLED", None),
     ],
 )
 def test_broker_statuses_map_onto_venue_outcomes(broker_status, expected):
-    from atr.core.enums import OrderStatus
-    from atr.core.models import Instrument, Order
+    from forward.core.enums import OrderStatus, Side
+    from forward.core.instrument_models import Instrument
+    from forward.core.order_models import Order
 
     order = Order(
         instrument=Instrument(symbol="X", exchange="NSEEQ"),
-        side=__import__("atr.core.enums", fromlist=["Side"]).Side.BUY,
+        side=Side.BUY,
         quantity=1,
     )
     order.status = OrderStatus(broker_status)
     order.broker_order_id = "BR-1"
     order.reject_reason = "nope" if broker_status == "REJECTED" else None
+    if broker_status in ("PARTIALLY_FILLED", "FILLED"):
+        order.filled_quantity = 1
+        order.avg_fill_price = 100
+    if expected is None:
+        with pytest.raises(ValueError, match="unexpected order status"):
+            outcome_from_broker_order(order)
+        return
     assert outcome_from_broker_order(order).status == expected
 
 
-def test_the_mapping_is_the_single_place_a_broker_answer_is_interpreted(app_db, trader):
+def test_the_mapping_is_the_single_place_a_broker_answer_is_interpreted():
     """Two callers each deciding what a broker answer means is how the old bug lived."""
     import inspect
 
-    from atr.services import execution
+    from forward.brokers import venue
 
-    source = inspect.getsource(execution)
+    source = inspect.getsource(venue)
     assert source.count("def outcome_from_broker_order") == 1

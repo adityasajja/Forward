@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-from atr.research.champion_challenger import (
+from forward.research.champion_challenger import (
     compare_arms,
     comparison_verdict,
     definition_diff,

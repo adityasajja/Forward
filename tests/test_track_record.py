@@ -12,8 +12,10 @@ from datetime import UTC, date, datetime, timedelta
 
 import pytest
 
-from atr.core.models import Fill, Instrument, Side
-from atr.services.track_record import (
+from forward.core.enums import Side
+from forward.core.instrument_models import Instrument
+from forward.core.order_models import Fill
+from forward.services.track_record import (
     build_record,
     combine,
     current_drawdown_pct,
@@ -73,11 +75,12 @@ class TestReplay:
         assert all(not p.priced for p in points)
         assert all(p.equity == pytest.approx(10_000.0) for p in points)  # cost, not zero, not a guess up
 
-    def test_a_missing_day_carries_the_last_known_close_and_stays_priced(self):
+    def test_a_missing_day_is_unknown_and_does_not_carry_forward_a_close(self):
         fills = [fill(Side.BUY, 10, 100.0, day(0))]
         points, _ = replay_equity(fills, 10_000.0, CAL, closes({day(0): 100.0, day(1): 120.0}))
-        assert points[-1].equity == pytest.approx(10_200.0)
-        assert all(p.priced for p in points)
+        assert points[-1].equity is None
+        assert points[-1].equity_before_unknown_fees == pytest.approx(10_000.0)
+        assert [point.priced for point in points] == [True, True, False, False, False]
 
     def test_closed_trades_and_wins_are_counted_from_realised_pnl(self):
         fills = [
@@ -189,19 +192,21 @@ class TestCombine:
 # ───────────────────────── through the real ledger and HTTP ─────────────────────────
 from fastapi.testclient import TestClient  # noqa: E402
 
-from atr.api.main import app  # noqa: E402
-from atr.services import track_record as tr  # noqa: E402
+from forward.api.main import app  # noqa: E402
+from forward.services import track_record as tr  # noqa: E402
 
 LOOPBACK = ("127.0.0.1", 51234)
 
 
 @pytest.fixture()
 def prices(monkeypatch):
-    from atr.services import paper as paper_service
-    from atr.services.paper import fixed_price_source
+    import forward.wiring.paper as paper
+    from forward.services.paper_prices import fixed_price_source
 
     table = {"RELIANCE": 2500.0}
-    monkeypatch.setattr(paper_service, "default_price_source", lambda: fixed_price_source(table))
+    monkeypatch.setattr(
+        paper, "get_live_paper_price_source", lambda: fixed_price_source(table)
+    )
     return table
 
 
@@ -294,9 +299,9 @@ def test_the_whole_book_view_matches_a_single_deployment(owner, closes_and_index
 
 def test_another_accounts_deployment_track_record_is_a_404(owner, closes_and_index):
     dep = _deploy(owner)
-    from atr.appdb.engine import get_app_db
-    from atr.appdb.repositories import UserRepository
-    from atr.auth.passwords import hash_password
+    from forward.appdb.engine import get_app_db
+    from forward.appdb.identity_repository import UserRepository
+    from forward.auth.passwords import hash_password
 
     with get_app_db().session() as session:
         UserRepository.create(session, email="v@example.com", username="viewer",
@@ -413,8 +418,8 @@ def test_after_a_sync_the_journal_and_the_track_record_agree(owner, closes_and_i
     again = owner.post("/api/v1/paper/sync-journal").json()
     assert again["journal_closed"] == 1 and again["synced"]["journal"]["opened"] == 0
 
-    from atr.appdb.engine import get_app_db
-    from atr.appdb.repositories import TradeJournalRepository
+    from forward.appdb.engine import get_app_db
+    from forward.appdb.trade_journal_repository import TradeJournalRepository
 
     with get_app_db().session() as session:
         rows, _ = TradeJournalRepository.list_for_user(session, owner_user_id(owner), closed_only=True, limit=50)

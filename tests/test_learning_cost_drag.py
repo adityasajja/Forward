@@ -11,13 +11,14 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-from atr.research.learning_axes import (
+from forward.research.learning_axes import (
     ATTRIBUTION_AXES,
     AXES_BY_NAME,
     AXIS_COST_DRAG,
     DEFAULT_AXES,
 )
-from atr.services.learning import LearningDataset, PerformanceAnalysis
+from forward.services.learning_analysis import PerformanceAnalysis
+from forward.services.learning_dataset_model import LearningDataset
 
 
 def test_cost_drag_bucket_boundaries() -> None:

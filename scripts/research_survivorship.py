@@ -29,36 +29,34 @@ Usage:
 # ruff: noqa: I001
 from __future__ import annotations
 
-import sys
+import argparse
+import json
 from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
-CACHE = Path("data/iifl_daily/NSEEQ")
-PANEL = Path("data/signals/panel_nseeq_120.parquet")
-MIN_BARS = 1000  # roughly four years of sessions
+ROOT = Path(__file__).resolve().parents[1]
+CONFIG_PATH = ROOT / "config" / "research_survivorship.json"
 
 
-def long_history_symbols() -> pd.DataFrame:
+def long_history_symbols(config: dict) -> pd.DataFrame:
     """Every cache symbol with a long enough history, as a close-price panel."""
     series = {}
-    for path in sorted(CACHE.glob("*.parquet")):
-        try:
-            frame = pd.read_parquet(path, columns=["ts", "close"])
-        except Exception:  # noqa: BLE001 — a bad file must not stop the scan
-            continue
-        if len(frame) < MIN_BARS:
+    data_directory = ROOT / config["daily_data_directory"]
+    for path in sorted(data_directory.glob("*.parquet")):
+        frame = pd.read_parquet(path, columns=["ts", "close"])
+        if len(frame) < config["minimum_history_bars"]:
             continue
         frame = frame.copy()
         frame["ts"] = pd.to_datetime(frame["ts"])
         series[path.stem.upper()] = frame.set_index("ts")["close"]
+    if not series:
+        raise ValueError("No cached symbols meet the configured long-history gate.")
     return pd.DataFrame(series).sort_index()
 
 
-def summarise(close: pd.DataFrame, label: str) -> dict:
+def summarise(close: pd.DataFrame, label: str, config: dict) -> dict:
     rets = close.pct_change()
     ew = rets.mean(axis=1).fillna(0)
     eq = (1 + ew).cumprod()
@@ -68,43 +66,62 @@ def summarise(close: pd.DataFrame, label: str) -> dict:
         "names": close.shape[1],
         "sessions": len(close),
         "index_total_pct": (eq.iloc[-1] - 1) * 100,
-        "index_sharpe": ew.mean() / ew.std() * np.sqrt(252) if ew.std() > 0 else 0.0,
+        "index_sharpe": (
+            ew.mean() / ew.std() * np.sqrt(config["trading_days_per_year"])
+            if ew.std() > 0
+            else None
+        ),
         "index_maxdd_pct": (eq / eq.cummax() - 1).min() * 100,
         "pct_names_positive": (total > 0).mean() * 100,
         "median_name_pct": total.median(),
-        "p10_name_pct": total.quantile(0.10),
-        "p90_name_pct": total.quantile(0.90),
+        "name_return_quantiles_pct": {
+            str(quantile): total.quantile(quantile) for quantile in config["name_return_quantiles"]
+        },
     }
     return out
 
 
 def main() -> int:
+    """Compare all-cache and selected-universe performance."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", type=Path, default=CONFIG_PATH)
+    config_path = parser.parse_args().config
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    print(f"Configuration: {config_path.resolve()}")
     print("building panels from the cache (this reads ~2,600 files)...")
-    all_names = long_history_symbols()
-    liquid = pd.read_parquet(PANEL)
+    all_names = long_history_symbols(config)
+    liquid_path = ROOT / config["selected_panel_file"]
+    liquid = pd.read_parquet(liquid_path)
     liquid["ts"] = pd.to_datetime(liquid["ts"])
-    liquid_close = liquid.pivot_table(
-        index="ts", columns="symbol", values="close"
-    ).sort_index()
+    liquid_close = liquid.pivot_table(index="ts", columns="symbol", values="close").sort_index()
 
-    rows = [summarise(all_names, "all cached w/ long history"),
-            summarise(liquid_close, "liquid-120 panel")]
+    if liquid_close.empty:
+        raise ValueError(f"The configured selected panel has no rows: {liquid_path}.")
+    labels = config["panel_labels"]
+    rows = [summarise(all_names, labels[0], config), summarise(liquid_close, labels[1], config)]
 
     # Align the two on the same dates before comparing, so the difference is
     # selection and not simply a different window.
     common = all_names.index.intersection(liquid_close.index)
-    rows.append(summarise(all_names.loc[common], "all cached (aligned dates)"))
-    rows.append(summarise(liquid_close.loc[common], "liquid-120 (aligned dates)"))
+    if common.empty:
+        raise ValueError("The compared panels have no common dates.")
+    aligned_labels = config["aligned_panel_labels"]
+    rows.append(summarise(all_names.loc[common], aligned_labels[0], config))
+    rows.append(summarise(liquid_close.loc[common], aligned_labels[1], config))
 
-    header = (f"{'panel':<30} {'names':>6} {'total':>10} {'Sharpe':>7} "
-              f"{'maxDD':>8} {'%pos':>6} {'median':>9}")
+    header = (
+        f"{'panel':<30} {'names':>6} {'total':>10} {'Sharpe':>7} "
+        f"{'maxDD':>8} {'%pos':>6} {'median':>9}"
+    )
     print("\n" + header)
     print("-" * len(header))
     for r in rows:
-        print(f"{r['label']:<30} {r['names']:>6} "
-              f"{r['index_total_pct']:>9.1f}% {r['index_sharpe']:>7.2f} "
-              f"{r['index_maxdd_pct']:>7.1f}% {r['pct_names_positive']:>5.0f}% "
-              f"{r['median_name_pct']:>8.0f}%")
+        print(
+            f"{r['label']:<30} {r['names']:>6} "
+            f"{r['index_total_pct']:>9.1f}% {r['index_sharpe']:>7.2f} "
+            f"{r['index_maxdd_pct']:>7.1f}% {r['pct_names_positive']:>5.0f}% "
+            f"{r['median_name_pct']:>8.0f}%"
+        )
 
     print("\n" + "=" * 72)
     aligned = [r for r in rows if "aligned" in r["label"]]
@@ -112,7 +129,7 @@ def main() -> int:
         gap = aligned[1]["index_total_pct"] - aligned[0]["index_total_pct"]
         print("On identical dates:")
         print(f"  all-cached index    {aligned[0]['index_total_pct']:+.1f}%")
-        print(f"  liquid-120 index    {aligned[1]['index_total_pct']:+.1f}%")
+        print(f"  selected index      {aligned[1]['index_total_pct']:+.1f}%")
         print(f"  selection gap       {gap:+.1f} points")
         print()
         print("  Reading: the liquid-120 universe was chosen by today's turnover,")

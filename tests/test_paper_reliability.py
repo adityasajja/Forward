@@ -18,26 +18,17 @@ Verifies:
 
 from __future__ import annotations
 
-from datetime import date, datetime, time, timedelta
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-import pytest
+from forward.core.paper_models import TickPrice
+from forward.market_calendar import NSEMarketCalendar
+from forward.services.deployment_loop import RunnerDeploymentState
+from tests.order_fakes import order_instrument_lookup
+from tests.paper_venue_factory import configured_paper_venue as PaperVenue
+from tests.test_paper_runner import SYMBOL, _loop
 
-from atr.market_calendar import MarketCalendar, NSEMarketCalendar
-from atr.services.orders import OrderDraft
-from atr.services.paper import (
-    PaperLedger,
-    PaperVenue,
-    TickPrice,
-    fixed_price_source,
-)
-from atr.services.runner import (
-    DeploymentLoop,
-    PaperRunner,
-    RunnerConfig,
-    RunnerDeploymentState,
-)
-from tests.test_paper_runner import SYMBOL, _loop, deployment, wired
+pytest_plugins = ("tests.test_paper_runner",)
 
 IST = ZoneInfo("Asia/Kolkata")
 SESSION_OPEN_TIME = datetime(2026, 9, 14, 10, 0, tzinfo=IST)  # Monday 10:00 IST
@@ -96,8 +87,8 @@ def test_market_calendar_session_hours_and_holidays():
 def test_paper_venue_rejects_stale_ticks_and_records_price_age():
     """Verify PaperVenue rejects orders when tick age exceeds max_tick_age_seconds,
     and records price_timestamp and price_age_seconds upon fill."""
-    from atr.execution.oms import OrderDraft
-    from atr.services.execution import VENUE_FILLED, VENUE_REJECTED
+    from forward.execution.oms import OrderDraft
+    from forward.execution.venue import VENUE_FILLED, VENUE_REJECTED
 
     clock_now = datetime(2026, 9, 14, 10, 0, 0, tzinfo=IST)
     feed = MockClockFeed(now=clock_now)
@@ -107,6 +98,7 @@ def test_paper_venue_rejects_stale_ticks_and_records_price_age():
 
     venue = PaperVenue(
         prices=feed,
+        instruments=order_instrument_lookup,
         clock=lambda: clock_now,
         max_tick_age_seconds=60.0,
     )
@@ -136,11 +128,11 @@ def test_paper_venue_rejects_stale_ticks_and_records_price_age():
 
 def test_paper_venue_no_tick_rejects_without_filling():
     """Verify venue rejects orders when no price is available rather than using old data."""
-    from atr.execution.oms import OrderDraft
-    from atr.services.execution import VENUE_REJECTED
+    from forward.execution.oms import OrderDraft
+    from forward.execution.venue import VENUE_REJECTED
 
     feed = MockClockFeed()
-    venue = PaperVenue(prices=feed)
+    venue = PaperVenue(prices=feed, instruments=order_instrument_lookup)
 
     draft = OrderDraft(
         user_id="u1",
@@ -159,7 +151,7 @@ def test_runner_deployment_observability_states(wired, deployment):
     """Verify deployment transitions through observability states:
     WAITING_FOR_MARKET, WAITING_FOR_TICKS, RUNNING."""
     runner, feed = wired()
-    loop = _loop(runner, deployment)
+    _loop(runner, deployment)
 
     # 1. Outside market hours -> WAITING_FOR_MARKET
     night_time = datetime(2026, 9, 14, 21, 0, tzinfo=IST)
@@ -189,7 +181,7 @@ def test_runner_deployment_observability_states(wired, deployment):
 def test_order_idempotency_prevents_duplicate_orders(wired, deployment):
     """Verify that restarting the runner or executing repeated passes does not duplicate orders."""
     runner, feed = wired()
-    loop = _loop(runner, deployment)
+    _loop(runner, deployment)
 
     # First pass: generates order
     tick1 = runner.pass_once(now=SESSION_OPEN_TIME)

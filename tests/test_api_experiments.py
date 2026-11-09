@@ -16,7 +16,7 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
-from atr.api.main import app
+from forward.api.main import app
 
 LOOPBACK = ("127.0.0.1", 51234)
 
@@ -67,6 +67,7 @@ def test_experiments_api_workflow(owner: TestClient):
                         "maximum": 3.0,
                         "step": 0.1,
                         "adaptive": True,
+                        "block": "entry",
                     }
                 ],
             },

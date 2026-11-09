@@ -5,9 +5,18 @@ from datetime import date
 
 import pytest
 
-from atr.services import tradebook as tb
+from forward.brokers.iifl.tradebook import IiflTradebookReadAdapter
+from forward.data.daily_tradebook import JsonDailyTradebookAdapter
+from forward.services.tradebook import TradebookCaptureService
 
 DAY = date(2026, 9, 18)
+
+
+def capture(client, data_root, day=DAY):
+    return TradebookCaptureService(
+        IiflTradebookReadAdapter(client),
+        JsonDailyTradebookAdapter(data_root),
+    ).capture(day)
 
 
 class _Broker:
@@ -30,7 +39,7 @@ def test_trades_and_positions_are_saved_as_the_broker_sent_them(tmp_path):
     fills = [{"tradingSymbol": "AAA-EQ", "qty": 10, "price": 100.5}]
     positions = [{"tradingSymbol": "AAA-EQ", "netQty": 0}]
 
-    out = tb.capture_day(_Broker({"result": fills}, {"result": positions}), tmp_path, DAY)
+    out = capture(_Broker({"result": fills}, {"result": positions}), tmp_path)
 
     assert out == {"trades": 1, "positions": 1}
     saved = json.loads((tmp_path / "portfolio" / "tradebook" / "2026-09-18.json").read_text())
@@ -39,7 +48,7 @@ def test_trades_and_positions_are_saved_as_the_broker_sent_them(tmp_path):
 
 
 def test_a_quiet_day_is_not_a_failure_and_writes_nothing(tmp_path):
-    out = tb.capture_day(_Broker(QUIET_TRADES, QUIET_POSITIONS), tmp_path, DAY)
+    out = capture(_Broker(QUIET_TRADES, QUIET_POSITIONS), tmp_path)
 
     assert out == {"trades": 0, "positions": 0}
     assert not (tmp_path / "portfolio" / "tradebook").exists()
@@ -47,7 +56,7 @@ def test_a_quiet_day_is_not_a_failure_and_writes_nothing(tmp_path):
 
 def test_a_refusal_raises_so_the_job_tries_again(tmp_path):
     with pytest.raises(RuntimeError, match="IP address not authorized"):
-        tb.capture_day(_Broker(QUIET_TRADES, BLOCKED), tmp_path, DAY)
+        capture(_Broker(QUIET_TRADES, BLOCKED), tmp_path)
 
 
 def test_trades_already_read_are_kept_even_if_the_positions_call_is_refused(tmp_path):
@@ -55,6 +64,6 @@ def test_trades_already_read_are_kept_even_if_the_positions_call_is_refused(tmp_
     fills = [{"tradingSymbol": "AAA-EQ", "qty": 1}]
 
     with pytest.raises(RuntimeError):
-        tb.capture_day(_Broker({"result": fills}, BLOCKED), tmp_path, DAY)
+        capture(_Broker({"result": fills}, BLOCKED), tmp_path)
 
     assert (tmp_path / "portfolio" / "tradebook" / "2026-09-18.json").exists()

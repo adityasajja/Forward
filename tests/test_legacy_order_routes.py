@@ -11,7 +11,7 @@ change that quietly reverts:
   leg of a three-leg bracket, so the entry order had already been transmitted when
   the ``AttributeError`` fired: a live position with no stop-loss, and a 500 the
   operator could not interpret. Orders are now assembled in one place
-  (``atr.services.execution``) and the venue is a parameter.
+  (``forward.services.execution``) and the venue is a parameter.
 
 The source-level assertions at the bottom are deliberately blunt. A behavioural
 test cannot catch a *new* call site that reintroduces the same bug; a grep can.
@@ -19,20 +19,20 @@ test cannot catch a *new* call site that reintroduces the same bug; a grep can.
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-
-_OPERATOR = SimpleNamespace(username="operator")
-_ADITYA = SimpleNamespace(username="aditya")
-
+import importlib
 import inspect
+import pkgutil
+from types import SimpleNamespace
 
 import pytest
 
-import importlib
-import pkgutil
+from forward.api import legacy
+from forward.api.legacy import frontend, orders, risk, signals
+from forward.appdb.risk_state_storage import SqlRiskStateStorage
+from forward.config.settings import get_settings
 
-from atr.api import legacy
-from atr.api.legacy import common, frontend, orders, risk, signals
+_OPERATOR = SimpleNamespace(username="operator")
+_ADITYA = SimpleNamespace(username="aditya")
 
 # The safety checks below must cover every root-path route module, not just one of them:
 # a new call site anywhere in the package is what they exist to catch.
@@ -119,7 +119,7 @@ def test_the_signal_execute_route_no_longer_names_a_member_that_does_not_exist()
 
 def test_the_stop_loss_leg_resolves_to_a_real_enum_member():
     """The leg's spelling, through the same parse the venue uses."""
-    from atr.core.enums import OrderType
+    from forward.core.enums import OrderType
 
     assert OrderType.parse("SL-M") is OrderType.STOP
 
@@ -135,7 +135,7 @@ def test_no_legacy_route_calls_the_broker_directly_any_more():
     """
     assert not any("place_order" in _called_attributes(m) for m in LEGACY_MODULES), (
         "a legacy route module calls a broker's place_order directly; route it through "
-        "atr.services.execution so the risk gate and the event log cannot be skipped"
+        "forward.services.execution so the risk gate and the event log cannot be skipped"
     )
 
 
@@ -182,13 +182,13 @@ def test_the_signal_route_reports_which_leg_failed(auth_client):
 # =========================================================================== the switch
 def test_the_legacy_kill_switch_reaches_the_durable_state(app_db, monkeypatch):
     """It used to write a module-level dict, so a restart re-armed trading."""
-    from atr.services.risk import RiskStateService
+    from forward.services.risk import RiskStateService
 
     risk.kill_switch(True, reason="legacy route test", principal=_OPERATOR)
-    assert RiskStateService(app_db).kill_switch_engaged() is True
+    assert RiskStateService(SqlRiskStateStorage(app_db), get_settings()).kill_switch_engaged() is True
 
     risk.kill_switch(False, reason="legacy route test done", principal=_OPERATOR)
-    assert RiskStateService(app_db).kill_switch_engaged() is False
+    assert RiskStateService(SqlRiskStateStorage(app_db), get_settings()).kill_switch_engaged() is False
 
 
 def test_the_legacy_kill_switch_requires_a_reason():
@@ -200,16 +200,16 @@ def test_the_legacy_kill_switch_requires_a_reason():
 
 
 def test_the_legacy_mode_endpoint_writes_the_durable_state(app_db):
-    from atr.services.risk import RiskStateService
+    from forward.services.risk import RiskStateService
 
     risk.set_execution_mode("live", reason="legacy route test", principal=_OPERATOR)
-    assert RiskStateService(app_db).execution_mode() == "live"
+    assert RiskStateService(SqlRiskStateStorage(app_db), get_settings()).execution_mode() == "live"
     risk.set_execution_mode("paper", reason="", principal=_OPERATOR)
 
 
 def test_an_unreadable_risk_store_reports_paper_not_live(monkeypatch):
     """The failure direction matters: an unreadable mode must never read as 'live'."""
-    from atr.services import risk as risk_module
+    from forward.services import risk as risk_module
 
     def explode(*args, **kwargs):  # noqa: ARG001
         raise RuntimeError("store unavailable")
@@ -263,18 +263,21 @@ def test_the_spa_fallback_cannot_read_files_outside_the_build(client, path):
     """`%2e%2e` decodes to `..`; an unchecked join served .env and the broker token."""
     response = client.get(path)
     assert "[project]" not in response.text
-    assert '"name": "atr-web"' not in response.text
+    assert "<title>Forward</title>" in response.text
 
 
 def test_audit_limit_zero_is_not_the_whole_file(tmp_path, monkeypatch):
-    """`lines[-0:]` is every line; a zero limit must not dump the full trail."""
+    """A zero limit still reads one event, never the whole audit trail."""
     import json
+
+    from forward.wiring.audit import get_audit_log_service
 
     path = tmp_path / "audit.jsonl"
     path.write_text("\n".join(json.dumps({"n": i}) for i in range(50)) + "\n", encoding="utf-8")
-    monkeypatch.setattr(common, "_AUDIT_PATH", path)
-    assert len(common._read_audit(0)) == 1
-    assert [e["n"] for e in common._read_audit(3)] == [49, 48, 47]
+    monkeypatch.setenv("FORWARD_AUDIT_PATH", str(path))
+    audit_log = get_audit_log_service()
+    assert len(audit_log.recent(0)) == 1
+    assert [event["n"] for event in audit_log.recent(3)] == [49, 48, 47]
 
 
 def test_query_limits_are_bounded(auth_client):
@@ -287,9 +290,10 @@ def test_the_tick_websocket_refuses_a_foreign_origin(client):
     """A page on another site must not be able to open the tick stream."""
     from starlette.websockets import WebSocketDisconnect
 
-    with pytest.raises(WebSocketDisconnect):
-        with client.websocket_connect("/ws/ticks", headers={"origin": "https://evil.example"}):
-            pass
+    with pytest.raises(WebSocketDisconnect), client.websocket_connect(
+        "/ws/ticks", headers={"origin": "https://evil.example"}
+    ):
+        pass
 
 
 def test_a_viewer_cannot_place_a_legacy_order(auth_client):
@@ -301,10 +305,10 @@ def test_a_viewer_cannot_place_a_legacy_order(auth_client):
     """
     from fastapi.testclient import TestClient
 
-    from atr.api.main import app
-    from atr.appdb.engine import get_app_db
-    from atr.appdb.repositories import UserRepository
-    from atr.auth.passwords import hash_password
+    from forward.api.main import app
+    from forward.appdb.engine import get_app_db
+    from forward.appdb.identity_repository import UserRepository
+    from forward.auth.passwords import hash_password
 
     with get_app_db().session() as session:
         UserRepository.create(

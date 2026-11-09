@@ -19,9 +19,16 @@ from __future__ import annotations
 
 import pytest
 
-from atr.appdb.repositories import UserRepository
-from atr.core.models import Funds, Holding, Instrument, Order, Position
-from atr.services.reconcile import (
+from forward.appdb.identity_repository import UserRepository
+from forward.appdb.order_storage import SqlOrderStorage
+from forward.appdb.paper_ledger_storage import SqlPaperLedgerStorage
+from forward.appdb.reconciliation_storage import SqlReconciliationStorage
+from forward.config.settings import get_settings
+from forward.core.instrument_models import Instrument
+from forward.core.order_models import Order
+from forward.core.portfolio_models import Funds, Holding, Position
+from forward.services.paper_ledger import PaperLedger
+from forward.services.reconcile import (
     SCOPE_FUNDS,
     SCOPE_HOLDINGS,
     SCOPE_ORDERS,
@@ -31,19 +38,66 @@ from atr.services.reconcile import (
     SEVERITY_OK,
     SEVERITY_WARNING,
     ReconciliationService,
-    compare_funds,
-    compare_holdings,
     compare_orders,
-    compare_positions,
 )
+from forward.services.reconcile import (
+    compare_funds as _compare_funds,
+)
+from forward.services.reconcile import (
+    compare_holdings as _compare_holdings,
+)
+from forward.services.reconcile import (
+    compare_positions as _compare_positions,
+)
+from tests.paper_price_fakes import no_live_price
+
+
+def _reconciliation_service(database):
+    """Build reconciliation with the SQL adapters used by the application."""
+    return ReconciliationService(
+        storage=SqlReconciliationStorage(database),
+        ledger=PaperLedger(storage=SqlPaperLedgerStorage(database), price_source=no_live_price),
+        quantity_tolerance=get_settings().reconcile_quantity_tolerance,
+        cash_tolerance=get_settings().reconcile_cash_tolerance,
+    )
+
+
+def compare_positions(platform_positions, broker_positions):
+    """Call the pure comparison with the required configured quantity tolerance."""
+    return _compare_positions(
+        platform_positions,
+        broker_positions,
+        quantity_tolerance=get_settings().reconcile_quantity_tolerance,
+    )
+
+
+def compare_holdings(platform_positions, broker_holdings):
+    """Call the pure comparison with the required configured quantity tolerance."""
+    return _compare_holdings(
+        platform_positions,
+        broker_holdings,
+        quantity_tolerance=get_settings().reconcile_quantity_tolerance,
+    )
+
+
+def compare_funds(platform_cash, broker_funds):
+    """Call the pure comparison with the required configured cash tolerance."""
+    return _compare_funds(
+        platform_cash,
+        broker_funds,
+        cash_tolerance=get_settings().reconcile_cash_tolerance,
+    )
 
 
 @pytest.fixture()
 def trader(app_db):
     with app_db.session() as session:
         return UserRepository.create(
-            session, email="r@example.com", username="recon",
-            password_hash="x", role="trader",
+            session,
+            email="r@example.com",
+            username="recon",
+            password_hash="x",
+            role="trader",
         )["user_id"]
 
 
@@ -54,7 +108,7 @@ def _instrument(symbol: str) -> Instrument:
 def _order(symbol: str, broker_order_id: str | None) -> Order:
     return Order(
         instrument=_instrument(symbol),
-        side=__import__("atr.core.enums", fromlist=["Side"]).Side.BUY,
+        side=__import__("forward.core.enums", fromlist=["Side"]).Side.BUY,
         quantity=1,
         broker_order_id=broker_order_id,
     )
@@ -107,12 +161,11 @@ def test_an_unacknowledged_order_is_not_counted():
 
 
 def test_both_directions_are_reported_at_once():
-    result = compare_orders(
-        [{"broker_order_id": "A", "symbol": "X"}], [_order("Y", "B")]
-    )
+    result = compare_orders([{"broker_order_id": "A", "symbol": "X"}], [_order("Y", "B")])
     assert len(result.differences) == 2
     assert {d.kind for d in result.differences} == {
-        "unknown_to_platform", "missing_at_broker",
+        "unknown_to_platform",
+        "missing_at_broker",
     }
 
 
@@ -243,7 +296,7 @@ class _Broker:
 
 
 def test_a_clean_run_is_recorded_as_ok(app_db, trader):
-    service = ReconciliationService(app_db)
+    service = _reconciliation_service(app_db)
     report = service.run(
         trader, broker=_Broker(no_holdings=True, no_funds=True), scopes=[SCOPE_ORDERS]
     )
@@ -254,7 +307,7 @@ def test_a_clean_run_is_recorded_as_ok(app_db, trader):
 
 
 def test_a_critical_run_raises_the_banner(app_db, trader):
-    service = ReconciliationService(app_db)
+    service = _reconciliation_service(app_db)
     report = service.run(
         trader,
         broker=_Broker(orders=[_order("RELIANCE", "B1")]),
@@ -269,7 +322,7 @@ def test_a_critical_run_raises_the_banner(app_db, trader):
 
 
 def test_a_later_clean_run_clears_the_banner(app_db, trader):
-    service = ReconciliationService(app_db)
+    service = _reconciliation_service(app_db)
     service.run(trader, broker=_Broker(orders=[_order("X", "B1")]), scopes=[SCOPE_ORDERS])
     assert service.status(trader)["clear"] is False
 
@@ -280,7 +333,7 @@ def test_a_later_clean_run_clears_the_banner(app_db, trader):
 def test_an_incomparable_scope_is_never_recorded_as_ok(app_db, trader):
     """The failure this control exists to prevent: a clean-looking run that skipped
     half its scopes."""
-    service = ReconciliationService(app_db)
+    service = _reconciliation_service(app_db)
     report = service.run(
         trader,
         broker=_Broker(no_holdings=True, no_funds=True),
@@ -298,9 +351,10 @@ def test_an_incomparable_scope_is_never_recorded_as_ok(app_db, trader):
 
 def test_a_broker_that_cannot_be_reached_is_recorded_not_raised(app_db, trader):
     """Reconciliation that throws is reconciliation that stops running."""
-    service = ReconciliationService(app_db)
+    service = _reconciliation_service(app_db)
     report = service.run(
-        trader, broker=_Broker(raises=ConnectionError("socket closed")),
+        trader,
+        broker=_Broker(raises=ConnectionError("socket closed")),
         scopes=[SCOPE_ORDERS],
     )
     assert report.severity == SEVERITY_WARNING
@@ -310,7 +364,7 @@ def test_a_broker_that_cannot_be_reached_is_recorded_not_raised(app_db, trader):
 
 
 def test_a_failed_run_does_not_lose_its_scopes(app_db, trader):
-    service = ReconciliationService(app_db)
+    service = _reconciliation_service(app_db)
     report = service.run(
         trader, broker=_Broker(raises=TimeoutError("timed out")), scopes=list(SCOPES)
     )
@@ -319,17 +373,17 @@ def test_a_failed_run_does_not_lose_its_scopes(app_db, trader):
 
 
 def test_an_unknown_scope_is_refused(app_db, trader):
-    service = ReconciliationService(app_db)
+    service = _reconciliation_service(app_db)
     with pytest.raises(ValueError, match="unknown reconciliation scope"):
         service.run(trader, broker=_Broker(), scopes=["orders", "vibes"])
 
 
 def test_the_platform_position_fold_is_used(app_db, trader):
     """The platform's side is the LIVE order-event fold, the same one the risk gate gets."""
-    from atr.execution.oms import OrderDraft, RiskDecision
-    from atr.services.orders import OrderService
+    from forward.execution.oms import OrderDraft, RiskDecision
+    from forward.services.orders import OrderService
 
-    service = OrderService(app_db, risk_gate=lambda d: RiskDecision.ok())
+    service = OrderService(SqlOrderStorage(app_db), risk_gate=lambda d: RiskDecision.ok())
     opened = service.open_order(
         OrderDraft(user_id=trader, symbol="RELIANCE", side="BUY", quantity=10, mode="LIVE")
     )
@@ -338,7 +392,7 @@ def test_the_platform_position_fold_is_used(app_db, trader):
     service.acknowledge(opened.order_id, trader, broker_order_id="B1")
     service.record_fill(opened.order_id, trader, filled_qty=10.0, filled_price=2500.0)
 
-    assert ReconciliationService(app_db).platform_positions(trader) == {"RELIANCE": 10.0}
+    assert _reconciliation_service(app_db).platform_positions(trader) == {"RELIANCE": 10.0}
 
     # Paper fills must not pollute the live comparison.
     paper = service.open_order(
@@ -348,11 +402,12 @@ def test_the_platform_position_fold_is_used(app_db, trader):
     service.submit(paper.order_id, trader)
     service.acknowledge(paper.order_id, trader, broker_order_id="P1")
     service.record_fill(paper.order_id, trader, filled_qty=5.0, filled_price=2500.0)
-    assert ReconciliationService(app_db).platform_positions(trader) == {"RELIANCE": 10.0}
+    assert _reconciliation_service(app_db).platform_positions(trader) == {"RELIANCE": 10.0}
 
     # And the fold makes a broker disagreement visible.
-    report = ReconciliationService(app_db).run(
-        trader, broker=_Broker(positions=[_position("RELIANCE", 7.0)]),
+    report = _reconciliation_service(app_db).run(
+        trader,
+        broker=_Broker(positions=[_position("RELIANCE", 7.0)]),
         scopes=[SCOPE_POSITIONS],
     )
     assert report.severity == SEVERITY_CRITICAL
@@ -360,10 +415,12 @@ def test_the_platform_position_fold_is_used(app_db, trader):
 
 
 def test_the_audit_trail_records_the_run(app_db, trader):
-    from atr.appdb.repositories import AuditRepository
+    from forward.appdb.audit_repository import AuditRepository
 
-    ReconciliationService(app_db).run(
-        trader, broker=_Broker(orders=[_order("X", "B1")]), scopes=[SCOPE_ORDERS],
+    _reconciliation_service(app_db).run(
+        trader,
+        broker=_Broker(orders=[_order("X", "B1")]),
+        scopes=[SCOPE_ORDERS],
         actor="alice",
     )
     with app_db.session() as session:
@@ -375,9 +432,9 @@ def test_the_audit_trail_records_the_run(app_db, trader):
 
 
 def test_a_clean_run_audits_as_success(app_db, trader):
-    from atr.appdb.repositories import AuditRepository
+    from forward.appdb.audit_repository import AuditRepository
 
-    ReconciliationService(app_db).run(
+    _reconciliation_service(app_db).run(
         trader, broker=_Broker(), scopes=[SCOPE_ORDERS], actor="alice"
     )
     with app_db.session() as session:
@@ -394,14 +451,14 @@ def test_a_notifier_gets_the_report_and_cannot_break_the_run(app_db, trader):
     def exploding(report) -> None:  # noqa: ARG001
         raise RuntimeError("notification channel down")
 
-    service = ReconciliationService(app_db)
-    service.run(trader, broker=_Broker(orders=[_order("X", "B1")]),
-                scopes=[SCOPE_ORDERS], notifier=notifier)
+    service = _reconciliation_service(app_db)
+    service.run(
+        trader, broker=_Broker(orders=[_order("X", "B1")]), scopes=[SCOPE_ORDERS], notifier=notifier
+    )
     assert seen == [SEVERITY_CRITICAL]
 
     # A failing notifier must not lose the run.
-    report = service.run(trader, broker=_Broker(), scopes=[SCOPE_ORDERS],
-                         notifier=exploding)
+    report = service.run(trader, broker=_Broker(), scopes=[SCOPE_ORDERS], notifier=exploding)
     assert report.run_id
     assert report.severity == SEVERITY_OK
 
@@ -409,10 +466,13 @@ def test_a_notifier_gets_the_report_and_cannot_break_the_run(app_db, trader):
 def test_runs_are_user_scoped(app_db, trader):
     with app_db.session() as session:
         stranger = UserRepository.create(
-            session, email="s@example.com", username="stranger",
-            password_hash="x", role="trader",
+            session,
+            email="s@example.com",
+            username="stranger",
+            password_hash="x",
+            role="trader",
         )["user_id"]
-    service = ReconciliationService(app_db)
+    service = _reconciliation_service(app_db)
     service.run(trader, broker=_Broker(orders=[_order("X", "B1")]), scopes=[SCOPE_ORDERS])
 
     assert service.latest(stranger) is None
@@ -421,7 +481,7 @@ def test_runs_are_user_scoped(app_db, trader):
 
 
 def test_history_can_be_filtered_by_severity(app_db, trader):
-    service = ReconciliationService(app_db)
+    service = _reconciliation_service(app_db)
     service.run(trader, broker=_Broker(), scopes=[SCOPE_ORDERS])
     service.run(trader, broker=_Broker(orders=[_order("X", "B1")]), scopes=[SCOPE_ORDERS])
 

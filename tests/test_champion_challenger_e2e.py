@@ -30,20 +30,48 @@ Also proven, because each would silently corrupt the comparison:
 from __future__ import annotations
 
 from datetime import datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
 import pytest
 
-from atr.appdb.repositories import (
-    DeploymentRepository,
-    StrategyRepository,
-    TradeJournalRepository,
+from forward.appdb.champion_storage import SqlChampionStorage
+from forward.appdb.daily_learning_storage import SqlDailyLearningStorage
+from forward.appdb.deployment_repository import DeploymentRepository
+from forward.appdb.forward_check_storage import SqlForwardCheckStorage
+from forward.appdb.learning_storage import SqlLearningStorage
+from forward.appdb.order_storage import SqlOrderStorage
+from forward.appdb.paper_deployment_storage import SqlPaperDeploymentStorage
+from forward.appdb.paper_ledger_storage import SqlPaperLedgerStorage
+from forward.appdb.paper_runner_storage import SqlPaperRunnerStorage
+from forward.appdb.portfolio_storage import SqlPortfolioStorage
+from forward.appdb.risk_state_storage import SqlRiskStateStorage
+from forward.appdb.strategy_repository import StrategyRepository
+from forward.appdb.system_state_storage import SqlSystemStateStorage
+from forward.appdb.trade_journal_repository import TradeJournalRepository
+from forward.appdb.trade_journal_storage import SqlTradeJournalStorage
+from forward.config.settings import get_settings
+from forward.core.learning_evidence import CLASS_PAPER_FORWARD
+from forward.data.cached_market_frames import CachedMarketFramesAdapter
+from forward.data.learning_artifacts import LocalLearningArtifactsAdapter
+from forward.data.vwap_liquidity import NseBhavcopyLiquidityAdapter
+from forward.market_calendar import get_market_calendar
+from forward.services.champions import ChampionService
+from forward.services.deployments import DeploymentService
+from forward.services.learning import LearningService
+from forward.services.learning_dataset import LearningDatasetBuilder
+from forward.services.paper_ledger import PaperLedger
+from forward.services.risk import RiskStateService
+from tests.market_data_fakes import (
+    InMemoryLearningArtifactsPort,
+    InMemoryMarketFramesPort,
+    NoopSignalContextEnricher,
+    signal_context_service_for_test,
 )
-from atr.research.learning_evidence import CLASS_PAPER_FORWARD
-from atr.services.champions import ChampionService
-from atr.services.learning import LearningDatasetBuilder, LearningService
+from tests.order_fakes import order_instrument_lookup
+from tests.paper_price_fakes import StaticRunnerVenueProvider, no_live_price
 
 SYMBOL = "RELIANCE"
 EXCHANGE = "NSEEQ"
@@ -122,7 +150,7 @@ def _frame(seed: int, periods: int = 300, up: float = 0.001) -> pd.DataFrame:
 
 @pytest.fixture()
 def owner(app_db) -> str:
-    from atr.appdb.schema import users
+    from forward.appdb.account_schema import users
 
     with app_db.session() as session:
         session.execute(
@@ -167,22 +195,56 @@ def strategy(app_db, owner) -> dict:
 def _deployment_config() -> dict:
     return {
         "symbols": [SYMBOL],
-        "exchange": EXCHANGE, "signal_basis": "live",
+        "exchange": EXCHANGE,
+        "signal_basis": "live",
         "timeframe": "1d",
-        "order_value": 250_000.0,
         "lookback_days": 400,
         "max_open_positions": 1,
     }
 
 
+def _champion_service(app_db) -> ChampionService:
+    """Build a champion service with its required application adapters.
+
+    Args:
+        app_db: Test database shared by the service's storage adapters.
+
+    Returns:
+        A fully configured champion comparison service.
+    """
+
+    return ChampionService(
+        storage=SqlChampionStorage(app_db),
+        learning=LearningService(
+            artifacts=InMemoryLearningArtifactsPort(),
+            market_history=InMemoryMarketFramesPort({}),
+            portfolio_storage=SqlPortfolioStorage(app_db),
+            storage=SqlLearningStorage(app_db),
+            daily_learning_storage=SqlDailyLearningStorage(app_db),
+        ),
+        contexts=signal_context_service_for_test(
+            app_db,
+            data_root=Path(get_settings().research_data_directory),
+        ),
+        deployments=DeploymentService(
+            runner_interval_seconds=get_settings().runner_interval_seconds,
+            runner_lookback_days=get_settings().runner_lookback_days,
+            portfolio_storage=SqlPortfolioStorage(app_db),
+            storage=SqlPaperDeploymentStorage(app_db),
+            ledger=PaperLedger(storage=SqlPaperLedgerStorage(app_db), price_source=no_live_price),
+            forward_trade_storage=SqlForwardCheckStorage(app_db),
+        ),
+    )
+
+
 @pytest.fixture()
 def arms(app_db, owner, strategy, monkeypatch) -> dict:
     """Champion V1 + challenger V2, one shared session, both closed."""
-    from atr.services.journal import TradeJournalService
-    from atr.services.runner import PaperRunner
+    from forward.services.journal import TradeJournalService
+    from forward.services.runner import PaperRunner
 
     monkeypatch.setattr(
-        "atr.signals.engine.load_daily",
+        "forward.data.cached_market_frames.load_daily_from_cache",
         lambda symbol, exchange="NSEEQ", **kw: _daily(),
     )
     with app_db.session() as session:
@@ -196,7 +258,7 @@ def arms(app_db, owner, strategy, monkeypatch) -> dict:
             status="RUNNING",
             config=_deployment_config(),
         )
-    service = ChampionService(db=app_db)
+    service = _champion_service(app_db)
     challenger = service.launch_challenger(
         owner,
         strategy_id=strategy["strategy_id"],
@@ -204,11 +266,31 @@ def arms(app_db, owner, strategy, monkeypatch) -> dict:
         challenger_version=2,
     )
     with app_db.session() as session:
-        DeploymentRepository.start(
-            session, challenger["deployment_id"], owner
-        )
+        DeploymentRepository.start(session, challenger["deployment_id"], owner)
 
-    runner = PaperRunner(db=app_db)
+    runner = PaperRunner(
+        interval_seconds=get_settings().runner_interval_seconds,
+        lookback_days=get_settings().runner_lookback_days,
+        minimum_sleep_seconds=get_settings().runner_min_sleep_seconds,
+        market_wait_seconds=get_settings().runner_market_wait_seconds,
+        symbol_retry_seconds=get_settings().deployment_symbol_retry_seconds,
+        signal_context=NoopSignalContextEnricher(),
+        daily_history=CachedMarketFramesAdapter(),
+        vwap_liquidity=NseBhavcopyLiquidityAdapter(get_settings().research_data_directory),
+        sector_table={},
+        instrument_lookup=order_instrument_lookup,
+        journal_storage=SqlTradeJournalStorage(app_db),
+        portfolio_storage=SqlPortfolioStorage(app_db),
+        ledger=PaperLedger(storage=SqlPaperLedgerStorage(app_db), price_source=no_live_price),
+        order_storage=SqlOrderStorage(app_db),
+        runner_storage=SqlPaperRunnerStorage(app_db),
+        state_storage=SqlSystemStateStorage(app_db),
+        risk_state=RiskStateService(SqlRiskStateStorage(app_db), get_settings()),
+        calendar=get_market_calendar(),
+        venue_provider=StaticRunnerVenueProvider(
+            prices=no_live_price, instruments=order_instrument_lookup
+        ),
+    )
     runner.sync_loops()
     assert set(runner._loops) == {
         champion["deployment_id"],
@@ -221,7 +303,7 @@ def arms(app_db, owner, strategy, monkeypatch) -> dict:
 
     _record_context(app_db, owner, strategy["strategy_id"])
 
-    journal = TradeJournalService(db=app_db)
+    journal = TradeJournalService(storage=SqlTradeJournalStorage(app_db), ledger=runner.ledger)
     for deployment_id in (champion["deployment_id"], challenger["deployment_id"]):
         journal.reconcile(USER, deployment_id)
         _flatten(app_db, deployment_id, multiplier=1.02)
@@ -235,21 +317,29 @@ def arms(app_db, owner, strategy, monkeypatch) -> dict:
 
 
 def _flatten(app_db, deployment_id: str, *, multiplier: float) -> None:
-    from atr.execution.oms import OrderDraft
-    from atr.services import paper as paper_service
-    from atr.services.execution import ExecutionService
-    from atr.services.orders import get_order_service
-    from atr.services.paper import PaperLedger
+    from forward.execution.oms import OrderDraft
+    from forward.services import paper_venue as paper_service
+    from forward.services.execution import ExecutionService
+    from forward.services.orders import get_order_service
+    from forward.services.paper_ledger import PaperLedger
 
-    ledger = PaperLedger(db=app_db)
+    ledger = PaperLedger(storage=SqlPaperLedgerStorage(app_db), price_source=no_live_price)
     portfolio = ledger.portfolio(USER, deployment_id=deployment_id)
     position = portfolio.position(SYMBOL)
     quantity = abs(float(position.quantity))
     assert quantity > 0, "the entry must have filled before the exit is placed"
     exit_price = round(float(position.avg_price) * multiplier, 2)
     ExecutionService(
-        orders=get_order_service(portfolio=portfolio),
-        venue=paper_service.paper_venue(lambda s, e: exit_price),
+        orders=get_order_service(
+            instruments=order_instrument_lookup,
+            storage=SqlOrderStorage(app_db),
+            risk=RiskStateService(SqlRiskStateStorage(app_db), get_settings()),
+            portfolio=portfolio,
+        ),
+        venue=paper_service.paper_venue(
+            lambda s, e: exit_price,
+            instruments=order_instrument_lookup,
+        ),
     ).place(
         OrderDraft(
             user_id=USER,
@@ -274,8 +364,7 @@ def _record_context(app_db, user_id: str, strategy_id: str) -> None:
     """
     from sqlalchemy import select
 
-    from atr.appdb.schema import orders
-    from atr.signal_context.service import SignalContextService
+    from forward.appdb.execution_schema import orders
 
     with app_db.session() as session:
         signal_id = session.execute(
@@ -286,7 +375,10 @@ def _record_context(app_db, user_id: str, strategy_id: str) -> None:
         ).scalar()
     assert signal_id, "the session must have raised an entry order"
 
-    service = SignalContextService(db=app_db)
+    service = signal_context_service_for_test(
+        app_db,
+        data_root=Path(get_settings().research_data_directory),
+    )
     stock = _frame(21, up=0.002)
     bench = _frame(22)
     when = stock["ts"].iloc[250]
@@ -308,28 +400,28 @@ def _record_context(app_db, user_id: str, strategy_id: str) -> None:
         sector_hint=sector,
         when=when,
     )
-    with app_db.session() as session:
-        assert service.record(session, context, user_id=user_id) == 1
+    assert service.record(context, user_id) == 1
 
 
 def _orders_by_deployment(app_db, deployment_id: str) -> list[dict]:
     from sqlalchemy import select
 
-    from atr.appdb.schema import orders
+    from forward.appdb.execution_schema import orders
 
     with app_db.session() as session:
         return [
             dict(r)
-            for r in session.execute(
-                select(orders).where(orders.c.deployment_id == deployment_id)
-            ).mappings().all()
+            for r in session.execute(select(orders).where(orders.c.deployment_id == deployment_id))
+            .mappings()
+            .all()
         ]
 
 
 def _governance_snapshot(app_db) -> dict:
     from sqlalchemy import select
 
-    from atr.appdb.schema import deployments, strategies, strategy_versions
+    from forward.appdb.execution_schema import deployments
+    from forward.appdb.strategy_backtest_schema import strategies, strategy_versions
 
     with app_db.session() as session:
         return {
@@ -374,9 +466,9 @@ def test_both_arms_trade_the_same_tick_independently(app_db, arms):
 
 
 def test_positions_pnl_and_journals_stay_in_their_arm(app_db, arms, strategy):
-    from atr.services.paper import PaperLedger
+    from forward.services.paper_ledger import PaperLedger
 
-    ledger = PaperLedger(db=app_db)
+    ledger = PaperLedger(storage=SqlPaperLedgerStorage(app_db), price_source=no_live_price)
     champion_book = ledger.portfolio(USER, deployment_id=arms["champion_id"])
     challenger_book = ledger.portfolio(USER, deployment_id=arms["challenger_id"])
     assert abs(float(champion_book.position(SYMBOL).quantity)) == 0
@@ -399,17 +491,24 @@ def test_positions_pnl_and_journals_stay_in_their_arm(app_db, arms, strategy):
 
 
 def test_learning_evidence_separates_by_version(app_db, arms, tmp_path, strategy):
-    builder = LearningDatasetBuilder(db=app_db, cache_root=tmp_path, frames={})
+    builder = LearningDatasetBuilder(
+        portfolio_storage=SqlPortfolioStorage(app_db),
+        storage=SqlLearningStorage(app_db),
+        artifacts=LocalLearningArtifactsAdapter(tmp_path),
+        market_history=InMemoryMarketFramesPort({}),
+    )
     dataset = builder.build(user_id=USER)
 
     v1 = [
-        r for r in dataset.rows
+        r
+        for r in dataset.rows
         if r.get("strategy_id") == strategy["strategy_id"]
         and r.get("strategy_version") == 1
         and r.get("evidence_class") == CLASS_PAPER_FORWARD
     ]
     v2 = [
-        r for r in dataset.rows
+        r
+        for r in dataset.rows
         if r.get("strategy_id") == strategy["strategy_id"]
         and r.get("strategy_version") == 2
         and r.get("evidence_class") == CLASS_PAPER_FORWARD
@@ -417,9 +516,10 @@ def test_learning_evidence_separates_by_version(app_db, arms, tmp_path, strategy
     assert len(v1) == 1 and len(v2) == 1
     assert v1[0]["trade_ref"] != v2[0]["trade_ref"]
 
-    from atr.signal_context.service import SignalContextService
-
-    contexts = SignalContextService(db=app_db)
+    contexts = signal_context_service_for_test(
+        app_db,
+        data_root=Path(get_settings().research_data_directory),
+    )
     arm1 = contexts.effectiveness(
         USER, strategy_id=strategy["strategy_id"], strategy_version=1, source="PAPER"
     )
@@ -437,7 +537,7 @@ def test_learning_evidence_separates_by_version(app_db, arms, tmp_path, strategy
 
 
 def test_compare_reports_both_arms_and_insufficient_evidence(app_db, arms, strategy):
-    service = ChampionService(db=app_db)
+    service = _champion_service(app_db)
     before = _governance_snapshot(app_db)
 
     result = service.compare(
@@ -482,12 +582,12 @@ def test_compare_reports_both_arms_and_insufficient_evidence(app_db, arms, strat
 
 
 def test_roles_infer_from_running_arms_when_unnamed(app_db, arms, strategy):
-    result = ChampionService(db=app_db).compare(USER, strategy["strategy_id"])
+    result = _champion_service(app_db).compare(USER, strategy["strategy_id"])
     assert (result["champion_version"], result["challenger_version"]) == (1, 2)
 
 
 def test_no_strategy_mutation_no_promotion(app_db, arms, strategy, tmp_path):
-    service = ChampionService(db=app_db)
+    service = _champion_service(app_db)
 
     with app_db.session() as session:
         hashes_before = {
@@ -497,7 +597,13 @@ def test_no_strategy_mutation_no_promotion(app_db, arms, strategy, tmp_path):
         count_before = StrategyRepository.version_count(session, strategy["strategy_id"])
     deployments_before = _governance_snapshot(app_db)["deployments"]
 
-    LearningService(db=app_db).readiness(user_id=USER)
+    LearningService(
+        artifacts=InMemoryLearningArtifactsPort(),
+        market_history=InMemoryMarketFramesPort({}),
+        portfolio_storage=SqlPortfolioStorage(app_db),
+        storage=SqlLearningStorage(app_db),
+        daily_learning_storage=SqlDailyLearningStorage(app_db),
+    ).readiness(user_id=USER)
     service.compare(USER, strategy["strategy_id"], champion_version=1, challenger_version=2)
 
     with app_db.session() as session:
@@ -507,9 +613,10 @@ def test_no_strategy_mutation_no_promotion(app_db, arms, strategy, tmp_path):
         }
         assert StrategyRepository.version_count(session, strategy["strategy_id"]) == count_before
         for version in (1, 2):
-            assert StrategyRepository.version(
-                session, strategy["strategy_id"], version
-            )["is_deployed"] is False, "comparing must not flip deployment flags"
+            assert (
+                StrategyRepository.version(session, strategy["strategy_id"], version)["is_deployed"]
+                is False
+            ), "comparing must not flip deployment flags"
     assert hashes_before == hashes_after
     assert _governance_snapshot(app_db)["deployments"] == deployments_before
     with app_db.session() as session:

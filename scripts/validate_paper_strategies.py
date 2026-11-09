@@ -2,7 +2,7 @@
 
 Why this exists
 ---------------
-``atr.research.papers`` attaches a hardcoded ``win_rate`` (0.58, 0.64, ...) to
+``forward.research.papers`` attaches a hardcoded ``win_rate`` (0.58, 0.64, ...) to
 every signal and derives ``expected_value`` and ``confidence_score`` from it.
 Those numbers are citations, not measurements. The walk-forward harness gates
 every other strategy on prices it has never seen, but the paper models could
@@ -27,9 +27,10 @@ trade on a given date. For a 19-name universe over 6.5 years that means each
 symbol spends most of its rows NaN, so ``ctx.history(symbol)`` hands the paper
 models a frame whose ``close`` column is mostly missing and they never fire.
 
-The fix is to give the feed the series it actually needs: one symbol per
-snapshot, each on its own timeline. Fold arithmetic then counts a *symbol-bar*
-as a bar, which is simpler and makes ``test_bars`` mean exactly what it says.
+This validator requires complete OHLCV rows on the same observed dates for all
+selected symbols. It rejects mismatched calendars instead of filling missing
+bars. Fold arithmetic then counts a *symbol-bar* as a bar, which makes
+``test_bars`` mean exactly what it says.
 
 Usage::
 
@@ -49,22 +50,24 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
-from atr.backtest.costs import SlippageModel  # noqa: E402
-from atr.backtest.engine import BacktestConfig, BacktestEngine  # noqa: E402
-from atr.core.enums import AssetClass, Timeframe  # noqa: E402
-from atr.core.models import Bar, Instrument, MarketSnapshot  # noqa: E402
-from atr.data.base import ListFeed  # noqa: E402
-from atr.data.hygiene import drop_reverting_spikes  # noqa: E402
-from atr.execution.risk import RiskLimits  # noqa: E402
-from atr.research.validate import (  # noqa: E402
+from forward.backtest.engine import BacktestConfig  # noqa: E402
+from forward.core.costs import SlippageModel  # noqa: E402
+from forward.core.enums import AssetClass  # noqa: E402
+from forward.core.feeds import ListFeed  # noqa: E402
+from forward.core.instrument_models import Instrument
+from forward.core.market_models import Bar, MarketSnapshot
+from forward.execution.risk import RiskLimits  # noqa: E402
+from forward.research.data_hygiene import drop_reverting_spikes  # noqa: E402
+from forward.research.validate import (  # noqa: E402
     ValidationConfig,
     WalkForwardConfig,
     walk_forward,
 )
-from atr.strategy.base import Strategy  # noqa: E402
-from atr.strategy.strategies import STRATEGIES  # noqa: E402
+from forward.strategy.base import Strategy  # noqa: E402
+from forward.strategy.strategies import STRATEGIES  # noqa: E402
 
 CACHE_ROOT = Path(__file__).resolve().parents[1] / "data" / "iifl_daily" / "NSEEQ"
 OHLCV = ("open", "high", "low", "close", "volume")
@@ -86,12 +89,20 @@ DEFAULT_UNIVERSE = (
 # ---------------------------------------------------------------------------
 
 
-def load_series(symbols: list[str], exchange: str = "NSEEQ", min_bars: int = 500):
+def load_series(
+    symbols: list[str], min_bars: int = 500
+) -> dict[str, pd.DataFrame]:
     """Read cached parquets into per-symbol frames, each on its own timeline.
 
-    Vendor glitches are dropped here rather than left for a strategy to trade on
-    — see :mod:`atr.data.hygiene`. The count is printed, not swallowed: a silent
-    repair is indistinguishable from a silent bug.
+    Args:
+        symbols: Instrument symbols to read.
+        min_bars: Minimum usable bars required for a symbol.
+
+    Returns:
+        Valid market frames keyed by symbol.
+
+    Raises:
+        ValueError: If a selected cache has incomplete OHLCV data.
     """
     series: dict[str, pd.DataFrame] = {}
     dropped_total = 0
@@ -102,18 +113,26 @@ def load_series(symbols: list[str], exchange: str = "NSEEQ", min_bars: int = 500
             continue
         frame = pd.read_parquet(path)
         frame.columns = [c.strip().lower() for c in frame.columns]
-        if "ts" not in frame.columns or len(frame) < min_bars:
+        required = {"ts", *OHLCV}
+        missing = required - set(frame.columns)
+        if missing:
+            raise ValueError(f"{symbol} cache is missing columns: {sorted(missing)}")
+        if len(frame) < min_bars:
             print(f"  skip {symbol}: {len(frame)} bars")
             continue
-        cols = ["ts", *[c for c in OHLCV if c in frame.columns]]
-        frame = frame[cols].copy()
+        frame = frame[["ts", *OHLCV]].copy()
         frame["ts"] = pd.to_datetime(frame["ts"], utc=True)
-        frame = (
-            frame.dropna(subset=["open", "high", "low", "close"])
-            .sort_values("ts")
-            .drop_duplicates("ts", keep="last")
-            .reset_index(drop=True)
-        )
+        if frame.isna().any().any():
+            raise ValueError(f"{symbol} cache has missing date or OHLCV values")
+        if frame["ts"].duplicated().any():
+            raise ValueError(f"{symbol} cache has duplicate dates")
+        frame.loc[:, OHLCV] = frame.loc[:, OHLCV].apply(pd.to_numeric, errors="raise")
+        values = frame.loc[:, OHLCV].to_numpy(dtype=float)
+        if not np.isfinite(values).all():
+            raise ValueError(f"{symbol} cache has non-finite OHLCV data")
+        if (frame["volume"] < 0).any() or (frame[["open", "high", "low", "close"]] <= 0).any().any():
+            raise ValueError(f"{symbol} cache has invalid OHLCV values")
+        frame = frame.sort_values("ts").reset_index(drop=True)
         frame, dropped = drop_reverting_spikes(frame)
         if len(dropped):
             dropped_total += len(dropped)
@@ -131,23 +150,27 @@ def load_series(symbols: list[str], exchange: str = "NSEEQ", min_bars: int = 500
 
 
 def build_feed(series: dict[str, pd.DataFrame], exchange: str = "NSEEQ"):
-    """One snapshot per trading date, every symbol present on every date.
+    """Build snapshots only when every symbol has an observed bar.
 
-    This matters more than it looks. ``BacktestEngine._build_frames`` builds one
-    aligned frame per symbol over the shared snapshot grid and NaN-pads any
-    symbol without a bar at that step. ``ctx.history(sym)`` then reads back that
-    frame — so a sparse grid (one symbol per snapshot, the obvious first
-    attempt) leaves every symbol's history ~99% NaN, the paper models see no
-    prices, and nothing ever trades. It fails silently: zero trades looks like
-    "no signal", not "no data".
+    Args:
+        series: Valid OHLCV frames keyed by symbol.
+        exchange: Exchange assigned to each returned instrument.
 
-    NSE large caps share one trading calendar, so forward-filling a genuinely
-    missing day is safe here and keeps every symbol dense. Prices are never
-    invented: a filled bar repeats the previous close and is flagged by volume
-    0, which no paper model keys off.
+    Returns:
+        A feed and its instrument map.
+
+    Raises:
+        ValueError: If no symbols are provided or their date grids differ.
     """
-    grid = sorted({ts for frame in series.values() for ts in frame["ts"]})
-    index = pd.DatetimeIndex(sorted(set(grid)))
+    if not series:
+        raise ValueError("paper validation needs at least one symbol")
+
+    symbols = sorted(series)
+    index = pd.DatetimeIndex(series[symbols[0]]["ts"])
+    for symbol in symbols[1:]:
+        symbol_dates = pd.DatetimeIndex(series[symbol]["ts"])
+        if not index.equals(symbol_dates):
+            raise ValueError(f"{symbol} does not have the same complete date grid")
 
     # Index once per symbol, not once per symbol per date. The obvious nesting
     # calls `set_index` 129 x 1,567 = 202k times on the mid-cap universe, which
@@ -155,24 +178,17 @@ def build_feed(series: dict[str, pd.DataFrame], exchange: str = "NSEEQ"):
     indexed = {s: f.set_index("ts") for s, f in series.items()}
 
     rows: list[MarketSnapshot] = []
-    for i, ts in enumerate(index):
+    for ts in index:
         bars: dict[str, Bar] = {}
         for symbol, frame in indexed.items():
-            if ts not in frame.index:
-                bars[symbol] = Bar(ts=ts.to_pydatetime(), open=float("nan"),
-                                   high=float("nan"), low=float("nan"),
-                                   close=float("nan"), volume=0.0)
-                continue
             r = frame.loc[ts]
-            if isinstance(r, pd.DataFrame):
-                r = r.iloc[-1]
             bars[symbol] = Bar(
                 ts=ts.to_pydatetime(),
                 open=float(r["open"]), high=float(r["high"]),
                 low=float(r["low"]), close=float(r["close"]),
-                volume=float(r["volume"]) if "volume" in frame.columns else 0.0,
+                volume=float(r["volume"]),
             )
-        rows.append(MarketSnapshot(ts=index[i].to_pydatetime(), bars=bars))
+        rows.append(MarketSnapshot(ts=ts.to_pydatetime(), bars=bars))
 
     instruments = {
         s: Instrument(symbol=s, exchange=exchange, asset_class=AssetClass.EQUITY)
@@ -187,27 +203,25 @@ def build_feed(series: dict[str, pd.DataFrame], exchange: str = "NSEEQ"):
 
 
 def measured_win_rate(trades: pd.DataFrame) -> tuple[float, int, float]:
-    """Win rate and expectancy in R from an actual trade log.
+    """Measure win rate and payoff expectancy from the canonical trade log.
 
-    R is realised P&L divided by the risk the strategy declared, so a 1:3
-    winner counts three times a 1:1 loser — the only way a win rate means
-    anything. Without per-trade risk we fall back to P&L sign, which is a
-    weaker claim and is labelled as such by the caller.
+    Args:
+        trades: Closed trades with a ``net_pnl`` field.
+
+    Returns:
+        Win rate, number of trades, and payoff expectancy.
+
+    Raises:
+        ValueError: If the trade log lacks finite ``net_pnl`` values.
     """
-    if trades is None or trades.empty:
+    if trades.empty:
         return 0.0, 0, 0.0
 
-    pnl_col = next(
-        (c for c in ("pnl", "realized_pnl", "net_pnl", "realised_pnl") if c in trades.columns),
-        None,
-    )
-    if pnl_col is None:
-        return 0.0, len(trades), 0.0
-
-    pnl = pd.to_numeric(trades[pnl_col], errors="coerce").dropna()
-    if pnl.empty:
-        return 0.0, 0, 0.0
-
+    if "net_pnl" not in trades.columns:
+        raise ValueError("trade log is missing the canonical net_pnl field")
+    pnl = pd.to_numeric(trades["net_pnl"], errors="raise")
+    if pnl.isna().any():
+        raise ValueError("trade log has missing net_pnl values")
     wins = int((pnl > 0).sum())
     win_rate = wins / len(pnl)
     gains = float(pnl[pnl > 0].mean()) if wins else 0.0

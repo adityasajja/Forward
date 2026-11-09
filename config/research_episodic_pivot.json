@@ -1,0 +1,29 @@
+{
+  "daily_cache_directory": "data/iifl_daily/NSEEQ",
+  "universe_files": {
+    "nifty50": "data/universe/ind_nifty50list.csv",
+    "next50": "data/universe/ind_niftynext50list.csv",
+    "midcap150": "data/universe/ind_niftymidcap150list.csv",
+    "smallcap250": "data/universe/ind_niftysmallcap250list.csv"
+  },
+  "universes": ["nifty50", "midcap150"],
+  "symbol_column": "Symbol",
+  "required_columns": ["ts", "open", "high", "low", "close", "volume"],
+  "minimum_history_bars": 1000,
+  "volume_average_window": 20,
+  "volume_average_minimum": 10,
+  "quiet_volatility_window": 120,
+  "quiet_volatility_minimum": 60,
+  "quiet_max_volatility_pct_per_day": 2.5,
+  "rupees_per_crore": 10000000,
+  "forward_horizons": [10, 20, 60],
+  "reported_forward_horizon": 20,
+  "tail_window": 20,
+  "gap_thresholds_pct": [3, 5, 10, 20],
+  "volume_ratio_thresholds": [3, 5, 10],
+  "catalyst_gap_threshold_pct": 5,
+  "catalyst_volume_ratio_threshold": 3,
+  "tail_return_thresholds": [0.5, 1.0],
+  "one_day_move_thresholds_pct": [10, 20],
+  "output_file": "data/self_learning/episodic_pivot_premise.json"
+}

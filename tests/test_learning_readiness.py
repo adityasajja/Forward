@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-from atr.research.learning_readiness import (
+from forward.research.learning_readiness import (
     ANALYSIS_READY_N,
     blocking_gaps,
     data_quality_issues,

@@ -1,0 +1,12 @@
+{
+  "callback_host": "127.0.0.1",
+  "callback_port": 8765,
+  "callback_wait_seconds": 300,
+  "exchange": "NSEEQ",
+  "symbols": ["RELIANCE", "HDFCBANK", "INFY", "ICICIBANK", "TCS", "NIFTYBEES"],
+  "from_date": "2025-01-01",
+  "to_date": "2026-09-15",
+  "interval": "1m",
+  "chunk_days": 25,
+  "pause_between_chunks_seconds": 0.1
+}

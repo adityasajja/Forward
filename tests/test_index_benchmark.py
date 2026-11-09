@@ -1,8 +1,8 @@
-"""The market overview prefers the official Nifty 50 index over the ETF proxy.
+"""The market overview reports only the official Nifty 50 index.
 
 The index is downloaded from the broker when a session exists and cached; reading
 it never needs a session. These tests use a fake client, so they prove the
-plumbing (cache, freshness, preference, fallback) but not IIFL's live response.
+plumbing (cache, freshness, source selection) but not IIFL's live response.
 """
 
 from __future__ import annotations
@@ -12,9 +12,39 @@ from datetime import date, timedelta
 import pandas as pd
 import pytest
 
-from atr.data import indices
-from atr.market_intel.models import PROVENANCE_NIFTY50_INDEX
-from atr.market_intel.service import MarketIntelService
+from forward.data import indices
+from forward.data.cache_store import PanelDailyBarCache
+from forward.data.market_intel_index_refresh import (
+    LocalMarketIntelIndexRefreshAdapter,
+)
+from forward.data.market_intel_market_data import LocalMarketIntelDataAdapter
+from forward.data.market_intel_snapshot import PickleMarketIntelSnapshotAdapter
+from forward.market_intel.models import PROVENANCE_NIFTY50_INDEX
+from forward.market_intel.service import MarketIntelService
+
+
+def _market_intel_service(data_root) -> MarketIntelService:
+    """Build a market-intelligence service over one isolated test data root."""
+    from forward.wiring import broker_access
+
+    def broker_client():
+        return broker_access.get_authenticated_broker_client()
+
+    return MarketIntelService(
+        market_data=LocalMarketIntelDataAdapter(
+            data_root, "NSEEQ", PanelDailyBarCache()
+        ),
+        index_refresh=LocalMarketIntelIndexRefreshAdapter(
+            data_root,
+            broker_client,
+            base_url=FakeClient.base_url,
+            contract_source="HTTP",
+            intervals={"NIFTY 50": "1d", "INDIA VIX": "1d"},
+        ),
+        snapshot_cache=PickleMarketIntelSnapshotAdapter(
+            data_root / "panel" / "market_intel.pkl"
+        ),
+    )
 
 
 def _candles(end: date, n: int = 30) -> list[list]:
@@ -36,17 +66,38 @@ class FakeClient:
 
 @pytest.fixture()
 def root(tmp_path, monkeypatch):
-    # No network: the contract lookup falls back to the known id.
-    def no_network(*a, **k):
-        raise OSError("offline")
+    class ContractResponse:
+        def raise_for_status(self):
+            return None
 
-    monkeypatch.setattr(indices.httpx, "get", no_network)
+        def json(self):
+            return [
+                {
+                    "underlyingInstrumentSymbol": "NIFTY 50",
+                    "instrumentId": "999920000",
+                    "exchange": "NSEEQ",
+                },
+                {
+                    "underlyingInstrumentSymbol": "INDIA VIX",
+                    "instrumentId": "999920019",
+                    "exchange": "NSEFO",
+                },
+            ]
+
+    monkeypatch.setattr(indices.httpx, "get", lambda *args, **kwargs: ContractResponse())
     return tmp_path
 
 
 def test_sync_writes_a_cache_that_loads_without_a_session(root):
     client = FakeClient()
-    assert indices.sync_index(client, root) == "ok"
+    assert indices.sync_index(
+        client,
+        root,
+        name=indices.NIFTY_50,
+        base_url=FakeClient.base_url,
+        contract_source="HTTP",
+        interval="1d",
+    ) == "ok"
     assert client.calls == [("NSEEQ", "999920000", "1d")]
 
     frame = indices.load_index(root)  # no client involved
@@ -55,36 +106,71 @@ def test_sync_writes_a_cache_that_loads_without_a_session(root):
 
 def test_a_second_sync_the_same_day_is_skipped(root):
     client = FakeClient()
-    indices.sync_index(client, root)
-    assert indices.sync_index(client, root) == "skip"
+    kwargs = {
+        "name": indices.NIFTY_50,
+        "base_url": FakeClient.base_url,
+        "contract_source": "HTTP",
+        "interval": "1d",
+    }
+    indices.sync_index(client, root, **kwargs)
+    assert indices.sync_index(client, root, **kwargs) == "skip"
     assert len(client.calls) == 1
 
 
 def test_a_failed_sync_keeps_the_previous_file(root):
-    indices.sync_index(FakeClient(), root)
+    indices.sync_index(
+        FakeClient(),
+        root,
+        name=indices.NIFTY_50,
+        base_url=FakeClient.base_url,
+        contract_source="HTTP",
+        interval="1d",
+    )
 
     class Broken(FakeClient):
         def historical_data(self, *a, **k):
             raise RuntimeError("session expired")
 
-    assert indices.sync_index(Broken(), root, force=True) == "fail"
+    assert indices.sync_index(
+        Broken(),
+        root,
+        name=indices.NIFTY_50,
+        base_url=FakeClient.base_url,
+        contract_source="HTTP",
+        interval="1d",
+        force=True,
+    ) == "fail"
     assert indices.load_index(root) is not None
 
 
 def test_a_stale_cache_is_not_presented_as_the_latest(root):
-    indices.sync_index(FakeClient(end=date.today() - timedelta(days=30)), root)
+    indices.sync_index(
+        FakeClient(end=date.today() - timedelta(days=30)),
+        root,
+        name=indices.NIFTY_50,
+        base_url=FakeClient.base_url,
+        contract_source="HTTP",
+        interval="1d",
+    )
     assert indices.load_index(root) is None
 
 
 def test_the_overview_prefers_the_official_index(root):
-    indices.sync_index(FakeClient(), root)
-    frame, provenance = MarketIntelService(data_root=root).get_benchmark_frame_and_provenance()
+    indices.sync_index(
+        FakeClient(),
+        root,
+        name=indices.NIFTY_50,
+        base_url=FakeClient.base_url,
+        contract_source="HTTP",
+        interval="1d",
+    )
+    frame, provenance = _market_intel_service(root).get_benchmark_frame_and_provenance()
     assert provenance == PROVENANCE_NIFTY50_INDEX
     assert provenance.is_proxy is False
     assert frame is not None and float(frame["close"].iloc[-1]) > 1000  # an index level, not a ~267 ETF unit
 
 
-def test_without_an_index_it_falls_back_to_the_etf(root):
+def test_without_an_index_it_reports_the_benchmark_unavailable(root):
     etf_dir = root / "iifl_daily" / "NSEEQ"
     etf_dir.mkdir(parents=True)
     days = pd.bdate_range(end=pd.Timestamp(date.today()), periods=30)
@@ -92,100 +178,41 @@ def test_without_an_index_it_falls_back_to_the_etf(root):
         {"ts": days, "open": 267.0, "high": 268.0, "low": 266.0, "close": 267.1, "volume": 1000.0}
     ).to_parquet(etf_dir / "NIFTYBEES-EQ.parquet")
 
-    _, provenance = MarketIntelService(data_root=root).get_benchmark_frame_and_provenance()
-    assert provenance.is_proxy is True
-    assert provenance.symbol == "NIFTYBEES-EQ"
+    frame, provenance = _market_intel_service(root).get_benchmark_frame_and_provenance()
+    assert frame is None
+    assert provenance.kind == "UNAVAILABLE"
+    assert provenance.is_proxy is None
 
 
-class _Resp:
-    def __init__(self, payload):
-        self._payload = payload
-
-    def raise_for_status(self):
-        return None
-
-    def json(self):
-        return self._payload
-
-
-def _chart_payload(n: int = 30) -> dict:
-    days = pd.bdate_range(end=pd.Timestamp(date.today()), periods=n)
-    # 09:15 IST is 03:45 UTC; the exchange offset is +5:30.
-    stamps = [int((d + pd.Timedelta(hours=3, minutes=45)).timestamp()) for d in days]
-    close = [23000.0 + i for i in range(n)]
-    close[5] = None  # a bar with no price must be dropped, not stored as NaN
-    return {
-        "chart": {
-            "result": [
-                {
-                    "meta": {"symbol": "^NSEI", "gmtoffset": 19800},
-                    "timestamp": stamps,
-                    "indicators": {
-                        "quote": [
-                            {
-                                "open": [c and c - 5 for c in close],
-                                "high": [c and c + 20 for c in close],
-                                "low": [c and c - 20 for c in close],
-                                "close": close,
-                                "volume": [0] * n,
-                            }
-                        ]
-                    },
-                }
-            ]
-        }
-    }
-
-
-def test_the_public_series_fills_the_same_cache_without_a_session(root, monkeypatch):
-    monkeypatch.setattr(indices.httpx, "get", lambda *a, **k: _Resp(_chart_payload()))
-    assert indices.sync_index_public(root) == "ok"
-
-    frame = indices.load_index(root)
-    assert frame is not None
-    assert len(frame) == 29  # the price-less bar was dropped
-    assert float(frame["close"].iloc[-1]) > 20000  # a real index level
-    assert (frame["ts"].dt.hour == 0).all()  # plain dates, not timestamps
-    assert indices.index_path(root).with_suffix(".source").read_text() == "public"
-
-
-def test_a_public_fetch_failure_keeps_the_previous_file(root, monkeypatch):
-    indices.sync_index(FakeClient(), root)
-
-    def offline(*a, **k):
-        raise OSError("offline")
-
-    monkeypatch.setattr(indices.httpx, "get", offline)
-    assert indices.sync_index_public(root, force=True) == "fail"
-    assert indices.load_index(root) is not None
-
-
-def test_no_session_uses_the_public_series_right_away(root, monkeypatch):
-    from atr.services import broker_access
+def test_no_session_does_not_substitute_a_public_series(root, monkeypatch):
+    from forward.core.errors import BrokerUnavailable
+    from forward.wiring import broker_access
 
     def no_session():
-        raise broker_access.BrokerUnavailable("no active IIFL session")
+        raise BrokerUnavailable(
+            "no active IIFL session", status=401, code="no_broker_session"
+        )
 
-    monkeypatch.setattr(broker_access, "authed_client", no_session)
+    monkeypatch.setattr(broker_access, "get_authenticated_broker_client", no_session)
     calls = []
-    monkeypatch.setattr(indices, "sync_index_public", lambda data_root, *a, **k: calls.append(data_root) or "ok")
+    monkeypatch.setattr(indices, "sync_index", lambda *a, **k: calls.append(a) or "ok")
 
-    service = MarketIntelService(data_root=root)
+    service = _market_intel_service(root)
     service._maybe_refresh_index()
-    assert calls == [root, root]  # inline, one per index (Nifty 50 and India VIX)
+    assert calls == []
     service._maybe_refresh_index()
-    assert calls == [root, root]  # throttled, so a down network is not hammered
+    assert calls == []
 
 
-def test_a_failed_broker_download_falls_back_to_the_public_series(root, monkeypatch):
-    from atr.services import broker_access
+def test_a_failed_broker_download_does_not_substitute_a_public_series(root, monkeypatch):
+    from forward.wiring import broker_access
 
-    monkeypatch.setattr(broker_access, "authed_client", lambda: object())
-    monkeypatch.setattr(indices, "sync_index", lambda *a, **k: "fail")
-    public = []
-    monkeypatch.setattr(indices, "sync_index_public", lambda data_root, *a, **k: public.append(1) or "ok")
+    broker = FakeClient()
+    monkeypatch.setattr(broker_access, "get_authenticated_broker_client", lambda: broker)
+    calls = []
+    monkeypatch.setattr(indices, "sync_index", lambda *a, **k: calls.append(a) or "fail")
     # Run the background work on the calling thread so the test can observe it.
     monkeypatch.setattr("threading.Thread.start", lambda self: self.run())
 
-    MarketIntelService(data_root=root)._maybe_refresh_index()
-    assert public == [1, 1]  # one fallback per index: Nifty 50 and India VIX
+    _market_intel_service(root)._maybe_refresh_index()
+    assert len(calls) == 2

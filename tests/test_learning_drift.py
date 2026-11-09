@@ -22,8 +22,7 @@ from __future__ import annotations
 
 import pytest
 
-from atr.research import learning_drift as drift
-
+from forward.research import learning_drift as drift
 
 # ---------------------------------------------------------------------------
 # fixtures
@@ -157,7 +156,7 @@ def test_the_p_value_is_a_p_value():
 
 def test_a_magnitude_never_produces_a_mangled_adverb():
     """``f"{magnitude}ly"`` gives "largely" for a change that rose."""
-    for magnitude, adverb in drift.MAGNITUDE_ADVERB.items():
+    for _magnitude, adverb in drift.MAGNITUDE_ADVERB.items():
         assert adverb.endswith("ly")
         assert "lyly" not in adverb
         assert adverb != "largely", "'largely' reads as 'mostly', not 'by a large amount'"
@@ -423,7 +422,7 @@ def test_the_drift_module_is_pure():
     offenders = [
         name
         for name in imported
-        if name.startswith("atr.appdb") or name.startswith("atr.services")
+        if name.startswith("forward.appdb") or name.startswith("forward.services")
         or name.startswith("pandas") or name.startswith("numpy")
     ]
     assert offenders == [], f"learning_drift reaches outside research: {offenders}"

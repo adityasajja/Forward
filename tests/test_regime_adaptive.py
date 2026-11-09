@@ -1,7 +1,7 @@
-import pytest
-from atr.strategy.regime_laya import LayaRegimeClassifier, MarketRegimeVerdict
-from atr.strategy.strategies.regime_adaptive import RegimeAdaptiveStrategy
-from atr.strategy.strategies import STRATEGIES
+
+from forward.strategy.regime_laya import LayaRegimeClassifier, MarketRegimeVerdict
+from forward.strategy.strategies import STRATEGIES
+from forward.strategy.strategies.regime_adaptive import RegimeAdaptiveStrategy
 
 
 def test_laya_classifier_instantiation():

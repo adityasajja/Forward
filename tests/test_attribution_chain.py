@@ -36,17 +36,18 @@ suite already uses, so nothing here touches the operator's real book.
 from __future__ import annotations
 
 from datetime import datetime
+from unittest.mock import Mock
 
 import pandas as pd
 import pytest
 
-from atr.appdb.repositories import (
-    OrderRepository,
-    TradeAttributionRepository,
-    TradeJournalRepository,
-    UserRepository,
-)
-from atr.services.attribution import AttributionService
+from forward.appdb.identity_repository import UserRepository
+from forward.appdb.order_repository import OrderRepository
+from forward.appdb.paper_ledger_storage import SqlPaperLedgerStorage
+from forward.appdb.trade_attribution_repository import TradeAttributionRepository
+from forward.appdb.trade_journal_repository import TradeJournalRepository
+from forward.services.attribution import AttributionService
+from tests.paper_price_fakes import no_live_price
 
 # ---------------------------------------------------------------------------
 # fixtures
@@ -183,7 +184,23 @@ def _seed_closed_trade(
 
 
 def _service(app_db, bars, symbol: str = SYMBOL) -> AttributionService:
-    return AttributionService(db=app_db, frames={symbol: bars})
+    from forward.appdb.attribution_storage import SqlAttributionStorage
+    from forward.appdb.trade_journal_storage import SqlTradeJournalStorage
+    from forward.core.historical_market_data_ports import CachedMarketFramesPort
+    from forward.services.journal import TradeJournalService
+    from forward.services.paper_ledger import PaperLedger
+
+    market_history = Mock(spec=CachedMarketFramesPort)
+    market_history.frames.return_value = {symbol: bars}
+    return AttributionService(
+        storage=SqlAttributionStorage(app_db),
+        journal_service=TradeJournalService(
+            storage=SqlTradeJournalStorage(app_db),
+            ledger=PaperLedger(storage=SqlPaperLedgerStorage(app_db), price_source=no_live_price),
+        ),
+        ledger=PaperLedger(storage=SqlPaperLedgerStorage(app_db), price_source=no_live_price),
+        market_history=market_history,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -401,9 +418,6 @@ def test_an_absent_sizing_method_is_reported_as_absent(app_db, owner, bars):
     # And the absence is *explained*, which is what makes the None actionable
     # rather than a hole in the report.
     assert stored["missing_fields"]
-    # And the absence is *explained*, which is what makes the None actionable
-    # rather than a hole in the report.
-    assert stored["missing_fields"]
 
 
 def test_the_detail_api_returns_the_nine_branches(app_db, owner, bars):
@@ -532,7 +546,7 @@ def test_the_summary_counts_every_row_and_separates_the_grades(app_db, owner, ba
     rows = service.all_rows(owner)
     assert len(rows) == 3
 
-    from atr.analytics.aggregation import evidence_counts
+    from forward.analytics.aggregation import evidence_counts
 
     counts = evidence_counts(rows)
     assert counts["n"] == 3
@@ -551,7 +565,7 @@ def test_an_empty_book_is_empty_rather_than_zero_filled(app_db, owner, bars):
     rows = service.all_rows(owner)
     assert rows == []
 
-    from atr.analytics.aggregation import evidence_counts, overview
+    from forward.analytics.aggregation import evidence_counts, overview
 
     counts = evidence_counts(rows)
     assert counts["n"] == 0
@@ -616,12 +630,8 @@ def test_two_users_never_see_each_others_rows(app_db, bars):
     bob_trade = _seed_closed_trade(app_db, bob)
     service = _service(app_db, bars)
     with app_db.session() as session:
-        service.attribute_episode(
-            alice, TradeJournalRepository.get(session, alice_trade, alice)
-        )
-        service.attribute_episode(
-            bob, TradeJournalRepository.get(session, bob_trade, bob)
-        )
+        service.attribute_episode(alice, TradeJournalRepository.get(session, alice_trade, alice))
+        service.attribute_episode(bob, TradeJournalRepository.get(session, bob_trade, bob))
 
     assert len(service.all_rows(alice)) == 1
     assert len(service.all_rows(bob)) == 1
@@ -642,7 +652,7 @@ def test_the_learning_dataset_declares_the_attribution_columns():
     columns are not declared, the chain terminates at the dashboard and the
     slices the spec asks for cannot be built at all.
     """
-    from atr.services.learning import DATASET_COLUMNS
+    from forward.services.learning_dataset_model import DATASET_COLUMNS
 
     attribution_cols = [c for c in DATASET_COLUMNS if c.startswith("attribution_")]
     assert len(attribution_cols) >= 20, f"only {len(attribution_cols)} attribution columns"
@@ -685,7 +695,7 @@ def test_the_attribution_axes_exist_but_stay_out_of_the_default_scan():
     comparisons without adding information — which deflates every p-value in the
     report and makes a real finding harder to see.
     """
-    from atr.research.learning_axes import (
+    from forward.research.learning_axes import (
         ATTRIBUTION_AXES,
         AXES_BY_NAME,
         DEFAULT_AXES,
@@ -711,7 +721,7 @@ def test_in_sample_trades_are_marked_missing_for_forward_only_features(app_db, o
     absent class grades **in-sample**. That is what stops the attribution sweep,
     or any later reader of its columns, from treating a measurement as evidence.
     """
-    from atr.research.learning_evidence import (
+    from forward.core.learning_evidence import (
         CLASS_LIVE_FORWARD,
         CLASS_PAPER_FORWARD,
         GRADE_IN_SAMPLE,

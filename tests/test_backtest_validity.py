@@ -1,6 +1,6 @@
 import pandas as pd
 
-from atr.backtest.validity import validity_warnings
+from forward.backtest.validity import validity_warnings
 
 
 def _frame(closes, start="2024-01-01"):

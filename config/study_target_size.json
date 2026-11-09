@@ -1,0 +1,9 @@
+{
+  "base_strategy_config": "config/study_intraweek_target.json",
+  "cost_config": "config/study_intraday_cost.json",
+  "target_fractions": [0.01, 0.015, 0.02, 0.03, 0.04, 0.05, 0.06],
+  "stop_fractions": [0.03, 0.05, 0.08, null],
+  "gap_down_threshold_fraction": -0.01,
+  "market_return_up_threshold_fraction": 0.01,
+  "same_day_slippage_fraction": 0.0005
+}

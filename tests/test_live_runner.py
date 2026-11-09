@@ -16,10 +16,11 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from atr.brokers.base import Broker
-from atr.core.models import Bar, Instrument, MarketSnapshot
-from atr.live.runner import LiveConfig, LiveRunner
-from atr.strategy.strategies.sma_crossover import SmaCrossover
+from forward.brokers.base import Broker
+from forward.core.instrument_models import Instrument
+from forward.core.market_models import Bar, MarketSnapshot
+from forward.live.runner import LiveConfig, LiveRunner
+from forward.strategy.strategies.sma_crossover import SmaCrossover
 
 # Wall-clock time in IST (the runner reads naive timestamps as IST), not the machine's local zone.
 START = datetime.now(ZoneInfo("Asia/Kolkata")).replace(tzinfo=None).replace(second=0, microsecond=0)
@@ -83,6 +84,12 @@ class FakeFeed:
     def stop(self) -> None:
         self.stopped = True
 
+    def last_tick(self, symbol):
+        return None
+
+    def subscribe_instruments(self, instruments):
+        return None
+
     def get(self, timeout: float = 1.0):
         if self._snapshots:
             return self._snapshots.pop(0)
@@ -91,16 +98,16 @@ class FakeFeed:
         return None
 
 
-class FakeClient:
-    """Returns a canned historical-data payload, in the API's own shape."""
+class FakeWarmupHistory:
+    """Return a configured historical frame to the live runner."""
 
-    def __init__(self, candles):
-        self._candles = candles
-        self.calls: list[dict] = []
+    def __init__(self, frame):
+        self.frame = frame
+        self.calls = []
 
-    def historical_data(self, **kwargs):
-        self.calls.append(kwargs)
-        return {"result": [{"candles": self._candles}]}
+    def fetch(self, instruments, timeframe, bars):
+        self.calls.append((instruments, timeframe, bars))
+        return self.frame
 
 
 class RecordingBroker(Broker):
@@ -129,16 +136,23 @@ class RecordingBroker(Broker):
     def last_price(self, instruments):  # pragma: no cover
         return {}
 
+    def holdings(self):  # pragma: no cover
+        return []
 
-def _runner(symbols, warmup_bars, snapshots, *, config=None, frames=None, client=None):
+    def funds(self):  # pragma: no cover
+        raise NotImplementedError("the recording broker has no account balance")
+
+    def fills_from_trades(self):
+        return []
+
+
+def _runner(symbols, warmup_bars, snapshots, *, config=None, frames=None):
     runner = LiveRunner(
-        session=None,
         instruments=_instruments(symbols),
         strategy=SmaCrossover(fast=3, slow=8),
         broker=RecordingBroker(),
         warmup_frames=frames if frames is not None else _frames(symbols, warmup_bars),
         config=config or LiveConfig(warmup_bars=0, poll_timeout=0.01),
-        client=client,
         feed=FakeFeed(snapshots),
     )
     runner.feed._on_exhausted = lambda: setattr(runner, "_stop", True)
@@ -202,35 +216,38 @@ def test_warmup_is_skipped_when_frames_are_already_supplied():
     assert len(runner.frames["AAA"]) == 60
 
 
-def test_warmup_fetches_and_honours_warmup_bars():
+def test_warmup_history_adapter_honours_warmup_bars():
     """warmup_bars was declared but never used; it must now cap the fetch."""
     symbols = ["AAA"]
     n = 300
     base = pd.Timestamp("2024-01-01 09:15")
-    candles = [
-        [
-            (base + pd.Timedelta(minutes=i)).isoformat(),
-            100.0 + i * 0.01,          # open
-            100.5 + i * 0.01,          # high
-            99.5 + i * 0.01,           # low
-            100.0 + i * 0.01,          # close
-            500,
-        ]
-        for i in range(n)
-    ]
-    client = FakeClient(candles)
+    timestamps = base + pd.to_timedelta(np.arange(n), unit="min")
+    close = 100.0 + np.arange(n) * 0.01
+    history = FakeWarmupHistory(
+        pd.DataFrame(
+            {
+                "ts": timestamps,
+                "symbol": "AAA",
+                "open": close,
+                "high": close + 0.5,
+                "low": close - 0.5,
+                "close": close,
+                "volume": 500,
+            }
+        )
+    )
     runner = LiveRunner(
-        session=None,
         instruments=_instruments(symbols),
         strategy=SmaCrossover(fast=3, slow=8),
         broker=RecordingBroker(),
         warmup_frames=None,
         config=LiveConfig(warmup_bars=100),
-        client=client,
         feed=FakeFeed([]),
+        warmup_history=history,
     )
     runner.load_warmup()
-    assert client.calls, "warmup never called the client"
+    assert history.calls
+    assert history.calls[0][2] == 100
     assert len(runner.frames["AAA"]) == 100, "warmup_bars did not cap the history"
     assert runner.frames["AAA"]["close"].iloc[-1] == pytest.approx(100.0 + 299 * 0.01)
 
@@ -238,13 +255,11 @@ def test_warmup_fetches_and_honours_warmup_bars():
 def test_warmup_disabled_when_zero():
     symbols = ["AAA"]
     runner = LiveRunner(
-        session=None,
         instruments=_instruments(symbols),
         strategy=SmaCrossover(),
         broker=RecordingBroker(),
         warmup_frames=None,
         config=LiveConfig(warmup_bars=0),
-        client=FakeClient([]),
         feed=FakeFeed([]),
     )
     runner._ensure_frames()
@@ -252,26 +267,24 @@ def test_warmup_disabled_when_zero():
     assert all(f.empty for f in runner.frames.values())
 
 
-def test_warmup_survives_a_failing_client():
-    """A dead warmup endpoint must degrade to a cold start, not crash the run."""
+def test_warmup_history_failure_stops_the_runner():
+    """A missing warmup dataset must not silently start a cold strategy."""
 
-    class ExplodingClient:
-        def historical_data(self, **kwargs):
+    class ExplodingHistory:
+        def fetch(self, instruments, timeframe, bars):
             raise RuntimeError("upstream is down")
 
     runner = LiveRunner(
-        session=None,
         instruments=_instruments(["AAA"]),
         strategy=SmaCrossover(),
         broker=RecordingBroker(),
         warmup_frames=None,
         config=LiveConfig(warmup_bars=100),
-        client=ExplodingClient(),
         feed=FakeFeed([]),
+        warmup_history=ExplodingHistory(),
     )
-    runner.load_warmup()  # must not raise
-    runner._ensure_frames()
-    assert all(f.empty for f in runner.frames.values())
+    with pytest.raises(RuntimeError, match="upstream is down"):
+        runner.load_warmup()
 
 
 @pytest.mark.parametrize("symbols", [["AAA"], ["AAA", "BBB", "CCC"]])
@@ -284,7 +297,7 @@ def test_runner_handles_one_and_many_symbols(symbols):
 
 def test_stale_snapshots_are_skipped_not_traded():
     """A queued backlog after a disconnect must not become trades."""
-    from atr.core.models import MarketSnapshot as _Snap
+    from forward.core.market_models import MarketSnapshot as _Snap
 
     symbols = ["AAA"]
     old = _snapshots(symbols, 60, 10)
@@ -315,8 +328,8 @@ def test_kill_switch_provider_stops_the_loop():
 
 def test_broker_fills_sync_into_the_local_book():
     """The local book learns fills, so close_all() can actually close."""
-    from atr.core.enums import Side
-    from atr.core.models import Fill
+    from forward.core.enums import Side
+    from forward.core.order_models import Fill
 
     class FillsBroker(RecordingBroker):
         def fills_from_trades(self):

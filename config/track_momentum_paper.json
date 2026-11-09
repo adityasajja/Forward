@@ -1,0 +1,12 @@
+{
+  "daily_data_directory": "data/iifl_daily/NSEEQ",
+  "picks_source_file": "data/self_learning/weekly_stock_picks.json",
+  "ledger_directory": "data/paper_momentum",
+  "filter_name": "top_decile_ret_26w",
+  "target_return_fraction": 0.05,
+  "settlement_days": 7,
+  "backfill_panel_file": "data/self_learning/stock_week_panel.parquet",
+  "backfill_pick_count": 10,
+  "status_minimum_settled_weeks": 52,
+  "historical_expected_hit_rate_pct": 20.17
+}

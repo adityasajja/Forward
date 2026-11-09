@@ -1,0 +1,18 @@
+{
+  "cache_directory": "data/iifl_1min",
+  "symbols": [
+    "RELIANCE", "HDFCBANK", "INFY", "ICICIBANK", "TCS",
+    "HINDUNILVR", "BHARTIARTL", "KOTAKBANK", "WIPRO", "NIFTYBEES"
+  ],
+  "index_symbol": "NIFTYBEES",
+  "volume_lookback": 20,
+  "momentum_lookback": 5,
+  "regime_lookback": 200,
+  "gap_threshold_pct": 0.5,
+  "volume_ratio_threshold": 1.0,
+  "minimum_momentum_pct": 0.0,
+  "sample_warmup_sessions": 20,
+  "sample_rows": 3,
+  "sample_gap_threshold_pct": 1.0,
+  "no_gap_threshold_pct": 0.0
+}

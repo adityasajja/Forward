@@ -51,7 +51,17 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import pytest
 
-from atr.research.learning_evidence import (
+from forward.appdb.daily_learning_storage import SqlDailyLearningStorage
+from forward.appdb.learning_storage import SqlLearningStorage
+from forward.appdb.order_storage import SqlOrderStorage
+from forward.appdb.paper_ledger_storage import SqlPaperLedgerStorage
+from forward.appdb.paper_runner_storage import SqlPaperRunnerStorage
+from forward.appdb.portfolio_storage import SqlPortfolioStorage
+from forward.appdb.risk_state_storage import SqlRiskStateStorage
+from forward.appdb.system_state_storage import SqlSystemStateStorage
+from forward.appdb.trade_journal_storage import SqlTradeJournalStorage
+from forward.config.settings import get_settings
+from forward.core.learning_evidence import (
     CLASS_IN_SAMPLE,
     CLASS_PAPER_FORWARD,
     GRADE_FORWARD,
@@ -59,15 +69,28 @@ from atr.research.learning_evidence import (
     has_grade,
     row_grade,
 )
-from atr.services.learning import (
-    DATASET_COLUMNS,
-    DailyLearningReport,
-    LearningDataset,
-    LearningDatasetBuilder,
-    LearningService,
+from forward.data.cached_market_frames import CachedMarketFramesAdapter
+from forward.data.learning_artifacts import LocalLearningArtifactsAdapter
+from forward.data.vwap_liquidity import NseBhavcopyLiquidityAdapter
+from forward.market_calendar import get_market_calendar
+from forward.services.learning import LearningService
+from forward.services.learning_analysis import (
     PerformanceAnalysis,
     resolve_metric,
 )
+from forward.services.learning_dataset import (
+    LearningDatasetBuilder,
+)
+from forward.services.learning_dataset_model import DATASET_COLUMNS, LearningDataset
+from forward.services.learning_reports import DailyLearningReport
+from forward.services.paper_ledger import PaperLedger
+from forward.services.risk import RiskStateService
+from tests.market_data_fakes import (
+    InMemoryMarketFramesPort,
+    NoopSignalContextEnricher,
+)
+from tests.order_fakes import order_instrument_lookup
+from tests.paper_price_fakes import StaticRunnerVenueProvider, no_live_price
 
 SYMBOL = "RELIANCE"
 EXCHANGE = "NSEEQ"
@@ -122,7 +145,7 @@ def _daily(n: int = 300, start: float = 1000.0) -> pd.DataFrame:
 
 @pytest.fixture()
 def owner(app_db) -> str:
-    from atr.appdb.schema import users
+    from forward.appdb.account_schema import users
 
     with app_db.session() as session:
         session.execute(
@@ -150,11 +173,12 @@ def paper_runner(app_db, owner, monkeypatch):
     Returns ``(runner, deployment_id, tick)``.
     """
     monkeypatch.setattr(
-        "atr.signals.engine.load_daily",
+        "forward.data.cached_market_frames.load_daily_from_cache",
         lambda symbol, exchange="NSEEQ", **kw: _daily(),
     )
-    from atr.appdb.repositories import DeploymentRepository, StrategyRepository
-    from atr.services.runner import PaperRunner
+    from forward.appdb.deployment_repository import DeploymentRepository
+    from forward.appdb.strategy_repository import StrategyRepository
+    from forward.services.runner import PaperRunner
 
     with app_db.session() as session:
         strategy = StrategyRepository.create(
@@ -179,7 +203,6 @@ def paper_runner(app_db, owner, monkeypatch):
                 "exchange": EXCHANGE,
                 "timeframe": "1d",
                 "signal_basis": "live",
-                "order_value": 250_000.0,
                 "lookback_days": 400,
                 "max_open_positions": 1,
             },
@@ -189,7 +212,29 @@ def paper_runner(app_db, owner, monkeypatch):
     high_63 = float(frame["close"].tail(63).max())
     tick = round(high_63 * 0.995, 2)
 
-    runner = PaperRunner(db=app_db)
+    runner = PaperRunner(
+        interval_seconds=get_settings().runner_interval_seconds,
+        lookback_days=get_settings().runner_lookback_days,
+        minimum_sleep_seconds=get_settings().runner_min_sleep_seconds,
+        market_wait_seconds=get_settings().runner_market_wait_seconds,
+        symbol_retry_seconds=get_settings().deployment_symbol_retry_seconds,
+        signal_context=NoopSignalContextEnricher(),
+        calendar=get_market_calendar(),
+        venue_provider=StaticRunnerVenueProvider(
+            prices=no_live_price, instruments=order_instrument_lookup
+        ),
+        daily_history=CachedMarketFramesAdapter(),
+        vwap_liquidity=NseBhavcopyLiquidityAdapter(get_settings().research_data_directory),
+        sector_table={},
+        instrument_lookup=order_instrument_lookup,
+        journal_storage=SqlTradeJournalStorage(app_db),
+        portfolio_storage=SqlPortfolioStorage(app_db),
+        ledger=PaperLedger(storage=SqlPaperLedgerStorage(app_db), price_source=no_live_price),
+        order_storage=SqlOrderStorage(app_db),
+        runner_storage=SqlPaperRunnerStorage(app_db),
+        state_storage=SqlSystemStateStorage(app_db),
+        risk_state=RiskStateService(SqlRiskStateStorage(app_db), get_settings()),
+    )
     runner.sync_loops()
     runner._loops[deployment["deployment_id"]].venue.prices = lambda s, e: tick
     return runner, deployment["deployment_id"], tick
@@ -197,21 +242,29 @@ def paper_runner(app_db, owner, monkeypatch):
 
 def _flatten(app_db, deployment_id: str, *, multiplier: float) -> None:
     """Sell the whole position at a chosen multiple of the entry price."""
-    from atr.execution.oms import OrderDraft
-    from atr.services import paper as paper_service
-    from atr.services.execution import ExecutionService
-    from atr.services.orders import get_order_service
-    from atr.services.paper import PaperLedger
+    from forward.execution.oms import OrderDraft
+    from forward.services import paper_venue as paper_service
+    from forward.services.execution import ExecutionService
+    from forward.services.orders import get_order_service
+    from forward.services.paper_ledger import PaperLedger
 
-    ledger = PaperLedger(db=app_db)
+    ledger = PaperLedger(storage=SqlPaperLedgerStorage(app_db), price_source=no_live_price)
     portfolio = ledger.portfolio("u1", deployment_id=deployment_id)
     position = portfolio.position(SYMBOL)
     quantity = abs(float(position.quantity))
     assert quantity > 0, "the entry must have filled before the exit is placed"
     exit_price = round(float(position.avg_price) * multiplier, 2)
     ExecutionService(
-        orders=get_order_service(portfolio=portfolio),
-        venue=paper_service.paper_venue(lambda s, e: exit_price),
+        orders=get_order_service(
+            instruments=order_instrument_lookup,
+            storage=SqlOrderStorage(app_db),
+            risk=RiskStateService(SqlRiskStateStorage(app_db), get_settings()),
+            portfolio=portfolio,
+        ),
+        venue=paper_service.paper_venue(
+            lambda s, e: exit_price,
+            instruments=order_instrument_lookup,
+        ),
     ).place(
         OrderDraft(
             user_id="u1",
@@ -235,18 +288,23 @@ def closed_paper_trade(app_db, paper_runner, tmp_path):
     *evidence* is what these tests are about, and enrichment is covered by the
     service suite.
     """
-    from atr.services.journal import TradeJournalService
+    from forward.services.journal import TradeJournalService
 
     runner, deployment_id, _tick = paper_runner
     runner.pass_once(now=SESSION)
 
-    journal = TradeJournalService(db=app_db)
+    journal = TradeJournalService(storage=SqlTradeJournalStorage(app_db), ledger=runner.ledger)
     journal.reconcile("u1", deployment_id)
 
     _flatten(app_db, deployment_id, multiplier=1.02)
     journal.reconcile("u1", deployment_id)
 
-    builder = LearningDatasetBuilder(db=app_db, cache_root=tmp_path, frames={})
+    builder = LearningDatasetBuilder(
+        portfolio_storage=SqlPortfolioStorage(app_db),
+        storage=SqlLearningStorage(app_db),
+        artifacts=LocalLearningArtifactsAdapter(tmp_path),
+        market_history=InMemoryMarketFramesPort({}),
+    )
     return builder.build(), builder, deployment_id
 
 
@@ -258,7 +316,7 @@ def closed_paper_trade(app_db, paper_runner, tmp_path):
 def _new_event_raw(app_db, order_id: str) -> dict:
     import json
 
-    from atr.appdb.repositories import OrderEventRepository
+    from forward.appdb.order_event_repository import OrderEventRepository
 
     with app_db.session() as session:
         for event in OrderEventRepository.history(session, order_id):
@@ -276,10 +334,16 @@ def test_the_oms_stamps_provenance_on_every_order_it_raises(app_db, owner):
     current state and the claim — "this was raised live, at this instant" — is
     history, which is what an append-only log is for.
     """
-    from atr.execution.oms import PROVENANCE_FORWARD, PROVENANCE_KEY
-    from atr.services.orders import get_order_service
+    from forward.execution.oms import PROVENANCE_FORWARD, PROVENANCE_KEY
+    from forward.execution.portfolio import Portfolio
+    from forward.services.orders import get_order_service
 
-    service = get_order_service()
+    service = get_order_service(
+        instruments=order_instrument_lookup,
+        storage=SqlOrderStorage(app_db),
+        risk=RiskStateService(SqlRiskStateStorage(app_db), get_settings()),
+        portfolio=Portfolio(initial_cash=0),
+    )
     opened = service.open_order(
         _draft(symbol=SYMBOL, side="BUY", quantity=10.0, requested_price=100.0)
     )
@@ -289,7 +353,7 @@ def test_the_oms_stamps_provenance_on_every_order_it_raises(app_db, owner):
 
 
 def _draft(*, symbol: str, side: str, quantity: float, requested_price: float | None):
-    from atr.execution.oms import OrderDraft
+    from forward.execution.oms import OrderDraft
 
     return OrderDraft(
         user_id="u1",
@@ -406,7 +470,7 @@ def _seed_backfilled_episode(app_db, *, user_id: str = "u1", symbol: str = "TCS"
     plausible trade, and no execution-time provenance — because there was no
     execution. It is the shape the grading rule exists to catch.
     """
-    from atr.appdb.repositories import TradeJournalRepository
+    from forward.appdb.trade_journal_repository import TradeJournalRepository
 
     with app_db.session() as session:
         created = TradeJournalRepository.open_trade(
@@ -443,7 +507,12 @@ def test_a_backfilled_episode_stays_in_sample(app_db, owner, tmp_path):
     it was written before its own outcome.
     """
     _seed_backfilled_episode(app_db)
-    dataset = LearningDatasetBuilder(db=app_db, cache_root=tmp_path, frames={}).build()
+    dataset = LearningDatasetBuilder(
+        portfolio_storage=SqlPortfolioStorage(app_db),
+        storage=SqlLearningStorage(app_db),
+        artifacts=LocalLearningArtifactsAdapter(tmp_path),
+        market_history=InMemoryMarketFramesPort({}),
+    ).build()
     assert len(dataset) == 1
 
     row = dataset.rows[0]
@@ -461,7 +530,12 @@ def test_building_the_dataset_again_does_not_promote_a_backfill(app_db, owner, t
     make every count depend on when it was asked for.
     """
     _seed_backfilled_episode(app_db)
-    builder = LearningDatasetBuilder(db=app_db, cache_root=tmp_path, frames={})
+    builder = LearningDatasetBuilder(
+        portfolio_storage=SqlPortfolioStorage(app_db),
+        storage=SqlLearningStorage(app_db),
+        artifacts=LocalLearningArtifactsAdapter(tmp_path),
+        market_history=InMemoryMarketFramesPort({}),
+    )
     first = builder.build().grade_counts()
     second = builder.build().grade_counts()
     assert first == second == {GRADE_FORWARD: 0, GRADE_IN_SAMPLE: 1}
@@ -476,8 +550,8 @@ def test_an_order_row_inserted_without_a_stamp_is_not_forward(app_db, owner, tmp
     """
     from sqlalchemy import insert
 
-    from atr.appdb.repositories import TradeJournalRepository
-    from atr.appdb.schema import order_events, orders
+    from forward.appdb.execution_schema import order_events, orders
+    from forward.appdb.trade_journal_repository import TradeJournalRepository
 
     now = datetime(2026, 3, 2, 9, 15)
     with app_db.session() as session:
@@ -537,7 +611,12 @@ def test_an_order_row_inserted_without_a_stamp_is_not_forward(app_db, owner, tmp
             exit_ts=datetime(2026, 3, 6, 14, 30),
         )
 
-    dataset = LearningDatasetBuilder(db=app_db, cache_root=tmp_path, frames={}).build()
+    dataset = LearningDatasetBuilder(
+        portfolio_storage=SqlPortfolioStorage(app_db),
+        storage=SqlLearningStorage(app_db),
+        artifacts=LocalLearningArtifactsAdapter(tmp_path),
+        market_history=InMemoryMarketFramesPort({}),
+    ).build()
     assert dataset.rows[0]["evidence_grade"] == GRADE_IN_SAMPLE
 
 
@@ -554,7 +633,12 @@ def test_a_mixed_book_keeps_the_two_kinds_apart(closed_paper_trade, app_db, owne
     mixed, and no count derived from it means anything.
     """
     _seed_backfilled_episode(app_db)
-    dataset = LearningDatasetBuilder(db=app_db, cache_root=tmp_path, frames={}).build()
+    dataset = LearningDatasetBuilder(
+        portfolio_storage=SqlPortfolioStorage(app_db),
+        storage=SqlLearningStorage(app_db),
+        artifacts=LocalLearningArtifactsAdapter(tmp_path),
+        market_history=InMemoryMarketFramesPort({}),
+    ).build()
 
     assert len(dataset) == 2
     grades = dataset.grade_counts()
@@ -574,11 +658,20 @@ def test_a_mixed_book_keeps_the_two_kinds_apart(closed_paper_trade, app_db, owne
     assert any("graded in-sample" in note for note in everything.caveats)
 
 
-def test_the_summary_of_a_mixed_book_states_both_counts(closed_paper_trade, app_db, owner, tmp_path):
+def test_the_summary_of_a_mixed_book_states_both_counts(
+    closed_paper_trade, app_db, owner, tmp_path
+):
     _seed_backfilled_episode(app_db)
-    summary = LearningDatasetBuilder(
-        db=app_db, cache_root=tmp_path, frames={}
-    ).build().summary()
+    summary = (
+        LearningDatasetBuilder(
+            portfolio_storage=SqlPortfolioStorage(app_db),
+            storage=SqlLearningStorage(app_db),
+            artifacts=LocalLearningArtifactsAdapter(tmp_path),
+            market_history=InMemoryMarketFramesPort({}),
+        )
+        .build()
+        .summary()
+    )
     assert summary["observations"] == 2
     assert summary["forward_observations"] == 1
     assert summary["in_sample_observations"] == 1
@@ -793,9 +886,11 @@ def test_a_book_of_in_sample_rows_supports_no_claim_however_large_it_is():
 def test_the_report_states_the_day_and_names_the_grade_of_its_trades():
     """The day is a record; the grade of the day is what says whether it is
     evidence. Both are on the payload so a screen can render them side by side."""
-    payload = DailyLearningReport(_book(forward=2, in_sample=3)).build(
-        as_of=datetime(2026, 6, 10, 18, 0, tzinfo=UTC)
-    ).as_dict()
+    payload = (
+        DailyLearningReport(_book(forward=2, in_sample=3))
+        .build(as_of=datetime(2026, 6, 10, 18, 0, tzinfo=UTC))
+        .as_dict()
+    )
     assert payload["trades_today"] == 5
     assert payload["today_grades"] == {GRADE_FORWARD: 2, GRADE_IN_SAMPLE: 3}
     assert payload["forward_observations"] == 2
@@ -866,9 +961,9 @@ def test_a_mixed_day_draws_its_findings_from_the_forward_rows_only():
 
     assert report.claimable is True
     assert report.today_grades == {GRADE_FORWARD: 6, GRADE_IN_SAMPLE: 6}
-    assert any(
-        "6 of today's 12 trades are forward" in note for note in report.limitations
-    ), report.limitations
+    assert any("6 of today's 12 trades are forward" in note for note in report.limitations), (
+        report.limitations
+    )
     for observation in report.observations:
         # Every finding names the grade it was computed from.
         assert observation["evidence"]["evidence_grade"] == GRADE_FORWARD
@@ -877,9 +972,11 @@ def test_a_mixed_day_draws_its_findings_from_the_forward_rows_only():
 def test_the_report_never_carries_a_parameter_value():
     """The line between this phase and autonomous optimisation, held in the
     payload rather than in a docstring."""
-    payload = DailyLearningReport(_book(forward=12, in_sample=0, value=-500.0)).build(
-        as_of=datetime(2026, 6, 10, 18, 0, tzinfo=UTC)
-    ).as_dict()
+    payload = (
+        DailyLearningReport(_book(forward=12, in_sample=0, value=-500.0))
+        .build(as_of=datetime(2026, 6, 10, 18, 0, tzinfo=UTC))
+        .as_dict()
+    )
     assert "proposed_value" not in str(payload)
     assert payload["applies_changes"] is False
 
@@ -916,7 +1013,13 @@ def test_status_says_a_book_of_journal_trades_holds_no_forward_evidence(app_db, 
     """
     for _ in range(3):
         _seed_backfilled_episode(app_db, symbol=f"SYM{_}")
-    status = LearningService(db=app_db, cache_root=tmp_path).status()
+    status = LearningService(
+        market_history=InMemoryMarketFramesPort({}),
+        portfolio_storage=SqlPortfolioStorage(app_db),
+        storage=SqlLearningStorage(app_db),
+        daily_learning_storage=SqlDailyLearningStorage(app_db),
+        artifacts=LocalLearningArtifactsAdapter(tmp_path),
+    ).status()
     assert status["counts"]["trade_journal"] == 3
     assert status["counts"]["trade_journal_forward"] == 0
     assert status["counts"]["trade_journal_in_sample"] == 3
@@ -926,7 +1029,13 @@ def test_status_says_a_book_of_journal_trades_holds_no_forward_evidence(app_db, 
 
 
 def test_status_counts_a_forward_trade_as_evidence(closed_paper_trade, app_db, tmp_path):
-    status = LearningService(db=app_db, cache_root=tmp_path).status()
+    status = LearningService(
+        market_history=InMemoryMarketFramesPort({}),
+        portfolio_storage=SqlPortfolioStorage(app_db),
+        storage=SqlLearningStorage(app_db),
+        daily_learning_storage=SqlDailyLearningStorage(app_db),
+        artifacts=LocalLearningArtifactsAdapter(tmp_path),
+    ).status()
     assert status["counts"]["trade_journal_forward"] == 1
     assert status["counts"]["trade_journal_in_sample"] == 0
     assert status["forward_available"] == 1

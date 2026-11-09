@@ -17,7 +17,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from atr.research import learning_enrich as enrich
+from forward.data.sector_catalog import read_sector_table
+from forward.research import learning_enrich as enrich
 
 
 def _split_frame() -> tuple[pd.DataFrame, pd.Timestamp]:
@@ -212,7 +213,7 @@ def test_an_empty_frame_yields_every_feature_marked_missing():
 def test_vwap_and_vix_are_reported_missing_on_every_call():
     """The one rule the dataset must never break.
 
-    ``atr.strategy.indicators.vwap`` exists and is correct, but it needs
+    ``forward.strategy.indicators.vwap`` exists and is correct, but it needs
     intraday bars. The cache holds daily bars timestamped 09:15, so a "daily
     VWAP" would be the rule's own arithmetic wearing a misleading name.
     """
@@ -311,19 +312,26 @@ def test_a_volatility_shock_outranks_the_direction():
     assert enrich.label_regime(5.0, 5.0, atr_median=2.0) == "high_volatility"
 
 
-def test_benchmark_trend_uses_a_series_that_exists():
-    """NIFTY-EQ is not in the cache; NIFTYBEES-EQ is, and is tradable."""
+def test_benchmark_provenance_names_the_selected_series():
+    """The report identifies the ETF series used for its benchmark."""
     frame = _flat_frame(80, close=np.linspace(100.0, 120.0, 80))
     benchmarks = {"NIFTYBEES-EQ": frame}
-    value, source = enrich.benchmark_trend(benchmarks, frame["ts"].iloc[-1])
+    value, provenance = enrich.benchmark_provenance_at(
+        benchmarks, frame["ts"].iloc[-1]
+    )
     assert value is not None and value > 5.0
-    assert source == "NIFTYBEES-EQ"
+    assert provenance["symbol"] == "NIFTYBEES-EQ"
+    assert provenance["is_proxy"] is True
 
 
-def test_benchmark_trend_is_absent_when_no_proxy_is_cached():
-    value, source = enrich.benchmark_trend({}, pd.Timestamp("2026-01-01"))
+def test_benchmark_provenance_is_unavailable_without_a_series():
+    value, provenance = enrich.benchmark_provenance_at(
+        {}, pd.Timestamp("2026-01-01")
+    )
     assert value is None
-    assert source is None
+    assert provenance["symbol"] is None
+    assert provenance["kind"] == "UNAVAILABLE"
+    assert provenance["is_proxy"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -340,7 +348,7 @@ def test_sector_table_reads_the_nifty_index_csvs(tmp_path):
         "Tata Consultancy Services Ltd.,Information Technology,TCS,EQ,INE467B01029\n",
         encoding="utf-8",
     )
-    table = enrich.build_sector_table(tmp_path)
+    table = read_sector_table(tmp_path)
     assert table["RELIANCE"] == "Oil Gas & Consumable Fuels"
     assert table["TCS"] == "Information Technology"
 
@@ -354,12 +362,12 @@ def test_sector_table_canonicalises_the_series_suffix(tmp_path):
         "Reliance Industries Ltd.,Oil Gas & Consumable Fuels,RELIANCE-EQ,EQ,INE002A01018\n",
         encoding="utf-8",
     )
-    table = enrich.build_sector_table(tmp_path)
+    table = read_sector_table(tmp_path)
     assert table["RELIANCE"] == "Oil Gas & Consumable Fuels"
 
 
 def test_a_missing_universe_directory_yields_an_empty_table(tmp_path):
-    assert enrich.build_sector_table(tmp_path) == {}
+    assert read_sector_table(tmp_path) == {}
 
 
 def test_a_malformed_csv_does_not_lose_the_others(tmp_path):
@@ -371,6 +379,6 @@ def test_a_malformed_csv_does_not_lose_the_others(tmp_path):
     (universe / "ind_niftymidcap150list.csv").write_text(
         "Company Name,Industry,Symbol\nTata,IT,TCS\n", encoding="utf-8"
     )
-    table = enrich.build_sector_table(tmp_path)
+    table = read_sector_table(tmp_path)
     assert table["RELIANCE"] == "Oil"
     assert table["TCS"] == "IT"

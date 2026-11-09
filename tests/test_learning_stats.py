@@ -16,8 +16,7 @@ import math
 
 import pytest
 
-from atr.research import learning_stats as stats
-
+from forward.research import learning_stats as stats
 
 # ---------------------------------------------------------------------------
 # the honesty floor
@@ -288,7 +287,7 @@ def test_ranking_can_require_significance():
 # ---------------------------------------------------------------------------
 
 
-def test_the_statistics_module_imports_nothing_from_atr():
+def test_the_statistics_module_imports_nothing_from_forward():
     """A statistic that depends on a trade table is not reproducible.
 
     Enforced here rather than by review, because the obvious way to make this
@@ -302,11 +301,13 @@ def test_the_statistics_module_imports_nothing_from_atr():
     tree = ast.parse(path.read_text(encoding="utf-8"))
     offenders: list[str] = []
     for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom) and (node.module or "").startswith("atr"):
+        if isinstance(node, ast.ImportFrom) and (node.module or "").startswith("forward"):
             offenders.append(f"from {node.module}")
         elif isinstance(node, ast.Import):
             offenders.extend(
-                f"import {alias.name}" for alias in node.names if alias.name.startswith("atr")
+                f"import {alias.name}"
+                for alias in node.names
+                if alias.name.startswith("forward")
             )
     assert offenders == [], f"learning_stats must stay dependency-free: {offenders}"
 

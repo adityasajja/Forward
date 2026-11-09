@@ -15,9 +15,9 @@ from __future__ import annotations
 
 def _bootstrap_second_user(client) -> str:
     """A second account, to prove owner scoping from outside."""
-    from atr.appdb.engine import get_app_db
-    from atr.appdb.repositories import UserRepository
-    from atr.auth.passwords import hash_password
+    from forward.appdb.engine import get_app_db
+    from forward.appdb.identity_repository import UserRepository
+    from forward.auth.passwords import hash_password
 
     db = get_app_db()
     with db.session() as session:
@@ -86,7 +86,7 @@ def test_every_monitoring_route_exists(auth_client):
     """The screen's six views plus the overview must all be routed.
 
     Read off the live OpenAPI document rather than ``app.routes``: the versioned
-    routers are included late in ``atr.api.main``, and an import-time snapshot of
+    routers are included late in ``forward.api.main``, and an import-time snapshot of
     the route table would be taken before that ran.
     """
     spec = auth_client.get("/openapi.json").json()

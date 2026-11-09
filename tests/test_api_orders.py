@@ -12,7 +12,7 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
-from atr.api.main import app
+from forward.api.main import app
 
 LOOPBACK = ("127.0.0.1", 51234)
 
@@ -42,9 +42,9 @@ def viewer(fresh_env, master, owner) -> TestClient:
     Created directly through the repository because self-registration is disabled
     on a trading platform — the operator adds accounts.
     """
-    from atr.appdb.engine import get_app_db
-    from atr.appdb.repositories import UserRepository
-    from atr.auth.passwords import hash_password
+    from forward.appdb.engine import get_app_db
+    from forward.appdb.identity_repository import UserRepository
+    from forward.auth.passwords import hash_password
 
     with get_app_db().session() as session:
         UserRepository.create(

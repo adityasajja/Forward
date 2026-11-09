@@ -36,13 +36,13 @@ OUT_DIR = r"D:\ALGO\.workbuddy-ai\shots-phase1"
 PROFILE = rf"D:\ALGO\.cdp-profile-phase1-{int(time.time())}"
 
 #: Kept out of the f-strings below so the quoting stays readable.
-SET_LIST_NAME_JS = "window.__atr.setValue('input[placeholder=\"Name\"]', \"{name}\")"
-SET_SYMBOLS_JS = "window.__atr.setValue('input[placeholder^=\"RELIANCE\"]', \"RELIANCE, TCS\")"
+SET_LIST_NAME_JS = "window.__forward.setValue('input[placeholder=\"Name\"]', \"{name}\")"
+SET_SYMBOLS_JS = "window.__forward.setValue('input[placeholder^=\"RELIANCE\"]', \"RELIANCE, TCS\")"
 SET_IDENTIFIER_JS = (
-    "window.__atr.setValue('input[placeholder=\"you@example.com\"]', \"aditya\")"
+    "window.__forward.setValue('input[placeholder=\"you@example.com\"]', \"aditya\")"
 )
 SET_PASSWORD_JS = (
-    "window.__atr.setValue('input[type=password]', \"Str0ngPassw0rd\")"
+    "window.__forward.setValue('input[type=password]', \"Str0ngPassw0rd\")"
 )
 
 # ── the DOM helpers, evaluated in the page ───────────────────────────────────
@@ -50,7 +50,7 @@ SET_PASSWORD_JS = (
 # onChange only fires when the *native* setter runs. Calling the prototype setter
 # and then dispatching a bubbling `input` is what makes the component see it.
 HELPERS = r"""
-window.__atr = {
+window.__forward = {
   setValue(selector, value) {
     const el = document.querySelector(selector);
     if (!el) return 'no element for ' + selector;
@@ -243,12 +243,12 @@ async def main() -> int:
             )
             await asyncio.sleep(1.5)
             await page.js(HELPERS)
-            print(f"    theme: {await page.js('window.__atr.theme()')}")
-            print(f"    visible: {(await page.js('window.__atr.text()') or '')[:200]!r}")
+            print(f"    theme: {await page.js('window.__forward.theme()')}")
+            print(f"    visible: {(await page.js('window.__forward.text()') or '')[:200]!r}")
             # The dashboard must NOT be reachable while signed out.
-            leaked = await page.js("!!document.querySelector('[aria-label=\"ATR navigation\"]')")
+            leaked = await page.js("!!document.querySelector('[aria-label=\"Forward navigation\"]')")
             print(f"    dashboard shell present while signed out: {leaked}")
-            print(f"    buttons: {await page.js('JSON.stringify(window.__atr.buttons())')}")
+            print(f"    buttons: {await page.js('JSON.stringify(window.__forward.buttons())')}")
             await page.shot("1-auth-gate")
 
             # ── 2. get in through the UI ─────────────────────────────────────
@@ -262,7 +262,7 @@ async def main() -> int:
                 ):
                     print(
                         f"    {selector} <- {value!r}: "
-                        f"{await page.js(f'window.__atr.setValue({selector!r}, {value!r})')}"
+                        f"{await page.js(f'window.__forward.setValue({selector!r}, {value!r})')}"
                     )
                 await asyncio.sleep(0.6)
                 submit_label = "Create the owner account"
@@ -277,16 +277,16 @@ async def main() -> int:
 
             print(
                 f"    submit: "
-                f"{await page.js(f'window.__atr.clickText({submit_label!r})')}"
+                f"{await page.js(f'window.__forward.clickText({submit_label!r})')}"
             )
 
             signed_in = await page.wait_for(
-                "!!document.querySelector('[aria-label=\"ATR navigation\"]')", 40, "the dashboard shell"
+                "!!document.querySelector('[aria-label=\"Forward navigation\"]')", 40, "the dashboard shell"
             )
             await asyncio.sleep(3)
             print(f"    signed in: {signed_in}")
-            print(f"    alerts: {await page.js('JSON.stringify(window.__atr.errors())')}")
-            print(f"    visible: {(await page.js('window.__atr.text()') or '')[:240]!r}")
+            print(f"    alerts: {await page.js('JSON.stringify(window.__forward.errors())')}")
+            print(f"    visible: {(await page.js('window.__forward.text()') or '')[:240]!r}")
             await page.shot("2-signed-in")
 
             # ── 3. the watchlist panel ───────────────────────────────────────
@@ -297,11 +297,11 @@ async def main() -> int:
             )
             await asyncio.sleep(2)
             await page.js(HELPERS)
-            print(f"    visible: {(await page.js('window.__atr.text()') or '')[:220]!r}")
+            print(f"    visible: {(await page.js('window.__forward.text()') or '')[:220]!r}")
             await page.shot("3-watchlist-empty")
 
             print("\n[4] Create a list and add a symbol, through the DOM")
-            print(f"    new: {await page.js('window.__atr.clickTitle(\"New watchlist\")')}")
+            print(f"    new: {await page.js('window.__forward.clickTitle(\"New watchlist\")')}")
             await asyncio.sleep(1)
             # A timestamped name so a second run does not collide with the first —
             # watchlist names are unique per user and a duplicate is a 409.
@@ -311,7 +311,7 @@ async def main() -> int:
                 f"{await page.js(SET_LIST_NAME_JS.replace('{name}', list_name))}"
             )
             await asyncio.sleep(0.4)
-            print(f"    create: {await page.js('window.__atr.clickText(\"Create\")')}")
+            print(f"    create: {await page.js('window.__forward.clickText(\"Create\")')}")
             added_list = await page.wait_for(
                 f"document.body.innerText.includes({list_name!r})", 30, "the new list"
             )
@@ -320,15 +320,15 @@ async def main() -> int:
 
             print(f"    symbol: {await page.js(SET_SYMBOLS_JS)}")
             await asyncio.sleep(0.6)
-            print(f"    add: {await page.js('window.__atr.clickText(\"Add\")')}")
+            print(f"    add: {await page.js('window.__forward.clickText(\"Add\")')}")
             await page.wait_for("!!document.querySelector('table')", 40, "the quote table")
             await asyncio.sleep(4)
-            print(f"    table: {await page.js('JSON.stringify(window.__atr.table())')}")
-            print(f"    alerts: {await page.js('JSON.stringify(window.__atr.errors())')}")
+            print(f"    table: {await page.js('JSON.stringify(window.__forward.table())')}")
+            print(f"    alerts: {await page.js('JSON.stringify(window.__forward.errors())')}")
             # The rail badge must agree with the table. It is loaded before the
             # symbols are added, so a stale count here is the specific bug this
             # check exists for.
-            body_text = await page.js("window.__atr.text()") or ""
+            body_text = await page.js("window.__forward.text()") or ""
             print(f"    rail badge in step: {f'{list_name} 2' in body_text}")
             print(f"    visible: {body_text[:260]!r}")
             await page.shot("4-watchlist-populated")

@@ -1,83 +1,141 @@
-"""Price the +2% plan honestly: cheap when it closes the same day, dear when it does not.
-
-Delivery costs 0.33% a round trip (0.1% STT on each side plus slippage). A trade that is
-bought and sold the same day is a day-trade: STT only on the sell at 0.025%, brokerage
-capped at Rs 20 a side, so the round trip falls to roughly 0.13%. The plan below buys as
-delivery and, if the stock touches +2% on Monday itself, sells it as a day-trade. Anything
-that has not hit by the close is carried and pays the full delivery cost when it exits.
-
-The same-day fill assumes the sell limit at +2% is executed when Monday's high reaches it
-and the stop was not hit first. Slippage is varied because it now dominates the cost.
-
-Run (from scripts/):  ../.venv/Scripts/python study_intraday_cost.py
-"""
+"""Compare configured delivery and intraday transaction costs."""
 
 from __future__ import annotations
 
+import argparse
+import json
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
-from study_intraweek_target import ROUND_TRIP as DELIVERY_RT
-from study_intraweek_target import simulate, stock_universe, weeks_for
+from study_intraweek_target import simulate, weeks_for
 
-from atr.research.hunt import STOCK_COSTS, Costs
+from forward.data.cached_market_frames import CachedMarketFramesAdapter
+from forward.research.hunt import Costs, stock_universe
 
-STOP = 0.05
-NOTIONAL = 100_000.0  # a Rs 1 lakh ticket: what the Rs 20 brokerage cap means in percent
-
-
-def intraday_costs(slippage: float) -> Costs:
-    """Day-trade schedule: STT 0.025% on the sell only, stamp 0.003% on the buy."""
-    return Costs(name="NSE day-trade share", stt_buy=0.0, stt_sell=0.00025, stamp_buy=0.00003, slippage=slippage)
+ROOT = Path(__file__).resolve().parents[1]
+CONFIG_PATH = ROOT / "config" / "study_intraday_cost.json"
 
 
-def main() -> None:
-    weeks = pd.concat([w for w in (weeks_for(s) for s in stock_universe(min_bars=1500)) if w is not None], ignore_index=True)
+def costs_at_slippage(config: dict, slippage: float) -> Costs:
+    """Build the configured fee model with one explicit slippage scenario.
+
+    Args:
+        config: Fee model fields.
+        slippage: Per-side slippage fraction for this scenario.
+
+    Returns:
+        A complete transaction-cost model.
+    """
+    return Costs(**{**config, "slippage": slippage})
+
+
+def main() -> int:
+    """Run the configured cost comparison."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", type=Path, default=CONFIG_PATH)
+    config_path = parser.parse_args().config
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    print(f"Configuration: {config_path.resolve()}")
+    strategy_path = ROOT / config["base_strategy_config"]
+    strategy_config = json.loads(strategy_path.read_text(encoding="utf-8"))
+    print(f"Strategy configuration: {strategy_path.resolve()}")
+
+    history = CachedMarketFramesAdapter()
+    frames = [
+        weeks_for(symbol, history, strategy_config)
+        for symbol in stock_universe(
+            history,
+            min_bars=strategy_config["universe_minimum_bars"],
+        )
+    ]
+    weeks = pd.concat([frame for frame in frames if frame is not None], ignore_index=True)
     weeks["mkt_prior_week"] = weeks.groupby("date")["ret5"].transform("median")
-    res = simulate(weeks, STOP)
-    mid = weeks["date"].sort_values().iloc[len(weeks) // 2]
-    early = (weeks["date"] < mid).to_numpy()
-    same_day_win = ((res["reason"] == "target") & (res["day"] == 0)).to_numpy()
-
-    print(f"Delivery round trip {100 * DELIVERY_RT:.3f}%   |   day-trade round trip at 5bp slippage "
-          f"{intraday_costs(0.0005).round_trip_pct(NOTIONAL):.3f}%, at 10bp {intraday_costs(0.001).round_trip_pct(NOTIONAL):.3f}%\n")
+    result = simulate(
+        weeks,
+        config["stop_fraction"],
+        strategy_config["target_fraction"],
+        strategy_config,
+    )
+    split_index = int(len(weeks) * strategy_config["split_fraction"])
+    midpoint = weeks["date"].sort_values().iloc[split_index]
+    early = (weeks["date"] < midpoint).to_numpy()
+    same_day_win = (
+        (result["reason"] == "target") & (result["day"] == 0)
+    ).to_numpy()
+    delivery_costs = Costs(**strategy_config["costs"])
+    slippage_cases = config["slippage_scenarios"]
+    print(
+        f"Delivery round trip {100 * delivery_costs.round_trip_pct(config['delivery_reference_notional']):.3f}%\n"
+    )
 
     gap = weeks["gap_open"]
+    conditions = config["conditions"]
     rules = {
         "every stock, every Monday": pd.Series(True, index=weeks.index),
-        "gapped down >1% Monday": gap < -0.01,
-        "gapped down >2% Monday": gap < -0.02,
-        "gapped down >1% + market rose last wk": (gap < -0.01) & (weeks["mkt_prior_week"] > 0.01),
-        "gapped down >1% + above 50-day avg": (gap < -0.01) & (weeks["dist_ema50"] > 0),
+        "gapped down one percent Monday": gap < conditions["gap_down_one_pct"],
+        "gapped down two percent Monday": gap < conditions["gap_down_two_pct"],
+        "gap down and market rose": (
+            (gap < conditions["gap_down_one_pct"])
+            & (weeks["mkt_prior_week"] > conditions["market_return_up_pct"])
+        ),
+        "gap down and above trend": (
+            (gap < conditions["gap_down_one_pct"])
+            & (weeks["dist_ema50"] > 0)
+        ),
     }
-    print(f"{'rule (buy Monday open, sell at +2%, stop -5%)':<46}{'trades':>8}{'same-day':>10}{'wins':>7}"
-          f"{'delivery avg':>14}{'hybrid avg (5bp)':>18}{'(10bp)':>9}{'late half (5bp)':>17}")
-    for name, cond in rules.items():
-        m = cond.to_numpy()
-        n = int(m.sum())
-        if n < 500:
-            continue
-        gross = res["ret"].to_numpy()
-        row = [f"{name:<46}{n:>8,}{100 * same_day_win[m].mean():>9.1f}%{100 * (res['reason'] == 'target').to_numpy()[m].mean():>6.0f}%"]
-        row.append(f"{100 * (gross[m] - DELIVERY_RT).mean():>+13.2f}%")
-        results = {}
-        for slip in (0.0005, 0.001):
-            cheap = intraday_costs(slip).round_trip_pct(NOTIONAL) / 100
-            dear = (STOCK_COSTS.round_trip_pct() / 100) + (slip - 0.0005) * 2  # delivery schedule at the same slippage
-            cost = np.where(same_day_win, cheap, dear)
-            results[slip] = gross - cost
-        row.append(f"{100 * results[0.0005][m].mean():>+17.2f}%")
-        row.append(f"{100 * results[0.001][m].mean():>+8.2f}%")
-        late = m & ~early
-        row.append(f"{100 * results[0.0005][late].mean():>+16.2f}%")
-        print("".join(row))
+    print(
+        f"{'rule':<42}{'trades':>8}{'same-day':>10}{'wins':>7}"
+        f"{'delivery avg':>14}{'hybrid avg low':>18}{'high':>9}{'late half':>13}"
+    )
+    gross_return = result["ret"].to_numpy()
+    target_win = (result["reason"] == "target").to_numpy()
+    scenario_returns: dict[float, np.ndarray] = {}
+    for slippage in slippage_cases:
+        day_cost = costs_at_slippage(config["day_trade_costs"], slippage)
+        delivery_scenario = costs_at_slippage(strategy_config["costs"], slippage)
+        same_day_cost = day_cost.round_trip_pct(config["day_trade_reference_notional"]) / 100
+        held_cost = delivery_scenario.round_trip_pct(config["delivery_reference_notional"]) / 100
+        scenario_returns[slippage] = gross_return - np.where(
+            same_day_win,
+            same_day_cost,
+            held_cost,
+        )
 
-    print("\nSame-day share of the gap-down winners, by half:")
-    m = (gap < -0.01).to_numpy()
-    won = (res["reason"] == "target").to_numpy()
-    for tag, half in (("early", early), ("late", ~early)):
-        sel = m & half
-        print(f"   {tag}: {100 * same_day_win[sel].sum() / max(won[sel].sum(), 1):.0f}% of the winners hit on Monday itself")
+    for name, condition in rules.items():
+        selected = condition.to_numpy()
+        count = int(selected.sum())
+        if count < config["minimum_condition_samples"]:
+            continue
+        same_day_rate = 100 * same_day_win[selected].mean()
+        target_rate = 100 * target_win[selected].mean()
+        delivery_average = 100 * (
+            gross_return[selected]
+            - delivery_costs.round_trip_pct(config["delivery_reference_notional"]) / 100
+        ).mean()
+        low_slippage, high_slippage = slippage_cases
+        low_result = scenario_returns[low_slippage]
+        high_result = scenario_returns[high_slippage]
+        late = selected & ~early
+        print(
+            f"{name:<42}{count:>8,}{same_day_rate:>9.1f}%{target_rate:>6.0f}%"
+            f"{delivery_average:>+13.2f}%{100 * low_result[selected].mean():>+17.2f}%"
+            f"{100 * high_result[selected].mean():>+8.2f}%"
+            f"{100 * low_result[late].mean():>+12.2f}%"
+        )
+
+    print("\nSame-day share of the gap-down winners, by history half:")
+    selected = (gap < conditions["gap_down_one_pct"]).to_numpy()
+    for label, half in (("early", early), ("late", ~early)):
+        winners = selected & half & target_win
+        winner_count = int(winners.sum())
+        if winner_count == 0:
+            print(f"  {label}: unavailable; no winning trades")
+            continue
+        same_day_rate = 100 * (selected & half & same_day_win).sum() / winner_count
+        print(f"  {label}: {same_day_rate:.0f}% of winners reached target on entry day")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

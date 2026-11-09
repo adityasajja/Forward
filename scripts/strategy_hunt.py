@@ -33,25 +33,19 @@ import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
 DAILY = ROOT / "data" / "iifl_daily" / "NSEEQ"
-ETF_DIR = ROOT / "data" / "iifl_daily" / "ETF"
 OUT = ROOT / "data" / "research" / "strategy_hunt.json"
 sys.path.insert(0, str(ROOT / "src"))
 
-from atr.research.hunt import (  # noqa: E402
+from forward.research.hunt import (  # noqa: E402
     STOCK_COSTS,
-    ETF_COSTS,
     Result,
-    TRADING_DAYS,
-    TRADING_WEEKS,
-    RISK_FREE,
-    buy_and_hold,
-    compare,
     deflated_sharpe,
-    load_panel,
     run_weights,
-    split_halves,
 )
-from atr.data.hygiene import drop_reverting_spikes  # noqa: E402
+from forward.research.data_hygiene import drop_reverting_spikes  # noqa: E402
+from forward.data.cached_market_frames import CachedMarketFramesAdapter  # noqa: E402
+
+HISTORY = CachedMarketFramesAdapter()
 
 # ---------------------------------------------------------------------------
 # Universe helpers
@@ -68,10 +62,7 @@ def load_symbol(symbol: str, min_bars: int = 200) -> pd.Series | None:
     path = DAILY / f"{symbol}.parquet"
     if not path.exists():
         return None
-    try:
-        df = pd.read_parquet(path, columns=["ts", "close"]).dropna(subset=["close"])
-    except Exception:
-        return None
+    df = pd.read_parquet(path, columns=["ts", "close"]).dropna(subset=["close"])
     df = df[df["close"] > 0].sort_values("ts")
     if len(df) < min_bars:
         return None
@@ -80,26 +71,6 @@ def load_symbol(symbol: str, min_bars: int = 200) -> pd.Series | None:
         return None
     s = pd.Series(df["close"].to_numpy(), index=pd.DatetimeIndex(df["ts"]), name=symbol)
     return s[~s.index.duplicated(keep="last")]
-
-
-def load_ohlc(symbol: str, min_bars: int = 200) -> pd.DataFrame | None:
-    """Full OHLCV frame for a stock, hygiene-filtered on close."""
-    path = DAILY / f"{symbol}.parquet"
-    if not path.exists():
-        return None
-    try:
-        df = pd.read_parquet(path).dropna(subset=["close"])
-    except Exception:
-        return None
-    df = df[df["close"] > 0].sort_values("ts")
-    if len(df) < min_bars:
-        return None
-    df, _ = drop_reverting_spikes(df)
-    if len(df) < min_bars:
-        return None
-    df = df.set_index("ts")
-    df.index = pd.DatetimeIndex(df.index)
-    return df[~df.index.duplicated(keep="last")]
 
 
 def build_universe_panel(symbols: list[str], start: pd.Timestamp, end: pd.Timestamp,
@@ -186,114 +157,32 @@ def signal_composite_mom_vol(panel: pd.DataFrame, mom_lookback: int,
     return score.shift(1)
 
 
-# ---------------------------------------------------------------------------
-# Walk-forward validation
-# ---------------------------------------------------------------------------
-def walk_forward_rank_signals(panel: pd.DataFrame, signal_fn, start: pd.Timestamp,
-                              end: pd.Timestamp, *, train_days: int = 252,
-                              test_days: int = 126, k: int = 10,
-                              rebalance_step: int = 1, sizing: str = "equal",
-                              costs=None, seed: int = 0) -> dict:
-    """Walk-forward test of a rank-based signal with random control.
-
-    Splits the window into train/test folds. On each train fold, finds the best
-    parameter set (here, the signal is already parameterized, so we test the
-    signal itself). On each test fold, holds the top-K and measures.
-    Also runs a random control with the same portfolio size and cadence.
-    """
-    if costs is None:
-        costs = STOCK_COSTS
-
-    dates = sorted(panel.index)
-    usable = [d for d in dates if d >= start]
-    if len(usable) < train_days + test_days:
-        return {"error": f"not enough data for walk-forward: {len(usable)} bars"}
-
-    weights_list = []
-    returns_list = []
-    ctrl_weights_list = []
-    ctrl_returns_list = []
-
-    # Generate the full signal matrix once, then slice by date
-    signal = signal_fn(panel)
-    invvol = 1.0 / panel.pct_change().rolling(63, min_periods=40).std()
-    invvol = invvol.replace([np.inf, -np.inf], np.nan)
-
-    # Build all rebalance dates
-    rebalance_idx = [i for i in range(len(panel)) if panel.index[i] >= start]
-
-    # Simple walk-forward: use ALL data to pick best params, then test on last 30%
-    # For a proper walk-forward, split into multiple folds
-    n_test = len(usable) - train_days
-    test_start_idx = np.searchsorted(dates, usable[train_days])
-
-    # --- Test window: from test_start to end ---
-    # Build weekly weight targets
-    test_dates = [d for d in dates if d >= usable[train_days]]
-    best_weekly_returns = []
-    ctrl_weekly_returns = []
-
-    # For weekly analysis
-    rng = np.random.default_rng(seed)
-
-    for i, date in enumerate(test_dates):
-        date_idx = np.searchsorted(dates, date)
-        if date_idx >= len(dates) - 1:
-            break
-        if date_idx < 1:
-            continue
-
-        # Get signal scores at this date
-        scores = signal.loc[date].dropna()
-        # Filter to stocks with valid prices
-        prices = panel.loc[date].dropna()
-        common = scores.index.intersection(prices.index)
-        if len(common) < 2 * k:
-            continue
-
-        scores = scores.loc[common]
-        ranked = scores.sort_values(ascending=False)
-        picks = list(ranked.index[:k])
-
-        # For weekly returns, we need to hold for 5 days
-        # Record the weight target
-        pass
-
-    # Actually, let's use the existing run_weights for a simpler but rigorous approach
-    # Build weight targets for the test period
-    test_start = usable[train_days]
-    weights = _build_weights(panel, signal, invvol, test_start, end, k,
-                             rebalance_step, sizing)
-    if weights.empty:
-        return {"error": "no valid weights generated"}
-
-    # Run the strategy
-    test_panel = panel.loc[panel.index >= start]
-    result = run_weights(test_panel, weights, costs)
-    metrics = result.metrics()
-
-    # Random control: same number of picks, same cadence, random selection
-    ctrl_weights = _build_random_weights(panel, test_start, end, k,
-                                         rebalance_step, seed=seed)
-    ctrl_result = run_weights(test_panel, ctrl_weights, costs)
-    ctrl_metrics = ctrl_result.metrics()
-
-    return {
-        "strategy": _slim_metrics(metrics),
-        "control": _slim_metrics(ctrl_metrics),
-        "strategy_sharpe": metrics["sharpe"],
-        "control_sharpe": ctrl_metrics["sharpe"],
-        "excess_sharpe": round(metrics["sharpe"] - ctrl_metrics["sharpe"], 3),
-        "weekly_mean_pct": metrics["weekly_mean_pct"],
-        "weekly_p_ge_2": metrics["weeks_ge_2pct_pct"],
-        "weekly_p_ge_5": _weekly_hit_rate(result, threshold=0.05),
-    }
-
-
 def _build_weights(panel: pd.DataFrame, signal: pd.DataFrame,
                    invvol: pd.DataFrame | None, start: pd.Timestamp,
                    end: pd.Timestamp, k: int, step: int, sizing: str) -> pd.DataFrame:
-    """Build weight targets: top-k by signal, rebalanced every `step` sessions."""
+    """Build top-k weights on the selected rebalance schedule.
+
+    Args:
+        panel: Close prices indexed by session and symbol.
+        signal: Scores indexed like ``panel``; higher scores rank first.
+        invvol: Inverse-volatility values required for ``invvol`` sizing.
+        start: First session included in the backtest.
+        end: Last session included in the backtest.
+        k: Number of symbols to hold.
+        step: Sessions between rebalances.
+        sizing: Either ``equal`` or ``invvol``.
+
+    Returns:
+        Target weights for each rebalance date and panel symbol.
+
+    Raises:
+        ValueError: If sizing is unknown or inverse-volatility data is invalid.
+    """
+    if sizing not in {"equal", "invvol"}:
+        raise ValueError(f"unknown sizing mode: {sizing}")
+    if sizing == "invvol" and invvol is None:
+        raise ValueError("inverse-volatility sizing requires volatility data")
+
     usable = panel.loc[(panel.index >= start) & (panel.index <= end)]
     dates = usable.index
     rebalance_dates_list = dates[::step]
@@ -311,18 +200,16 @@ def _build_weights(panel: pd.DataFrame, signal: pd.DataFrame,
         ranked = scores.sort_values(ascending=False)
         picks = list(ranked.index[:k])
 
-        if sizing == "invvol" and invvol is not None:
-            if date in invvol.index:
-                vols = invvol.loc[date, picks].replace([np.inf, -np.inf], np.nan).dropna()
-                if len(vols) >= k // 2:
-                    w = vols / vols.sum()
-                    weights_dict = {p: w.get(p, 0.0) for p in picks}
-                else:
-                    weights_dict = {p: 1.0 / k for p in picks}
-            else:
-                weights_dict = {p: 1.0 / k for p in picks}
+        if sizing == "invvol":
+            if date not in invvol.index:
+                raise ValueError(f"missing inverse-volatility data for {date}")
+            vols = invvol.loc[date, picks].replace([np.inf, -np.inf], np.nan).dropna()
+            if len(vols) != len(picks) or (vols <= 0).any():
+                raise ValueError(f"invalid inverse-volatility data for selected symbols on {date}")
+            w = vols / vols.sum()
+            weights_dict = {symbol: float(w[symbol]) for symbol in picks}
         else:
-            weights_dict = {p: 1.0 / k for p in picks}
+            weights_dict = {symbol: 1.0 / len(picks) for symbol in picks}
         rows[date] = weights_dict
 
     return pd.DataFrame.from_dict(rows, orient="index").reindex(columns=panel.columns, fill_value=0.0).fillna(0.0)
@@ -344,7 +231,7 @@ def _build_random_weights(panel: pd.DataFrame, start: pd.Timestamp,
         if len(prices) < 2 * k:
             continue
         candidates = prices.index.tolist()
-        picks = rng.choice(candidates, size=min(k, len(candidates)), replace=False)
+        picks = rng.choice(candidates, size=k, replace=False)
         weights_dict = {p: 1.0 / k for p in picks}
         rows[date] = weights_dict
 
@@ -428,16 +315,10 @@ def phase1_sweep(symbols: list[str], start: pd.Timestamp, end: pd.Timestamp) -> 
         try:
             if name.startswith("gap") or "gap" in name:
                 ohlc = _load_ohlc_for_panel(train_panel.columns, train_panel.index)
-                if ohlc is not None:
-                    signal = fn(ohlc[0], ohlc[1], ohlc[4], **kwargs)  # close, open, volume
-                else:
-                    continue
+                signal = fn(ohlc[0], ohlc[1], ohlc[4], **kwargs)  # close, open, volume
             elif "boll" in name:
                 ohlc = _load_ohlc_for_panel(train_panel.columns, train_panel.index)
-                if ohlc is not None:
-                    signal = fn(ohlc[2], ohlc[3], ohlc[0], **kwargs)  # high, low, close
-                else:
-                    continue
+                signal = fn(ohlc[2], ohlc[3], ohlc[0], **kwargs)  # high, low, close
             else:
                 signal = fn(train_panel, **kwargs)
             signals[name] = signal
@@ -510,34 +391,25 @@ def _z_score(sharpe_a: float, sharpe_b: float, sd: float) -> float | None:
 def _load_ohlc_for_panel(columns, index):
     """Load OHLCV for panel columns aligned to the panel index."""
     closes_list, opens_list, highs_list, lows_list, vols_list = [], [], [], [], []
-    skip: set[str] = set()
     for sym in columns:
         path = DAILY / f"{sym}.parquet"
         if not path.exists():
-            continue
-        try:
-            df = pd.read_parquet(path, columns=["ts", "open", "high", "low", "close", "volume"])
-            df = df.dropna(subset=["close"]).sort_values("ts")
-            df, _ = drop_reverting_spikes(df)
-            df = df.set_index("ts")
-            df.index = pd.DatetimeIndex(df.index)
-            common = df.index.intersection(index)
-            if len(common) < 50:
-                skip.add(sym)
-                continue
-            df = df.reindex(index).loc[~df.index.duplicated(keep="last")]
-            closes_list.append(df["close"])
-            opens_list.append(df["open"])
-            highs_list.append(df["high"])
-            lows_list.append(df["low"])
-            vols_list.append(df["volume"])
-        except Exception:
-            skip.add(sym)
-            continue
+            raise FileNotFoundError(f"Missing OHLCV data for panel symbol {sym}: {path}")
+        df = pd.read_parquet(path, columns=["ts", "open", "high", "low", "close", "volume"])
+        df = df.dropna(subset=["close"]).sort_values("ts")
+        df, _ = drop_reverting_spikes(df)
+        df = df.drop_duplicates(subset=["ts"], keep="last").set_index("ts")
+        df.index = pd.DatetimeIndex(df.index)
+        df = df.reindex(index)
+        closes_list.append(df["close"].rename(sym))
+        opens_list.append(df["open"].rename(sym))
+        highs_list.append(df["high"].rename(sym))
+        lows_list.append(df["low"].rename(sym))
+        vols_list.append(df["volume"].rename(sym))
 
     if not closes_list:
-        return None
-    closes = pd.concat(closes_list, axis=1).loc[:, ~pd.DataFrame(closes_list).columns.isin(skip)] if skip else pd.concat(closes_list, axis=1)
+        raise ValueError("OHLCV data requires at least one panel symbol")
+    closes = pd.concat(closes_list, axis=1)
     opens = pd.concat(opens_list, axis=1)
     highs = pd.concat(highs_list, axis=1)
     lows = pd.concat(lows_list, axis=1)
@@ -975,12 +847,12 @@ def phase3_refine(symbols: list[str], start: pd.Timestamp, end: pd.Timestamp,
 def search_etf_rotation(start: pd.Timestamp, end: pd.Timestamp) -> dict:
     """Same signal families applied to the ETF universe — costs are 8x lower."""
     print("ETF search: loading universe...")
-    from atr.research.hunt import ETF_COSTS, etf_universe, load_panel as hunt_load_panel
-    etfs = etf_universe(min_bars=1000)
+    from forward.research.hunt import ETF_COSTS, etf_universe, load_panel as hunt_load_panel
+    etfs = etf_universe(HISTORY, min_bars=1000)
     if not etfs:
         print("  No ETFs with 1000+ bars")
         return {}
-    panel = hunt_load_panel(etfs, etf=True, min_bars=1000)
+    panel = hunt_load_panel(etfs, history=HISTORY, etf=True, min_bars=1000)
     if panel.empty:
         return {}
     panel = panel.loc[(panel.index >= start) & (panel.index <= end)]

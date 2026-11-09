@@ -11,11 +11,11 @@ from __future__ import annotations
 
 import pytest
 
-from atr.instruments.service import (
+from forward.core.symbols import canonical_symbol
+from forward.data.instrument_catalog import (
     INDEX_INSTRUMENTS,
     InstrumentMaster,
     _split_cache_name,
-    canonical_symbol,
 )
 
 
@@ -246,7 +246,7 @@ def test_warm_triggered_by_staleness_actually_rebuilds_not_just_hands_back_the_s
 
 def test_only_the_very_first_build_with_nothing_cached_anywhere_blocks_the_caller(tmp_path):
     """The one case where blocking is correct: nothing in memory, nothing usable on disk."""
-    from atr.instruments.service import InstrumentMaster
+    from forward.data.instrument_catalog import InstrumentMaster
 
     empty = tmp_path / "nothing"
     empty.mkdir()
@@ -268,3 +268,76 @@ def test_a_still_current_cache_is_used_on_refresh_instead_of_a_needless_full_reb
     master.refresh(force=True)
 
     assert called == []
+
+
+def test_existing_snapshot_remains_readable_during_refresh(tmp_path, monkeypatch):
+    import threading
+
+    from forward.data.instrument_catalog import MasterSnapshot
+
+    master = InstrumentMaster(tmp_path, ttl_seconds=0)
+    old = MasterSnapshot("old", "old", {}, {}, {}, 0, "cache")
+    new = MasterSnapshot("new", "new", {}, {}, {}, 0, "scan")
+    master._snapshot = old
+    entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+    def build():
+        entered.set()
+        assert release.wait(5)
+        return new
+    monkeypatch.setattr(master, "_load_if_current", lambda: None)
+    monkeypatch.setattr(master, "_build", build)
+    master.warm()
+    assert entered.wait(2)
+    result = []
+    reader = threading.Thread(target=lambda: (result.append(master.snapshot()), finished.set()), daemon=True)
+    reader.start()
+    try:
+        assert finished.wait(0.5), "background rebuild blocked an existing snapshot read"
+        assert result == [old]
+    finally:
+        release.set()
+        reader.join(2)
+    # Explicit refresh waits for any prior builder and publishes the new snapshot.
+    assert master.refresh(force=False) is new
+
+
+def test_cold_readers_share_one_build(tmp_path, monkeypatch):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    from unittest.mock import Mock
+
+    from forward.data.instrument_catalog import MasterSnapshot
+
+    master = InstrumentMaster(tmp_path)
+    snapshot = MasterSnapshot("new", "new", {}, {}, {}, 0, "scan")
+    entered, release = threading.Event(), threading.Event()
+    def build():
+        entered.set()
+        assert release.wait(5)
+        return snapshot
+    build_mock = Mock(side_effect=build)
+    monkeypatch.setattr(master, "_load_if_current", lambda: None)
+    monkeypatch.setattr(master, "_build", build_mock)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = [pool.submit(master.snapshot) for _ in range(4)]
+        try:
+            assert entered.wait(2)
+        finally:
+            release.set()
+        assert all(f.result(timeout=2) is snapshot for f in futures)
+    build_mock.assert_called_once_with()
+
+
+def test_failed_refresh_keeps_last_snapshot(tmp_path, monkeypatch):
+    from forward.data.instrument_catalog import MasterSnapshot
+
+    master = InstrumentMaster(tmp_path)
+    old = MasterSnapshot("old", "old", {}, {}, {}, 0, "cache")
+    master._snapshot = old
+    monkeypatch.setattr(master, "_load_if_current", lambda: None)
+    def fail():
+        raise OSError("unreadable cache")
+    monkeypatch.setattr(master, "_build", fail)
+    with pytest.raises(OSError):
+        master.refresh()
+    assert master._snapshot is old

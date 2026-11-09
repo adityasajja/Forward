@@ -3,18 +3,78 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import Any
 
 import numpy as np
 import pandas as pd
-
 import pytest
 
-from atr.insights import evidence
-from atr.insights.holdings import load_holdings, normalize
-from atr.insights.ideas import buy_ideas, classify
-from atr.insights.market import changes_since, describe_market, signature
-from atr.insights.service import InsightsService, InsightsSettings
-from atr.insights.watch import watch_holding
+from forward.data.insights_holdings import LocalInsightsHoldingsAdapter
+from forward.data.insights_state import JsonInsightsStateAdapter
+from forward.insights import evidence
+from forward.insights.holdings import normalize
+from forward.insights.ideas import buy_ideas, classify
+from forward.insights.market import changes_since, describe_market, signature
+from forward.insights.service import InsightsService, InsightsSettings
+from forward.insights.watch import watch_holding
+
+
+class UnusedMarketIntel:
+    """Fail if a test that does not need market data requests a snapshot."""
+
+    def compute_all(
+        self, *, force_refresh: bool = False
+    ) -> tuple[Any, list[Any], dict[str, Any]]:
+        """Reject market reads in tests for settings and message formatting.
+
+        Args:
+            force_refresh: Whether the caller requested a fresh snapshot.
+
+        Raises:
+            AssertionError: Insights unexpectedly requested market data.
+        """
+        raise AssertionError("This test does not use market intelligence.")
+
+
+class UnusedMarketData:
+    """Fail if a settings or formatting test reads cached market bars."""
+
+    def load_frame(self, symbol: str):
+        """Reject unexpected daily-bar reads.
+
+        Args:
+            symbol: Symbol requested by the service.
+
+        Raises:
+            AssertionError: The test unexpectedly requested a market frame.
+        """
+        raise AssertionError("This test does not use market data.")
+
+
+class EmptyWatchlists:
+    """Return no watchlist symbols for insights tests."""
+
+    def symbols_for_user(self, user_id: str) -> set[str]:
+        """Return no symbols because these tests do not read watchlists.
+
+        Args:
+            user_id: User whose watchlists would be read.
+
+        Returns:
+            An empty symbol set.
+        """
+        return set()
+
+
+def _insights_service(data_root) -> InsightsService:
+    """Build the service used by tests that do not read market data."""
+    return InsightsService(
+        holdings=LocalInsightsHoldingsAdapter(data_root),
+        storage=JsonInsightsStateAdapter(data_root),
+        watchlists=EmptyWatchlists(),
+        market_intel=UnusedMarketIntel(),
+        market_data=UnusedMarketData(),
+    )
 
 
 def _summary(regime="BEARISH_TREND", breadth=34.0, vs50=-3.0, month_ago=66.0):
@@ -140,31 +200,35 @@ def test_lagging_carries_the_honest_note():
 
 
 # ------------------------------------------------------------------------- holdings source
-def test_holdings_fall_back_to_the_saved_snapshot_without_a_session(tmp_path):
+def test_live_and_snapshot_holdings_sources_are_selected_explicitly(tmp_path):
     class Live:
         def holdings(self):
             return [{"symbol": "INFY", "qty": 10, "avg_price": 1000}]
 
-    live = load_holdings(tmp_path, Live())
+    holdings = LocalInsightsHoldingsAdapter(tmp_path)
+    live = holdings.load(source="LIVE", client=Live())
     assert live["source"] == "live" and live["holdings"][0]["symbol"] == "INFY-EQ"
 
-    later = load_holdings(tmp_path, None)  # session gone
+    later = holdings.load(source="SNAPSHOT")
     assert later["source"] == "snapshot" and later["holdings"][0]["symbol"] == "INFY-EQ"
-    assert load_holdings(tmp_path / "empty", None)["source"] == "none"
+    with pytest.raises(FileNotFoundError):
+        LocalInsightsHoldingsAdapter(tmp_path / "empty").load(source="SNAPSHOT")
 
 
-def test_a_broker_failure_uses_the_snapshot_instead_of_silently_watching_nothing(tmp_path):
+def test_a_broker_failure_is_not_replaced_by_a_snapshot(tmp_path):
     class Live:
         def holdings(self):
             return [{"symbol": "TCS", "qty": 5, "avg_price": 3000}]
 
-    load_holdings(tmp_path, Live())
+    holdings = LocalInsightsHoldingsAdapter(tmp_path)
+    holdings.load(source="LIVE", client=Live())
 
     class Broken:
         def holdings(self):
             raise RuntimeError("401")
 
-    assert load_holdings(tmp_path, Broken())["source"] == "snapshot"
+    with pytest.raises(RuntimeError, match="401"):
+        holdings.load(source="LIVE", client=Broken())
 
 
 def test_normalize_handles_iifl_field_names():
@@ -174,7 +238,7 @@ def test_normalize_handles_iifl_field_names():
 
 # ------------------------------------------------------------------------- the message
 def test_the_message_states_its_data_date_and_limits(tmp_path):
-    svc = InsightsService(data_root=tmp_path)
+    svc = _insights_service(tmp_path)
     digest = {
         "market": describe_market(_summary()),
         "changes": ["The market turned falling (it was rising)."],
@@ -196,7 +260,7 @@ def test_the_message_states_its_data_date_and_limits(tmp_path):
 
 
 def test_switched_off_sections_are_left_out_of_the_message(tmp_path):
-    svc = InsightsService(data_root=tmp_path)
+    svc = _insights_service(tmp_path)
     digest = {
         "market": describe_market(_summary()), "changes": ["x"], "ideas": [{"symbol": "ABC", "setup": "strong_rs", "setup_label": "S", "vs_nifty_20d_pct": 1.0, "move_20d_pct": 1.0, "stop_price": 1.0, "stop_pct": 1.0}],
         "holdings": {"source": "none", "as_of": None, "items": []}, "data_as_of": None, "stale": False, "stale_days": None, "disclaimer": "",
@@ -206,19 +270,19 @@ def test_switched_off_sections_are_left_out_of_the_message(tmp_path):
 
 
 def test_settings_round_trip(tmp_path):
-    svc = InsightsService(data_root=tmp_path)
+    svc = _insights_service(tmp_path)
     assert svc.settings().enabled is True
     svc.save_settings(InsightsSettings(buy_ideas=False, max_buy_ideas=3))
-    again = InsightsService(data_root=tmp_path).settings()
+    again = _insights_service(tmp_path).settings()
     assert again.buy_ideas is False and again.max_buy_ideas == 3
 
 
 def test_the_daily_send_waits_until_after_the_close_and_only_happens_once(tmp_path, monkeypatch):
     from datetime import datetime
 
-    import atr.insights.service as mod
+    import forward.insights.service as mod
 
-    svc = InsightsService(data_root=tmp_path)
+    svc = _insights_service(tmp_path)
     sent = []
     monkeypatch.setattr(svc, "send", lambda **k: sent.append(1) or {"sent": True})
 
@@ -254,7 +318,7 @@ def test_a_locked_database_cannot_fail_the_login_check(auth_client, monkeypatch)
 
     from sqlalchemy.exc import OperationalError
 
-    import atr.auth.service as auth_service
+    import forward.auth.service as auth_service
 
     real = auth_service.utcnow
     monkeypatch.setattr(auth_service, "utcnow", lambda: real() + timedelta(minutes=5))  # stamp is now stale
@@ -274,7 +338,7 @@ def test_normalize_reads_the_field_names_the_broker_actually_uses():
     assert normalize(rows) == [{"symbol": "HINDALCO-EQ", "qty": 15, "avg_price": 647.72}]
 
 
-def test_an_empty_snapshot_falls_back_to_the_saved_holdings_export(tmp_path):
+def test_explicit_export_source_reads_saved_holdings_export(tmp_path):
     (tmp_path / "insights").mkdir()
     (tmp_path / "insights" / "holdings.json").write_text('{"as_of": "2026-09-19T00:00:00+00:00", "holdings": []}')
     (tmp_path / "portfolio").mkdir()
@@ -282,7 +346,7 @@ def test_an_empty_snapshot_falls_back_to_the_saved_holdings_export(tmp_path):
         "nseTradingSymbol,totalQuantity,averageTradedPrice\nTCS-EQ,4,3100.5\n"
     )
 
-    got = load_holdings(tmp_path)
+    got = LocalInsightsHoldingsAdapter(tmp_path).load(source="EXPORT")
 
     assert got["source"] == "export"
     assert got["holdings"] == [{"symbol": "TCS-EQ", "qty": 4, "avg_price": 3100.5}]

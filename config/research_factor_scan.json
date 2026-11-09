@@ -1,0 +1,20 @@
+{
+  "panel_file": "data/signals/panel_nseeq_120.parquet",
+  "forward_horizon_days": 21,
+  "quantile_count": 5,
+  "momentum_skip_days": 21,
+  "momentum_factors": {
+    "mom_63_skip21": 84,
+    "mom_126_skip21": 147,
+    "mom_252_skip21": 273
+  },
+  "volatility_factor_name": "vol_126",
+  "volatility_lookback_days": 126,
+  "distance_high_factor_name": "dist_high_252",
+  "distance_high_lookback_days": 252,
+  "moving_average_factors": {
+    "px_sma50": 50,
+    "px_sma200": 200
+  },
+  "minimum_survivor_spread_pct": 0.5
+}

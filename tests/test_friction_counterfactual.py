@@ -14,14 +14,14 @@ from typing import Any
 
 import pytest
 
-from atr.appdb.engine import AppDatabase
-from atr.appdb.repositories import (
-    LearningObservationRepository,
-    StrategyRepository,
-    UserRepository,
-)
-from atr.data.synthetic import SyntheticConfig, SyntheticFeed
-from atr.services.experiment import StrategyExperimentService
+from forward.appdb.engine import AppDatabase
+from forward.appdb.identity_repository import UserRepository
+from forward.appdb.learning_observation_repository import LearningObservationRepository
+from forward.appdb.strategy_repository import StrategyRepository
+from forward.appdb.strategy_research_storage import SqlStrategyResearchStorage
+from forward.config.settings import get_settings
+from forward.data.synthetic import SyntheticConfig, SyntheticFeed
+from forward.services.experiment import StrategyExperimentService
 
 
 @pytest.fixture
@@ -96,7 +96,11 @@ def test_no_cost_finding_creates_nothing(
 ) -> None:
     """No banked friction lesson means no experiment — stated, not silent."""
     strategy_id = _make_strategy(app_db, test_user["user_id"])
-    svc = StrategyExperimentService(db=app_db)
+    svc = StrategyExperimentService(
+        storage=SqlStrategyResearchStorage(app_db),
+        curve_max_points=get_settings().experiment_curve_max_points,
+        result_decimals=get_settings().experiment_result_decimals,
+    )
     result = svc.run_friction_counterfactual(
         strategy_id, 1, creator_user_id=test_user["user_id"]
     )
@@ -110,7 +114,11 @@ def test_missing_stop_param_states_what_is_missing(
     """A cost finding against a definition with no stop has nothing to widen."""
     strategy_id = _make_strategy(app_db, test_user["user_id"], stop=None)
     _bank_cost_finding(app_db, strategy_id)
-    svc = StrategyExperimentService(db=app_db)
+    svc = StrategyExperimentService(
+        storage=SqlStrategyResearchStorage(app_db),
+        curve_max_points=get_settings().experiment_curve_max_points,
+        result_decimals=get_settings().experiment_result_decimals,
+    )
     result = svc.run_friction_counterfactual(
         strategy_id, 1, creator_user_id=test_user["user_id"]
     )
@@ -124,7 +132,11 @@ def test_friction_counterfactual_runs_end_to_end(
     """The morning's lesson, replayed: 2.0 stop proposes 3.0 and runs."""
     strategy_id = _make_strategy(app_db, test_user["user_id"], stop=2.0)
     _bank_cost_finding(app_db, strategy_id)
-    svc = StrategyExperimentService(db=app_db)
+    svc = StrategyExperimentService(
+        storage=SqlStrategyResearchStorage(app_db),
+        curve_max_points=get_settings().experiment_curve_max_points,
+        result_decimals=get_settings().experiment_result_decimals,
+    )
     result = svc.run_friction_counterfactual(
         strategy_id, 1, creator_user_id=test_user["user_id"], feed=feed
     )

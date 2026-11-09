@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from atr.research.hunt import ETF_COSTS, STOCK_COSTS, Costs, run_weights
+from forward.research.hunt import ETF_COSTS, STOCK_COSTS, Costs, run_weights
 
 
 def _prices(**columns: list[float]) -> pd.DataFrame:
@@ -102,7 +102,7 @@ def test_turnover_is_charged_on_what_actually_changed_hands():
 
 def test_sharpe_subtracts_the_rate_you_could_have_earned_risk_free():
     """Otherwise a rule that sits in cash scores well for taking no risk at all."""
-    from atr.research.hunt import RISK_FREE
+    from forward.research.hunt import RISK_FREE
 
     prices = _prices(x=[100.0 * (1.0004**i) for i in range(600)])
     weights = pd.DataFrame({"x": [1.0]}, index=prices.index[:1])
@@ -116,7 +116,7 @@ def test_sharpe_subtracts_the_rate_you_could_have_earned_risk_free():
 
 def test_a_pooled_win_does_not_claim_to_beat_the_benchmark_in_both_halves():
     """The failure mode: winning on pooled figures while losing one half badly."""
-    from atr.research.hunt import compare
+    from forward.research.hunt import compare
 
     rising = _prices(x=[100.0 * (1.03**i) for i in range(400)])
     flat = _prices(x=[100.0 + 0.01 * i for i in range(400)])

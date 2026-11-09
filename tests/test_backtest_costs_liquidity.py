@@ -1,9 +1,9 @@
 import pytest
 
-from atr.backtest.costs import IndianDeliveryCosts, IndianIntradayCosts
-from atr.backtest.config import BacktestRunConfig, ConfigError
-from atr.core.enums import Side
-from atr.core.models import Instrument
+from forward.backtest.config import BacktestRunConfig, ConfigError
+from forward.core.costs import IndianDeliveryCosts, IndianIntradayCosts
+from forward.core.enums import Side
+from forward.core.instrument_models import Instrument
 
 INST = Instrument(symbol="X", exchange="NSE", currency="INR")
 

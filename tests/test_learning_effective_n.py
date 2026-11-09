@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
-from atr.research.learning_stats import compare_bucket, effective_n
+from forward.research.learning_stats import compare_bucket, effective_n
 
 
 def _minute(offset: int = 0) -> datetime:

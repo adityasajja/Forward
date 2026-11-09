@@ -1,0 +1,8 @@
+{
+  "symbol": "NIFTYBEES",
+  "exchange": "NSEEQ",
+  "interval": "1m",
+  "from_date": "2026-08-15",
+  "to_date": "2026-09-15",
+  "output_directory": "data/iifl_1min"
+}

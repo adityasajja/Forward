@@ -1,82 +1,115 @@
-"""Does the "stalled at the top" pattern precede weak stretches? Measured, not assumed.
-
-For every stock in the local daily cache and every day, compute the detector's flag and
-what happened over the next 5 and 10 sessions. Compare against three baselines:
-
-* all days (what any stock does),
-* ran up and sitting at the top but NOT stalled (still moving),
-* the flagged days.
-
-Run:  python scripts/study_stall.py
-"""
+"""Measure forward returns after the configured stalled-stock detector."""
 
 from __future__ import annotations
 
-import sys
+import argparse
+import json
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from forward.insights.stall import StallConfig, stall_frame
 
-from atr.insights.stall import stall_frame  # noqa: E402
+ROOT = Path(__file__).resolve().parents[1]
+CONFIG_PATH = ROOT / "config" / "study_stall.json"
 
-ROOT = Path(__file__).resolve().parents[1] / "data" / "iifl_daily" / "NSEEQ"
 
+def main() -> int:
+    """Run the stall study using its named experiment and feature configs."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", type=Path, default=CONFIG_PATH)
+    config_path = parser.parse_args().config
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    feature_path = ROOT / config["feature_config"]
+    feature_config_data = json.loads(feature_path.read_text(encoding="utf-8"))
+    feature_config = StallConfig(**feature_config_data)
+    print(f"Configuration: {config_path.resolve()}")
+    print(f"Feature configuration: {feature_path.resolve()}")
 
-def main() -> None:
     rows = []
-    for path in sorted(ROOT.glob("*.parquet")):
-        try:
-            df = pd.read_parquet(path)
-        except Exception:
+    data_directory = ROOT / config["data_directory"]
+    for path in sorted(data_directory.glob("*.parquet")):
+        frame = pd.read_parquet(path)
+        required = {"open", "high", "low", "close", "ts", "volume"}
+        if len(frame) < config["minimum_history_bars"] or not required.issubset(frame.columns):
             continue
-        if len(df) < 90 or not {"open", "high", "low", "close", "ts"}.issubset(df.columns):
-            continue
-        f = stall_frame(df)
-        c = f["close"]
-        f["fwd5"] = (c.shift(-5) / c - 1) * 100
-        f["fwd10"] = (c.shift(-10) / c - 1) * 100
-        f["sym"] = path.stem
-        rows.append(f.dropna(subset=["fwd5", "ext50", "ret20", "off_high", "range_ratio"]))
+        features = stall_frame(frame, feature_config)
+        close = features["close"]
+        for horizon in config["forward_horizons"]:
+            features[f"forward_{horizon}"] = (close.shift(-horizon) / close - 1) * 100
+        features["symbol"] = path.stem
+        rows.append(
+            features.dropna(
+                subset=[
+                    f"forward_{config['forward_horizons'][0]}",
+                    "ext50",
+                    "ret20",
+                    "off_high",
+                    "range_ratio",
+                ]
+            )
+        )
+    if not rows:
+        raise ValueError("No cached symbols meet the configured history requirements.")
     data = pd.concat(rows, ignore_index=True)
-
-    ran_top = ((data["ret20"] >= 10) | (data["ext50"] >= 8)) & (data["off_high"] >= -3.5)
+    ran_top = (
+        (data["ret20"] >= config["recent_run_return_pct"])
+        | (data["ext50"] >= config["recent_run_extension_pct"])
+    ) & (data["off_high"] >= -config["near_high_distance_pct"])
     groups = {
         "all days": data,
-        "ran up & at top, still moving": data[ran_top & ~data["gate"]],
-        "gate (ran up, at top, flat)": data[data["gate"]],
-        "FLAGGED (gate + score>=55)": data[data["flag"]],
+        "ran up and still moving": data[ran_top & ~data["gate"]],
+        "gate": data[data["gate"]],
+        "flagged": data[data["flag"]],
     }
-    print(f"{data['sym'].nunique()} stocks, {len(data):,} stock-days, "
-          f"{data['ts'].min():%d %b %Y} to {data['ts'].max():%d %b %Y}\n")
-    print(f"{'group':34s} {'n':>7s} | {'5d mean':>8s} {'5d med':>7s} {'5d down%':>9s} | {'10d mean':>9s} {'10d med':>8s}")
-    for name, g in groups.items():
-        g10 = g.dropna(subset=["fwd10"])
+    first_horizon, second_horizon = config["forward_horizons"]
+    print(
+        f"{data['symbol'].nunique()} symbols, {len(data):,} stock-days, "
+        f"{data['ts'].min():%d %b %Y} to {data['ts'].max():%d %b %Y}\n"
+    )
+    print(
+        f"{'group':30s} {'n':>7s} | {str(first_horizon) + 'd mean':>9s} "
+        f"{str(first_horizon) + 'd med':>8s} | {str(second_horizon) + 'd mean':>10s} "
+        f"{str(second_horizon) + 'd med':>9s}"
+    )
+    for name, part in groups.items():
+        future = part.dropna(subset=[f"forward_{second_horizon}"])
         print(
-            f"{name:34s} {len(g):7,d} | {g['fwd5'].mean():8.2f} {g['fwd5'].median():7.2f} "
-            f"{(g['fwd5'] < 0).mean() * 100:8.1f}% | {g10['fwd10'].mean():9.2f} {g10['fwd10'].median():8.2f}"
+            f"{name:30s} {len(part):7,d} | "
+            f"{part[f'forward_{first_horizon}'].mean():9.2f} "
+            f"{part[f'forward_{first_horizon}'].median():8.2f} | "
+            f"{future[f'forward_{second_horizon}'].mean():10.2f} "
+            f"{future[f'forward_{second_horizon}'].median():9.2f}"
         )
 
-    # The claim behind the alert: after a flag, does the stock fail to make progress?
-    flagged = groups["FLAGGED (gate + score>=55)"]
-    base = groups["all days"]
-    for thr in (1.0, 2.0):
+    flagged = groups["flagged"]
+    baseline = groups["all days"]
+    first_returns = f"forward_{first_horizon}"
+    for threshold in config["low_progress_thresholds_pct"]:
         print(
-            f"\nWithin 5 sessions the stock gained less than {thr:.0f}%:  "
-            f"flagged {(flagged['fwd5'] < thr).mean() * 100:.0f}%   vs all days {(base['fwd5'] < thr).mean() * 100:.0f}%"
+            f"\nWithin {first_horizon} sessions, gain stayed below {threshold:.0f}%: "
+            f"flagged {(flagged[first_returns] < threshold).mean() * 100:.0f}% vs "
+            f"all days {(baseline[first_returns] < threshold).mean() * 100:.0f}%"
         )
-    print(f"Fell 3%+ within 5 sessions: flagged {(flagged['fwd5'] <= -3).mean() * 100:.0f}%   "
-          f"vs all days {(base['fwd5'] <= -3).mean() * 100:.0f}%")
-    # Stock-days overlap heavily (a stalled stock is flagged on consecutive days), so also
-    # count distinct episodes: first flagged day per stock per 10-day stretch.
-    ep = flagged.sort_values(["sym", "ts"]).copy()
-    ep["gap"] = ep.groupby("sym")["ts"].diff().dt.days.fillna(999)
-    first = ep[ep["gap"] > 10]
-    print(f"\nDistinct episodes: {len(first):,}  mean 5d {first['fwd5'].mean():.2f}%  "
-          f"median {first['fwd5'].median():.2f}%  down {(first['fwd5'] < 0).mean() * 100:.0f}%")
+    drawdown = config["drawdown_threshold_pct"]
+    print(
+        f"Fell {abs(drawdown):.0f}%+ within {first_horizon} sessions: "
+        f"flagged {(flagged[first_returns] <= drawdown).mean() * 100:.0f}% vs "
+        f"all days {(baseline[first_returns] <= drawdown).mean() * 100:.0f}%"
+    )
+    episodes = flagged.sort_values(["symbol", "ts"]).copy()
+    episodes["gap"] = (
+        episodes.groupby("symbol")["ts"].diff().dt.days.fillna(config["stall_episode_days"] + 1)
+    )
+    first_flags = episodes[episodes["gap"] > config["stall_episode_days"]]
+    print(
+        f"\nDistinct episodes: {len(first_flags):,}  "
+        f"mean {first_horizon}d {first_flags[first_returns].mean():.2f}%  "
+        f"median {first_horizon}d {first_flags[first_returns].median():.2f}%  "
+        f"down {(first_flags[first_returns] < 0).mean() * 100:.0f}%"
+    )
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

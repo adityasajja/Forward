@@ -10,11 +10,11 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from atr.brokers.iifl.auth import SessionStore
-from atr.brokers.iifl.client import IiflClient, _fmt_date
-from atr.brokers.iifl.contracts import InstrumentMaster
-from atr.brokers.iifl.feeds import _candles, _candle_row
-from atr.config.settings import get_settings
+from forward.brokers.iifl.auth import SessionStore
+from forward.brokers.iifl.client import IiflClient, _fmt_date
+from forward.brokers.iifl.contracts import InstrumentMaster
+from forward.brokers.iifl.feeds import _candles, _candle_row
+from forward.config.settings import get_settings
 
 p = print
 def P(*a, **kw): kw.setdefault("flush", True); p(*a, **kw)
@@ -252,7 +252,7 @@ def main():
             if session_still_valid:
                 P(f"  {sym}: fetching...")
                 if master is None:
-                    from atr.brokers.iifl.contracts import InstrumentMaster
+                    from forward.brokers.iifl.contracts import InstrumentMaster
                     master = InstrumentMaster(client)
                     P("Syncing instrument master...")
                     master.sync(["NSEEQ"])

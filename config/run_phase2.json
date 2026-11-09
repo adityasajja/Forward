@@ -1,0 +1,10 @@
+{
+  "history_start_date": "2020-01-01",
+  "history_end_date": "2026-09-18",
+  "universe_files": [
+    "data/universe/n50.txt",
+    "data/universe/mid150.txt"
+  ],
+  "log_file": "data/research/phase2_progress.log",
+  "output_file": "data/research/strategy_hunt_wf.json"
+}

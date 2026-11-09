@@ -13,8 +13,12 @@ from __future__ import annotations
 
 import pytest
 
-from atr.appdb.repositories import UserRepository
-from atr.services.watchlists import (
+from forward.appdb.identity_repository import UserRepository
+from forward.appdb.watchlist_storage import SqlWatchlistStorage
+from forward.data.cache_store import PanelDailyBarCache
+from forward.data.watchlist_market import InstrumentMasterWatchlistAdapter
+from forward.infra.audit_log import JsonlAuditLogAdapter
+from forward.services.watchlists import (
     COLUMN_INDEX,
     COMPUTABLE_COLUMNS,
     DEFAULT_COLUMNS,
@@ -38,7 +42,12 @@ def users(app_db) -> tuple[str, str]:
 
 @pytest.fixture()
 def service(app_db, master) -> WatchlistService:
-    return WatchlistService(app_db, master)
+    from forward.config.settings import audit_log_path
+
+    return WatchlistService(
+        SqlWatchlistStorage(app_db, JsonlAuditLogAdapter(audit_log_path())),
+        InstrumentMasterWatchlistAdapter(master, PanelDailyBarCache(), master.cache_root),
+    )
 
 
 # ─── the column registry ──────────────────────────────────────────────────────
@@ -137,7 +146,7 @@ def test_deleting_a_watchlist_removes_its_items(service, users, app_db):
 
     from sqlalchemy import func, select
 
-    from atr.appdb.schema import watchlist_items
+    from forward.appdb.watchlists_schema import watchlist_items
 
     with app_db.session() as session:
         remaining = session.execute(select(func.count()).select_from(watchlist_items)).scalar()
@@ -179,14 +188,17 @@ def test_remove_item(service, users):
     assert service.remove_item(first_user, created["watchlist_id"], "INFY") is False
 
 
-def test_reorder_is_idempotent_and_keeps_unlisted_symbols(service, users):
+def test_reorder_requires_the_complete_list_and_is_idempotent(service, users):
     first_user, _ = users
     created = service.create(first_user, name="Core")
     service.add_items(first_user, created["watchlist_id"], ["RELIANCE", "TCS", "INFY"])
     wid = created["watchlist_id"]
 
-    first = service.reorder(first_user, wid, ["INFY", "TCS"])
-    # A partial list must not drop rows: RELIANCE stays, after the ones named.
+    with pytest.raises(WatchlistError) as exc:
+        service.reorder(first_user, wid, ["INFY", "TCS"])
+    assert exc.value.code == "invalid_order"
+
+    first = service.reorder(first_user, wid, ["INFY", "TCS", "RELIANCE"])
     assert first["items"] == ["INFY", "TCS", "RELIANCE"]
     # INFY moved 2→0 and RELIANCE 0→2; TCS did not move.
     assert first["moved"] == 2
@@ -197,7 +209,7 @@ def test_reorder_is_idempotent_and_keeps_unlisted_symbols(service, users):
     assert again["items"] == ["INFY", "TCS", "RELIANCE"]
 
     # And a genuine swap does move.
-    swapped = service.reorder(first_user, wid, ["TCS", "INFY"])
+    swapped = service.reorder(first_user, wid, ["TCS", "INFY", "RELIANCE"])
     assert swapped["items"] == ["TCS", "INFY", "RELIANCE"]
     assert swapped["moved"] == 2
 

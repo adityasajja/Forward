@@ -41,12 +41,11 @@ same universe, which is what the bias permits.
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from atr.research.hunt import (
+from forward.research.hunt import (
     ETF_COSTS,
     TRADING_DAYS,
     Result,
@@ -58,9 +57,11 @@ from atr.research.hunt import (
     run_weights,
     split_halves,
 )
+from forward.data.cached_market_frames import CachedMarketFramesAdapter
+from forward.config.settings import research_data_root
 
-ROOT = Path(__file__).resolve().parents[1]
-OUT = ROOT / "data" / "research" / "etf_rotation.json"
+OUT = research_data_root() / "research" / "etf_rotation.json"
+HISTORY = CachedMarketFramesAdapter()
 
 CASH = "CASH"
 #: Annual cash yield. This is an ASSUMPTION, not a measured series — LIQUIDBEES,
@@ -84,7 +85,9 @@ REBALANCE = {"W": "W-FRI", "M": "ME", "Q": "QE"}
 # ---------------------------------------------------------------------------
 def build_panel(symbols: list[str], cash_rate: float = CASH_RATE) -> pd.DataFrame:
     """Close prices for ``symbols`` plus a synthetic cash column, over their common window."""
-    raw = load_panel(etf_universe(), etf=True)
+    raw = load_panel(
+        etf_universe(HISTORY), history=HISTORY, etf=True
+    )
     panel = raw[symbols].dropna()
     days = (panel.index - panel.index[0]).days.to_numpy()
     panel = panel.copy()

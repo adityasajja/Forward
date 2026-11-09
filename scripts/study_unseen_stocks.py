@@ -1,96 +1,140 @@
-"""Run the fixed oversold-and-volatile rule on stocks it was never developed on.
-
-The pattern was found among 341 long-history stocks. The same folder holds ~2,700 more
-with about a year of bars each. None of them entered any earlier study, so this is a
-true holdout in *names* as well as in time, with nothing tuned to it: the rule is
-applied exactly as written (RSI(14) < 30 and 20-day volatility in the top fifth of that
-week's cross-section, outcome = next-5-bar gain of 2% or more).
-
-Illiquid names can print wide, unreachable moves, so the result is shown both for every
-stock and for those trading at least Rs 2 crore a day.
-
-Run:  ./.venv/Scripts/python.exe scripts/study_unseen_stocks.py
-"""
+"""Measure the configured signal on symbols excluded from earlier research."""
 
 from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from atr.research.forward_tracker import RSI_BELOW, VOL_QUANTILE, _rsi
-from atr.research.hunt import STOCKS, STOCK_COSTS, stock_universe
+from forward.data.cached_market_frames import CachedMarketFramesAdapter
+from forward.research.forward_tracker import _rsi
+from forward.research.hunt import Costs, stock_universe
 
-HIT = 0.02
-ROUND_TRIP = STOCK_COSTS.round_trip_pct() / 100
-MIN_BARS = 200
-LIQUID_CRORE = 2.0
+ROOT = Path(__file__).resolve().parents[1]
+CONFIG_PATH = ROOT / "config" / "study_unseen_stocks.json"
 
 
-def main() -> None:
-    seen = set(stock_universe(min_bars=1500))
+def main() -> int:
+    """Run the holdout study with explicit configuration."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", type=Path, default=CONFIG_PATH)
+    config_path = parser.parse_args().config
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    print(f"Configuration: {config_path.resolve()}")
+    history = CachedMarketFramesAdapter()
+    seen = set(stock_universe(history, min_bars=config["minimum_universe_history_bars"]))
     close_cols, value_cols = [], []
-    for path in STOCKS.glob("*-EQ.parquet"):
-        base = path.stem[:-3]
+    frames = history.frames(config["exchange"])
+    for symbol, frame in frames.items():
+        if not symbol.endswith(config["symbol_suffix"]):
+            continue
+        base = symbol.removesuffix(config["symbol_suffix"])
         if base in seen:
-            continue  # the same company under its other spelling was in the earlier studies
-        df = pd.read_parquet(path, columns=["ts", "close", "volume"]).dropna()
+            continue
+        df = frame[["ts", "close", "volume"]].dropna()
         df = df[df["close"] > 0].drop_duplicates("ts")
-        if len(df) < MIN_BARS:
+        if len(df) < config["minimum_symbol_history_bars"]:
             continue
         df = df.set_index("ts")
         close_cols.append(df["close"].rename(base))
         value_cols.append((df["close"] * df["volume"]).rename(base))
+    if not close_cols:
+        raise ValueError("No unseen symbols meet the configured history requirement.")
     close = pd.concat(close_cols, axis=1, sort=True)
     value = pd.concat(value_cols, axis=1, sort=True)
-    print(f"{close.shape[1]} stocks never used before, {len(close)} sessions "
-          f"({close.index[0].date()} to {close.index[-1].date()})")
+    print(
+        f"{close.shape[1]} unseen symbols, {len(close)} sessions "
+        f"({close.index[0].date()} to {close.index[-1].date()})"
+    )
 
-    ret = close.pct_change()
-    rsi = close.apply(_rsi)
-    vol = ret.rolling(20).std()
-    liquid = value.rolling(20).median() >= LIQUID_CRORE * 1e7
-    fwd = close.shift(-5) / close - 1
-
-    weeks = list(close.groupby(close.index.to_period("W-FRI")).tail(1).index)
+    returns = close.pct_change()
+    rsi = close.apply(lambda prices: _rsi(prices, config["rsi_period"]))
+    volatility = returns.rolling(config["volatility_lookback_days"]).std()
+    liquid = value.rolling(config["liquidity_lookback_days"]).median() >= (
+        config["liquid_value_threshold_crore"] * config["crore_in_rupees"]
+    )
+    forward_return = close.shift(-config["forward_days"]) / close - 1
+    weeks = list(close.groupby(close.index.to_period(config["week_period"])).tail(1).index)
     rows = []
-    for d in weeks:
-        v, r, f, lq = vol.loc[d], rsi.loc[d], fwd.loc[d], liquid.loc[d]
-        ok = v.notna() & r.notna() & f.notna()
-        if ok.sum() < 200:
+    for date in weeks:
+        vol, strength, outcome, liquidity = (
+            volatility.loc[date],
+            rsi.loc[date],
+            forward_return.loc[date],
+            liquid.loc[date],
+        )
+        valid = vol.notna() & strength.notna() & outcome.notna()
+        if valid.sum() < config["minimum_weekly_cross_section"]:
             continue
-        cut = v[ok].quantile(VOL_QUANTILE)
-        flag = ok & (r < RSI_BELOW) & (v >= cut)
-        for s in flag[flag].index:
-            rows.append({"date": d, "symbol": s, "fwd": f[s], "hit": float(f[s] >= HIT), "liquid": bool(lq[s])})
-        rows.append({"date": d, "symbol": "*base*", "fwd": float(f[ok].mean()), "hit": float((f[ok] >= HIT).mean()), "liquid": True})
+        cutoff = vol[valid].quantile(config["volatility_quantile"])
+        selected = valid & (strength < config["rsi_maximum"]) & (vol >= cutoff)
+        for symbol in selected[selected].index:
+            rows.append(
+                {
+                    "date": date,
+                    "symbol": symbol,
+                    "return": outcome[symbol],
+                    "hit": float(outcome[symbol] >= config["hit_return_fraction"]),
+                    "liquid": bool(liquidity[symbol]),
+                }
+            )
+        rows.append(
+            {
+                "date": date,
+                "symbol": config["baseline_symbol"],
+                "return": float(outcome[valid].mean()),
+                "hit": float((outcome[valid] >= config["hit_return_fraction"]).mean()),
+                "liquid": True,
+            }
+        )
     frame = pd.DataFrame(rows)
-    base = frame[frame["symbol"] == "*base*"]["hit"].mean()
-    sig = frame[frame["symbol"] != "*base*"]
-    print(f"ordinary stock-week rate in this universe: {100 * base:.1f}%\n")
+    baseline = frame[frame["symbol"] == config["baseline_symbol"]]["hit"].mean()
+    signals = frame[frame["symbol"] != config["baseline_symbol"]]
+    print(f"Ordinary stock-week rate in this universe: {100 * baseline:.1f}%\n")
+    costs = Costs(**config["costs"])
+    cost_fraction = costs.round_trip_pct() / 100
 
-    def show(tag: str, part: pd.DataFrame) -> None:
-        if len(part) < 30:
-            print(f"{tag:<26} only {len(part)} signals")
+    def show(label: str, part: pd.DataFrame) -> None:
+        """Print the configured hit-rate and return summary."""
+        if len(part) < config["minimum_signal_count"]:
+            print(f"{label:<26} only {len(part)} signals")
             return
-        n, hits = len(part), float(part["hit"].sum())
-        p = hits / n
-        z = 1.96
-        centre = (p + z * z / (2 * n)) / (1 + z * z / n)
-        half = z * np.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / (1 + z * z / n)
-        wk = part.groupby("date")["hit"].mean()
-        print(f"{tag:<26} n={n:>5}  hit {100 * p:>5.1f}%  (likely {100 * (centre - half):.0f}-{100 * (centre + half):.0f}%)  "
-              f"weeks {len(wk):>3}  week-weighted {100 * wk.mean():.1f}%  net avg {100 * (part['fwd'].mean() - ROUND_TRIP):+.2f}%/wk  "
-              f"median {100 * part['fwd'].median():+.2f}%")
+        count = len(part)
+        hits = float(part["hit"].sum())
+        probability = hits / count
+        z = config["confidence_z"]
+        centre = (probability + z * z / (2 * count)) / (1 + z * z / count)
+        half = (
+            z
+            * np.sqrt(probability * (1 - probability) / count + z * z / (4 * count * count))
+            / (1 + z * z / count)
+        )
+        weekly = part.groupby("date")["hit"].mean()
+        print(
+            f"{label:<26} n={count:>5} hit {100 * probability:>5.1f}% "
+            f"(likely {100 * (centre - half):.0f}-{100 * (centre + half):.0f}%) "
+            f"weeks {len(weekly):>3} week-weighted {100 * weekly.mean():.1f}% "
+            f"net avg {100 * (part['return'].mean() - cost_fraction):+.2f}%/wk "
+            f"median {100 * part['return'].median():+.2f}%"
+        )
 
-    show("all stocks", sig)
-    show("liquid (>= Rs 2cr/day)", sig[sig["liquid"]])
-    show("illiquid", sig[~sig["liquid"]])
-    top = sig.groupby("date").size().sort_values(ascending=False)
-    print(f"\nbusiest weeks hold {100 * top.head(3).sum() / top.sum():.0f}% of signals: "
-          + ", ".join(f"{d.date()} n={n}" for d, n in top.head(3).items()))
-    ex = sig[~sig["date"].isin(top.head(3).index)]
-    show("excluding those 3 weeks", ex)
+    show("all unseen symbols", signals)
+    show("liquid symbols", signals[signals["liquid"]])
+    show("illiquid symbols", signals[~signals["liquid"]])
+    busiest = signals.groupby("date").size().sort_values(ascending=False)
+    examples = config["busy_week_examples"]
+    print(
+        f"\nBusiest weeks hold {100 * busiest.head(examples).sum() / busiest.sum():.0f}% "
+        f"of signals: "
+        + ", ".join(f"{date.date()} n={count}" for date, count in busiest.head(examples).items())
+    )
+    excluded = signals[~signals["date"].isin(busiest.head(examples).index)]
+    show("excluding busiest weeks", excluded)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

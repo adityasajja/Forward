@@ -38,12 +38,11 @@ Usage::
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from atr.research.hunt import (
+from forward.research.hunt import (
     ETF_COSTS,
     STOCK_COSTS,
     Result,
@@ -55,10 +54,11 @@ from atr.research.hunt import (
     split_halves,
     stock_universe,
 )
+from forward.data.cached_market_frames import CachedMarketFramesAdapter
+from forward.config.settings import research_data_root
 
-ROOT = Path(__file__).resolve().parents[1]
-DAILY = ROOT / "data" / "iifl_daily" / "NSEEQ"
-OUT = ROOT / "data" / "research" / "stock_momentum.json"
+OUT = research_data_root() / "research" / "stock_momentum.json"
+HISTORY = CachedMarketFramesAdapter()
 
 MIN_BARS = 1500
 LIQUIDITY_BARS = 250      # early sub-window used to pick the liquid names
@@ -80,12 +80,9 @@ def early_liquidity(symbols: list[str], bars: int = LIQUIDITY_BARS) -> pd.Series
     is in the universe.
     """
     out: dict[str, float] = {}
-    for symbol in symbols:
-        path = DAILY / f"{symbol}.parquet"
-        try:
-            frame = pd.read_parquet(path, columns=["ts", "close", "volume"])
-        except Exception:  # noqa: BLE001 - a corrupt file is simply not liquid
-            continue
+    frames = HISTORY.frames("NSEEQ", symbols)
+    for symbol, frame in frames.items():
+        frame = frame[["ts", "close", "volume"]]
         frame = frame.dropna(subset=["close", "volume"]).sort_values("ts").head(bars)
         if len(frame) < bars:
             continue
@@ -95,11 +92,11 @@ def early_liquidity(symbols: list[str], bars: int = LIQUIDITY_BARS) -> pd.Series
 
 def build_panel() -> tuple[pd.DataFrame, pd.Timestamp, list[str]]:
     """Closes for the liquid long-history names, trimmed of partial trailing bars."""
-    symbols = stock_universe(min_bars=MIN_BARS)
+    symbols = stock_universe(HISTORY, min_bars=MIN_BARS)
     liquidity = early_liquidity(symbols)
     chosen = list(liquidity.head(UNIVERSE_SIZE).index)
 
-    panel = load_panel(chosen, min_bars=MIN_BARS)
+    panel = load_panel(chosen, history=HISTORY, min_bars=MIN_BARS)
     # The broker cache's last day or two is often a partial snapshot; a bar where
     # most names are missing would fabricate a rebalance out of nothing.
     coverage = panel.notna().sum(axis=1)
@@ -248,7 +245,9 @@ def main() -> None:
     print("same-universe equal-weight buy-and-hold (SURVIVORSHIP-BIASED level):")
     print("  full ", bench["full"])
 
-    nifty = load_panel(["NIFTYBEES"], etf=True, min_bars=1000)
+    nifty = load_panel(
+        ["NIFTYBEES"], history=HISTORY, etf=True, min_bars=1000
+    )
     nifty = nifty[(nifty.index >= traded.index[0]) & (nifty.index <= traded.index[-1])]
     nifty_res = buy_and_hold(nifty, "NIFTYBEES", ETF_COSTS)
     nifty_metrics = nifty_res.metrics()

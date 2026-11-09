@@ -14,20 +14,18 @@ Verifies:
 
 import pytest
 
-from atr.execution.risk import RiskEngine, RiskLimits, Side
-from atr.services.portfolio import (
-    BookPosition,
+from forward.execution.risk import RiskEngine, RiskLimits, Side
+from forward.services.portfolio_models import (
     DeploymentSlice,
     PortfolioBook,
-    PortfolioPolicy,
-    evaluate_order,
 )
-from atr.strategy.sizing import (
+from forward.services.portfolio_policy import PortfolioPolicy
+from forward.services.portfolio_risk import evaluate_order
+from forward.strategy.sizing import (
     PositionSizingEngine,
     RoundingRule,
     SizingConfig,
     SizingMethod,
-    SizingResult,
 )
 
 
@@ -251,7 +249,7 @@ def test_capping_by_available_capital():
 
 
 def test_equivalence_across_backtest_and_paper():
-    from atr.backtest.sizing import SizingPlan
+    from forward.backtest.sizing import SizingPlan
 
     # Both must return the exact same 100 shares for identical inputs
     plan = SizingPlan(
@@ -293,7 +291,9 @@ def test_pipeline_cannot_bypass_risk_engine_or_portfolio_gate():
 
     # 1. Downstream Strategy Risk Engine check
     # Let's say RiskEngine has max_order_notional = 50,000 (100 shares * 1000 = 100,000 exceeds it)
-    from atr.core.models import Instrument, Order
+    from forward.core.instrument_models import Instrument
+    from forward.core.order_models import Order
+
     inst = Instrument(symbol="INFY", multiplier=1.0)
     order = Order(
         instrument=inst,
@@ -306,10 +306,12 @@ def test_pipeline_cannot_bypass_risk_engine_or_portfolio_gate():
         equity = 500_000.0
         gross_exposure = 0.0
         positions = {}
+
         def position(self, s):
             class P:
                 quantity = 0.0
                 last_price = 1000.0
+
             return P()
 
     limits = RiskLimits(max_order_notional=50_000.0)

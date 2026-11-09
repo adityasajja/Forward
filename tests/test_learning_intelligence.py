@@ -10,27 +10,29 @@ Exercises:
 
 from __future__ import annotations
 
-import json
 from datetime import UTC, datetime
-import pytest
 
-from atr.appdb.repositories import LearningObservationRepository
-from atr.appdb.schema import learning_observations
-from atr.research.learning_stats import BucketVerdict, summarise, compare_bucket
-from atr.services.learning import (
-    LearningDataset,
-    LearningService,
-    DailyLearningReport,
-    PerformanceAnalysis,
-    GRADE_FORWARD,
-    GRADE_IN_SAMPLE,
-)
+from forward.appdb.daily_learning_storage import SqlDailyLearningStorage
+from forward.appdb.learning_observation_repository import LearningObservationRepository
+from forward.appdb.learning_storage import SqlLearningStorage
+from forward.appdb.portfolio_storage import SqlPortfolioStorage
+from forward.data.learning_artifacts import LocalLearningArtifactsAdapter
+from forward.research.learning_stats import compare_bucket
+from forward.services.learning import LearningService
+from forward.services.learning_dataset_model import LearningDataset
+from tests.market_data_fakes import InMemoryMarketFramesPort
 
 
 def test_bucket_verdict_explicit_metric_fields():
     """Verify BucketVerdict.as_dict exposes sample_size, win_rate, mean, median, PF, and sample_adequacy."""
     # Adequate sample: 35 values
-    values = [10.0, 15.0, -5.0, 20.0, -2.0, 8.0, 12.0, -4.0, 14.0, 6.0] * 3 + [5.0, -1.0, 7.0, 9.0, 11.0]
+    values = [10.0, 15.0, -5.0, 20.0, -2.0, 8.0, 12.0, -4.0, 14.0, 6.0] * 3 + [
+        5.0,
+        -1.0,
+        7.0,
+        9.0,
+        11.0,
+    ]
     baseline = [2.0, -1.0, 3.0, 1.0, 0.0] * 7
     verdict = compare_bucket("test_bucket", values, baseline)
     d = verdict.as_dict()
@@ -98,36 +100,40 @@ def test_learning_service_backtest_vs_forward(app_db, tmp_path):
     rows = []
     # 20 backtest trades
     for i in range(20):
-        rows.append({
-            "source": "BACKTEST",
-            "evidence_class": "BACKTEST",
-            "evidence_grade": "in_sample",
-            "strategy_id": "trend_follow",
-            "strategy_key": "trend_follow",
-            "strategy_version": 1,
-            "exit_ts": "2026-01-10T15:30:00Z",
-            "entry_price": 100.0,
-            "exit_price": 105.0 if i % 2 == 0 else 98.0,
-            "net_pnl": 500.0 if i % 2 == 0 else -200.0,
-            "return_pct": 0.05 if i % 2 == 0 else -0.02,
-            "market_regime": "trending_up",
-        })
+        rows.append(
+            {
+                "source": "BACKTEST",
+                "evidence_class": "BACKTEST",
+                "evidence_grade": "in_sample",
+                "strategy_id": "trend_follow",
+                "strategy_key": "trend_follow",
+                "strategy_version": 1,
+                "exit_ts": "2026-01-10T15:30:00Z",
+                "entry_price": 100.0,
+                "exit_price": 105.0 if i % 2 == 0 else 98.0,
+                "net_pnl": 500.0 if i % 2 == 0 else -200.0,
+                "return_pct": 0.05 if i % 2 == 0 else -0.02,
+                "market_regime": "trending_up",
+            }
+        )
     # 15 paper forward trades
     for i in range(15):
-        rows.append({
-            "source": "PAPER",
-            "evidence_class": "PAPER_FORWARD",
-            "evidence_grade": "forward",
-            "strategy_id": "trend_follow",
-            "strategy_key": "trend_follow",
-            "strategy_version": 1,
-            "exit_ts": "2026-09-15T15:30:00Z",
-            "entry_price": 200.0,
-            "exit_price": 208.0 if i % 3 != 0 else 195.0,
-            "net_pnl": 800.0 if i % 3 != 0 else -500.0,
-            "return_pct": 0.04 if i % 3 != 0 else -0.025,
-            "market_regime": "trending_up",
-        })
+        rows.append(
+            {
+                "source": "PAPER",
+                "evidence_class": "PAPER_FORWARD",
+                "evidence_grade": "forward",
+                "strategy_id": "trend_follow",
+                "strategy_key": "trend_follow",
+                "strategy_version": 1,
+                "exit_ts": "2026-09-15T15:30:00Z",
+                "entry_price": 200.0,
+                "exit_price": 208.0 if i % 3 != 0 else 195.0,
+                "net_pnl": 800.0 if i % 3 != 0 else -500.0,
+                "return_pct": 0.04 if i % 3 != 0 else -0.025,
+                "market_regime": "trending_up",
+            }
+        )
 
     dataset = LearningDataset(rows=rows, missing_features={}, generated_at=datetime.now(UTC))
 
@@ -135,7 +141,14 @@ def test_learning_service_backtest_vs_forward(app_db, tmp_path):
         def build(self, **_kwargs):
             return dataset
 
-    service = LearningService(db=app_db, builder=MockBuilder(), cache_root=tmp_path)
+    service = LearningService(
+        market_history=InMemoryMarketFramesPort({}),
+        portfolio_storage=SqlPortfolioStorage(app_db),
+        storage=SqlLearningStorage(app_db),
+        daily_learning_storage=SqlDailyLearningStorage(app_db),
+        builder=MockBuilder(),
+        artifacts=LocalLearningArtifactsAdapter(tmp_path),
+    )
     comp = service.backtest_vs_forward(strategy="trend_follow")
 
     assert comp["strategy"] == "trend_follow"
@@ -149,14 +162,15 @@ def test_learning_service_backtest_vs_forward(app_db, tmp_path):
     records = service.record_observations(strategy_id="trend_follow", min_sample=10)
     assert isinstance(records, list)
 
-    listed = service.list_observations(strategy_id="trend_follow")
+    listed = service.list_observations(strategy_id="trend_follow", limit=100)
     assert isinstance(listed, list)
 
 
 def test_learning_api_routes(app_db):
     """Test API router endpoints for observations and backtest-vs-forward."""
     from fastapi.testclient import TestClient
-    from atr.api.main import app
+
+    from forward.api.main import app
 
     client = TestClient(app)
     resp = client.get("/api/v1/learning/backtest-vs-forward")
