@@ -1,25 +1,27 @@
-# atr — Data Model
+# Forward — Data Model
 
-Companion to `docs/ARCHITECTURE.md`. Sections 1, 3 and 4 are **normative** — the
-DDL there matches `src/atr/appdb/schema.py` exactly, table for table, and is
-covered by `tests/test_appdb_trading.py` and `tests/test_watchlists.py`. Section 2
-is a **specification** for a later phase: it exists so the design is settled before
-the code is written, not to claim the tables exist.
+Companion to `docs/ARCHITECTURE.md`. DDL marked **shipped** documents the tables
+registered through `src/forward/appdb/schema_registry.py`. The shared metadata
+currently contains 31 tables: 19 core identity, trading, strategy, and system
+tables listed below, plus 12 feature tables for backtests, learning, options,
+portfolio policy, signal context, experiments, and attribution. Section 2 is a
+specification for a future time-series storage tier; those tables are not part
+of the current application schema.
 
-The control plane currently holds **19 tables**: `users`, `sessions`, `api_keys`,
+The core identity, trading, strategy, and system tiers contain **19 tables**:
+`users`, `sessions`, `api_keys`,
 `watchlists`, `watchlist_items`, `watchlist_columns`, `user_preferences`,
 `audit_events` (§1) and `orders`, `order_events`, `order_intents`, `deployments`,
 `reconciliation_runs`, `trade_journal`, `strategies`, `strategy_versions`,
-`backtest_runs`, `screener_scans` (§3–4) and `system_state` (§6).and `system_state` (§6).
+`backtest_runs`, `screener_scans` (§3–4), and `system_state` (§6).
 
 ---
 
-## 1. Control plane — `atr/appdb` (Phase 1, shipped)
+## 1. Control plane — `forward/appdb` (Phase 1, shipped)
 
 Store: SQLite by default (`data/app.db`), Postgres by setting `APP_DB_URL`.
-Low volume, relational, zero setup. The market-data and trading tiers stay on
-Postgres/TimescaleDB — they have a different shape and a different scale, and
-merging them would force TimescaleDB on every install.
+Low volume, relational, zero setup. Historical market data uses file-backed
+adapters; trading records are stored in this application database.
 
 ### Design rules
 
@@ -44,6 +46,7 @@ CREATE TABLE users (
     is_active     BOOLEAN      NOT NULL DEFAULT 1,
     mfa_enabled   BOOLEAN      NOT NULL DEFAULT 0,
     mfa_secret    TEXT,                    -- base32 TOTP seed, encrypted at rest
+    mfa_last_counter INTEGER,              -- highest accepted TOTP counter; blocks replay
     failed_logins INTEGER      NOT NULL DEFAULT 0,
     locked_until  TIMESTAMP,               -- brute-force backoff
     created_at    TIMESTAMP    NOT NULL,
@@ -62,7 +65,7 @@ user-defined, this becomes `roles` + `user_roles` — a migration, not a redesig
 CREATE TABLE sessions (
     session_id    VARCHAR(32) PRIMARY KEY,
     user_id       VARCHAR(32) NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
-    token_hash    CHAR(64)    NOT NULL UNIQUE,  -- sha256(token); token itself never stored
+    token_hash    VARCHAR(64) NOT NULL UNIQUE,  -- sha256(token); token itself never stored
     created_at    TIMESTAMP   NOT NULL,
     expires_at    TIMESTAMP   NOT NULL,
     last_seen_at  TIMESTAMP,
@@ -91,8 +94,8 @@ CREATE TABLE api_keys (
     key_id       VARCHAR(32) PRIMARY KEY,
     user_id      VARCHAR(32) NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
     label        VARCHAR(64) NOT NULL,
-    prefix       VARCHAR(12) NOT NULL,   -- "atr_ab12cd" — the only part shown in the UI
-    key_hash     CHAR(64)    NOT NULL UNIQUE,
+    prefix       VARCHAR(12) NOT NULL,   -- "forward_ab12cd" — the only part shown in the UI
+    key_hash     VARCHAR(64) NOT NULL UNIQUE,
     scopes       TEXT        NOT NULL,   -- comma-separated permissions
     created_at   TIMESTAMP   NOT NULL,
     expires_at   TIMESTAMP,
@@ -102,7 +105,7 @@ CREATE TABLE api_keys (
 CREATE INDEX ix_api_keys_user ON api_keys(user_id);
 ```
 
-Key format: `atr_<prefix>_<secret>`. Only `prefix` is stored in the clear, so the
+Key format: `forward_<prefix>_<secret>`. Only `prefix` is stored in the clear, so the
 UI can show "which key is this" without the database being able to reconstruct it.
 
 ### 1.4 `watchlists` / `watchlist_items` / `watchlist_columns`
@@ -237,13 +240,12 @@ boolean `is_admin`:
 
 ---
 
-## 2. Market data tier (Postgres + TimescaleDB)
+## 2. Market data tier (proposed TimescaleDB schema)
 
-**Shipped today** (`src/atr/data/store.py`): `instruments`, `bars`, `ticks`,
-`orders`, `fills`. Hypertables on `bars`/`ticks`, compression policies, and a
-`bars_pk` that includes the partition column `ts` as TimescaleDB requires.
-
-**Specified, not built:**
+The former `forward.data.store` Postgres/TimescaleDB module has been removed.
+Historical prices currently use the file-backed market adapters under
+`src/forward/data`, including Parquet history. The tables below are a future
+storage proposal; they are not part of the current application schema.
 
 ```sql
 -- Option chain snapshots. One row per (ts, underlying, expiry, strike).
@@ -308,20 +310,17 @@ CREATE TABLE expiry_calendar (
 );
 ```
 
-Adjustment policy, stated so it cannot be quietly wrong: **prices are stored
-unadjusted and adjusted on read**, using `corporate_actions`. Storing adjusted
-prices destroys the ability to reconstruct what actually traded, and a
-back-adjusted series changes retroactively every time a new action occurs. The
-backtester applies the adjustment factor at load time and records the factor used
-in the run metadata, so a result is reproducible.
+Proposed adjustment policy: store raw prices and apply corporate actions on read.
+This policy depends on the proposed `corporate_actions` table and does not describe
+the current file-backed adjustment path in `forward.data.market_history`.
 
 ---
 
 ## 3. Trading tier
 
 **Shipped 2026-09-14:** `orders`, `order_events`, `order_intents`, `deployments`,
-`reconciliation_runs`, `trade_journal` — all in `atr/appdb/schema.py`, with
-repositories in `atr/appdb/repositories.py` and tests in
+`reconciliation_runs`, `trade_journal` — all in `forward/appdb/schema.py`, with
+focused repositories in `forward/appdb/` and tests in
 `tests/test_appdb_trading.py`.
 
 Three deviations from the original spec in this section, each for a reason:
@@ -336,8 +335,8 @@ Three deviations from the original spec in this section, each for a reason:
    `to_status` is `PARTIALLY_FILLED` or `FILLED` with `filled_qty`/`filled_price`
    set. Positions and P&L are folds over those rows. A separate fill table would be
    a second copy of the same facts with no way to tell which one is right when they
-   disagree. The Postgres `orders`/`fills` DDL in `atr/data/store.py` is
-   **deprecated** — nothing ever called it.
+   disagree. The former Postgres `orders`/`fills` store has been removed; the
+   current order and fill records are in `forward/appdb`.
 3. **`order_intents` gained `user_id`.** See the note on key derivation below.
 
 ```sql
@@ -404,7 +403,7 @@ CREATE INDEX ix_order_events_ts    ON order_events(ts);
 
 -- Idempotency guard. The primary key IS the mechanism, not a convention.
 CREATE TABLE order_intents (
-    idempotency_key CHAR(64) PRIMARY KEY,
+    idempotency_key VARCHAR(64) PRIMARY KEY,
     order_id        VARCHAR(32) NOT NULL REFERENCES orders(order_id) ON DELETE CASCADE,
     user_id         VARCHAR(32) NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
     strategy_id     VARCHAR(32),
@@ -426,8 +425,8 @@ from a cost model at read time. Two reasons, and the second is the load-bearing 
 * recomputing would silently restate history every time a rate changed;
 * it is what lets the paper ledger be a **faithful fold** over this table —
   positions, cash and net P&L all derive from these rows, with no second state store
-  to drift. `atr/services/paper.py` replays them into the existing
-  `atr.backtest.portfolio.Portfolio`, which asserts `equity == cash + market value`
+  to drift. `forward/services/paper_ledger.py` replays them into the existing
+  `forward.backtest.portfolio.Portfolio`, which asserts `equity == cash + market value`
   after every fill.
 
 **Key derivation.** The key is
@@ -436,7 +435,7 @@ from a cost model at read time. Two reasons, and the second is the load-bearing 
 a *shared registry* entry: two accounts running `engine_key="ema_cross"` would
 otherwise produce the same key for the same signal, and the second account would be
 handed the first account's order id. See `idempotency_key_for` in
-`atr/appdb/repositories.py`.
+`forward/execution/oms.py`.
 
 The guard is the `INSERT` itself — a `SELECT` first would leave a window between
 the check and the write, and a duplicate order is exactly what gets created inside
@@ -515,6 +514,7 @@ CREATE TABLE trade_journal (
     regime         VARCHAR(24),        -- from the regime engine
     signal_reason  TEXT,
     exit_reason    VARCHAR(32),        -- the closing order's own reason
+    exit_detail    TEXT,               -- full explanation from the closing rule
     slippage_bps   DOUBLE PRECISION,   -- mean of the measurable legs
     evidence_grade VARCHAR(16),        -- 'forward' | 'in_sample'
     notes          TEXT,
@@ -525,9 +525,9 @@ CREATE TABLE trade_journal (
 `mfe`/`mae` are stored rather than derived because they require the intra-trade
 path, which the order-event log does not preserve once a position is netted.
 `duration_sec` *is* derived, from `entry_ts`/`exit_ts` at close time, so the two
-cannot disagree. `exit_reason`, `slippage_bps` and `evidence_grade` were added
-after the table shipped; `AppDatabase.ADDITIVE_COLUMNS` is how an existing
-database gets them.
+cannot disagree. `exit_reason`, `exit_detail` and `evidence_grade` are added to an
+existing database through `AppDatabase.ADDITIVE_COLUMNS`. `slippage_bps` is also a
+current schema column.
 
 ### `evidence_grade` — the column that decides how much a trade is worth
 
@@ -544,16 +544,16 @@ conservative.
 
 The four-value `evidence_class` (BACKTEST, IN_SAMPLE, PAPER_FORWARD,
 LIVE_FORWARD) and the two-value `evidence_grade` (`forward`, `in_sample`) are
-defined once, in `atr/research/learning_evidence.py`, and the grade is derived
+defined once, in `forward/core/learning_evidence.py`, and the grade is derived
 from the class by `grade_of` — so a record cannot carry a grade that disagrees
-with its class. `atr.services.learning` stamps both onto every dataset row.
+with its class. `forward.services.learning` stamps both onto every dataset row.
 
 ---
 
 ## 4. Strategy tier
 
 **Shipped 2026-09-14:** `strategies`, `strategy_versions`, `backtest_runs`,
-`screener_scans`. The Python registry (`atr.strategy.registry`) is unchanged and
+`screener_scans`. The Python registry (`forward.strategy.registry`) is unchanged and
 still the execution path for a `code` strategy — a persisted strategy either points
 at a registry entry via `engine_key` or is defined entirely by its JSON rules.
 
@@ -582,7 +582,7 @@ CREATE TABLE strategy_versions (
     author_user_id VARCHAR(32) NOT NULL,
     created_at     TIMESTAMPTZ NOT NULL,
     definition     TEXT        NOT NULL,   -- canonical JSON of rules / params / code
-    definition_hash CHAR(64)   NOT NULL,   -- sha256 of definition; dedupes identical versions
+    definition_hash VARCHAR(64) NOT NULL,  -- sha256 of definition; dedupes identical versions
     change_note    TEXT,
     is_deployed    BOOLEAN     NOT NULL DEFAULT 0,
     PRIMARY KEY (strategy_id, version)
@@ -620,7 +620,7 @@ CREATE TABLE backtest_runs (
     status         VARCHAR(12) NOT NULL DEFAULT 'QUEUED',  -- QUEUED|RUNNING|COMPLETED|FAILED|CANCELLED
     progress       DOUBLE PRECISION NOT NULL DEFAULT 0,
     config         TEXT NOT NULL,          -- JSON: dates, symbols, capital, costs
-    data_fingerprint CHAR(64),             -- sha256 of the price panel used
+    data_fingerprint VARCHAR(64),          -- sha256 of the price panel used
     metrics        TEXT,                   -- JSON summary, written once on completion
     error          TEXT
 );
@@ -671,19 +671,19 @@ CREATE TABLE backtest_trades (
     trade_id     INTEGER PRIMARY KEY AUTOINCREMENT,
     run_id       VARCHAR(32) NOT NULL REFERENCES backtest_runs(run_id) ON DELETE CASCADE,
     seq          INTEGER NOT NULL,       -- 0-based, stable order within a run
-    symbol       VARCHAR(32) NOT NULL,
+    symbol       VARCHAR(64) NOT NULL,
     direction    VARCHAR(6)  NOT NULL,   -- LONG | SHORT, stored rather than inferred
     quantity     DOUBLE PRECISION NOT NULL,
     entry_ts     TIMESTAMPTZ NOT NULL,
     entry_price  DOUBLE PRECISION NOT NULL,
     exit_ts      TIMESTAMPTZ,
     exit_price   DOUBLE PRECISION,
-    gross_pnl    DOUBLE PRECISION,
-    commission   DOUBLE PRECISION,
-    net_pnl      DOUBLE PRECISION,
+    gross_pnl    DOUBLE PRECISION NOT NULL DEFAULT 0,
+    commission   DOUBLE PRECISION NOT NULL DEFAULT 0,
+    net_pnl      DOUBLE PRECISION NOT NULL DEFAULT 0,
     return_pct   DOUBLE PRECISION,
     duration_days DOUBLE PRECISION,
-    exit_reason  VARCHAR(32),            -- signal | stop_loss | take_profit | trailing_stop
+    exit_reason  VARCHAR(24),            -- signal | stop_loss | take_profit | trailing_stop | end_of_test
     signal_reason TEXT,                  -- the strategy's own words, or NULL
     strategy_id  VARCHAR(32),
     strategy_version INTEGER
@@ -693,7 +693,7 @@ CREATE TABLE backtest_trades (
 CREATE TABLE backtest_curves (
     curve_id  INTEGER PRIMARY KEY AUTOINCREMENT,
     run_id    VARCHAR(32) NOT NULL REFERENCES backtest_runs(run_id) ON DELETE CASCADE,
-    kind      VARCHAR(12) NOT NULL,      -- equity | drawdown | exposure | cash
+    kind      VARCHAR(16) NOT NULL,      -- equity | drawdown | exposure | cash
     seq       INTEGER NOT NULL,
     ts        TIMESTAMPTZ NOT NULL,
     value     DOUBLE PRECISION NOT NULL
@@ -719,7 +719,7 @@ filter on `status NOT IN ('COMPLETED','FAILED','CANCELLED')`, so a late straggle
 from the worker cannot overwrite a finished run's metrics.
 
 ```sql
--- Saved screens. The condition tree is opaque to this layer; `atr.screener` owns
+-- Saved screens. The condition tree is opaque to this layer; `forward.screener` owns
 -- its shape and validates it on the way in.
 CREATE TABLE screener_scans (
     scan_id     VARCHAR(32) PRIMARY KEY,
@@ -785,7 +785,7 @@ installation* rather than to a user.
 
 ```sql
 -- Key/value state for the installation. Holds the kill switch and the execution
--- mode, both of which used to be an in-process dict in atr/api/main.py.
+-- mode, both of which used to be an in-process dict in forward/api/main.py.
 CREATE TABLE system_state (
     key        VARCHAR(64) PRIMARY KEY,
     value      TEXT,
@@ -809,7 +809,7 @@ Two failures are fixed by making this durable rather than in-memory:
 * **There was one reader per route.** Each endpoint consulted the dict itself, so
   "is the kill switch engaged?" had as many answers as there were routes — and the
   manual order route did not ask at all. It is now read through
-  ``atr.services.risk.RiskStateService``, and the OMS's risk gate is built from it,
+  ``forward.services.risk.RiskStateService``, and the OMS's risk gate is built from it,
   so the switch applies to every order path.
 
 Keys in use: ``risk.kill_switch``, ``risk.execution_mode``,
@@ -817,74 +817,58 @@ Keys in use: ``risk.kill_switch``, ``risk.execution_mode``,
 
 ---
 
-## 8. Portfolio tier
+## 7. Learning & Optimization tier (Shipped)
 
-**Shipped 2026-09-18.** One row per user, holding the capital-allocation
-policy the portfolio risk gate enforces: portfolio limits, conflict handling
-and strategy priorities.
-
-```sql
-CREATE TABLE portfolio_policies (
-    user_id    VARCHAR(32) PRIMARY KEY REFERENCES users(user_id) ON DELETE CASCADE,
-    policy     TEXT NOT NULL,
-    updated_at TIMESTAMPTZ NOT NULL,
-    updated_by VARCHAR(64),
-    reason     TEXT
-);
-```
-
-Why this is not `system_state`: that table belongs to the installation (kill
-switch, execution mode), while capital allocation belongs to whoever owns the
-paper book. Per-user rows keep one account's limits from constraining another.
-No policy row means no portfolio limits — the gate passes everything through,
-which is the pre-policy behaviour, and every figure the dashboard shows is
-still computed.
-
----
-
-## 5. Learning & Optimization tier (Shipped)
-
-### 5.1 `learning_observations`
+### 7.1 `learning_observations`
 Persisted learning records representing in-sample, forward paper, and live trading observations.
 
 ```sql
 CREATE TABLE learning_observations (
     observation_id   VARCHAR(36) PRIMARY KEY,
-    trade_id         VARCHAR(36),
-    strategy_id      VARCHAR(36) NOT NULL,
+    strategy_id      VARCHAR(32) NOT NULL,
     strategy_version INTEGER,
+    date             VARCHAR(10) NOT NULL, -- YYYY-MM-DD
+    created_at       TIMESTAMP NOT NULL,
+    metric           VARCHAR(64) NOT NULL,
+    condition_bucket VARCHAR(128) NOT NULL,
+    sample_size      INTEGER NOT NULL,
+    statistical_result TEXT NOT NULL,      -- JSON
     evidence_class   VARCHAR(32) NOT NULL,
-    evidence_grade   VARCHAR(32) NOT NULL,
-    is_forward       BOOLEAN NOT NULL,
-    entry_ts         TIMESTAMP NOT NULL,
-    exit_ts          TIMESTAMP,
-    pnl              REAL,
-    return_pct       REAL,
-    features         TEXT,
-    created_at       TIMESTAMP NOT NULL
+    confidence       FLOAT,
+    source_trades    TEXT                   -- JSON list
 );
 ```
 
-### 5.2 `optimization_recommendations`
+### 7.2 `optimization_recommendations`
 Controlled strategy optimization recommendations generated from empirical forward evidence.
 
 ```sql
 CREATE TABLE optimization_recommendations (
     recommendation_id VARCHAR(36) PRIMARY KEY,
-    hypothesis_id     VARCHAR(36) NOT NULL,
-    strategy_id       VARCHAR(36) NOT NULL,
-    from_version      INTEGER NOT NULL,
-    to_version        INTEGER,
-    status            VARCHAR(32) NOT NULL,
-    candidate_changes TEXT NOT NULL,
-    validation_report TEXT NOT NULL,
+    strategy_id       VARCHAR(32) NOT NULL REFERENCES strategies(strategy_id) ON DELETE CASCADE,
+    source_strategy_version INTEGER NOT NULL,
+    target_strategy_version INTEGER,
+    parameter         VARCHAR(64) NOT NULL,
+    current_value     FLOAT NOT NULL,
+    proposed_value    FLOAT NOT NULL,
+    reason            TEXT NOT NULL,
+    source_observations TEXT NOT NULL,      -- JSON
+    sample_size       INTEGER NOT NULL,
+    baseline_metrics TEXT NOT NULL,         -- JSON
+    candidate_metrics TEXT NOT NULL,        -- JSON
+    walk_forward_metrics TEXT NOT NULL,     -- JSON
+    robustness_results TEXT NOT NULL,       -- JSON
+    confidence        VARCHAR(16),
+    status            VARCHAR(16) NOT NULL DEFAULT 'PROPOSED',
+    rejection_reason  TEXT,
     created_at        TIMESTAMP NOT NULL,
-    approved_at       TIMESTAMP,
-    approved_by       VARCHAR(36)
+    updated_at        TIMESTAMP NOT NULL,
+    reviewed_by       VARCHAR(64),
+    reviewed_at       TIMESTAMP
 );
 ```
 
-### 5.3 `strategy_experiments`
+### 7.3 `strategy_experiments`
 
 A controlled experiment measures a candidate strategy version against the
 version it came from. The experiment **records and reports**; it never promotes
@@ -917,7 +901,7 @@ CREATE TABLE strategy_experiments (
 
 ---
 
-## 7. Signal context tier (Shipped)
+## 8. Signal context tier (Shipped)
 
 **Shipped 2026-09-17.** One table, `signal_contexts`, records the market, sector
 and stock context of every signal the platform raises, together with the
@@ -935,7 +919,7 @@ CREATE TABLE signal_contexts (
     signal_source          VARCHAR(16) NOT NULL,      -- LIVE | PAPER | BACKTEST
     signal_ts              VARCHAR(40) NOT NULL,
     context_model_version  VARCHAR(24) NOT NULL,
-    context_class          VARCHAR(24) NOT NULL,      -- STRONG | NEUTRAL | WEAK | INSUFFICIENT_DATA
+    context_class          VARCHAR(24) NOT NULL,      -- STRONG_CONTEXT | NEUTRAL_CONTEXT | WEAK_CONTEXT | INSUFFICIENT_DATA
     context_score          INTEGER NOT NULL DEFAULT 0,
     max_possible_score     INTEGER NOT NULL DEFAULT 0,
     has_insufficient_data  BOOLEAN NOT NULL DEFAULT FALSE,
@@ -972,26 +956,19 @@ Why this exists and why it is shaped this way:
 
 ---
 
-## 8. Portfolio tier — Capital Allocation & Portfolio Risk
+## 9. Portfolio tier — Capital Allocation & Portfolio Risk
 
-### 8.1 `portfolio_policies`
+### 9.1 `portfolio_policies`
 
 Stores per-user aggregate risk limits and signal conflict resolution policies.
 
 ```sql
 CREATE TABLE portfolio_policies (
     user_id                  VARCHAR(32) PRIMARY KEY REFERENCES users(user_id) ON DELETE CASCADE,
-    policy_json              TEXT NOT NULL,
-    max_total_exposure       DOUBLE PRECISION,
-    max_daily_loss           DOUBLE PRECISION,
-    max_capital_per_strategy DOUBLE PRECISION,
-    max_open_positions       INTEGER,
-    max_stock_exposure       DOUBLE PRECISION,
-    max_sector_exposure      DOUBLE PRECISION,
-    max_correlated_exposure  DOUBLE PRECISION,
-    conflict_resolution      VARCHAR(32) NOT NULL DEFAULT 'reject',
-    created_at               DATETIME NOT NULL,
-    updated_at               DATETIME NOT NULL
+    policy                   TEXT NOT NULL, -- JSON: limits, conflict handling, priorities
+    updated_at               TIMESTAMP NOT NULL,
+    updated_by               VARCHAR(64),
+    reason                   TEXT
 );
 ```
 
@@ -999,7 +976,7 @@ CREATE TABLE portfolio_policies (
 
 ---
 
-## 8. Post-trade attribution tier (Shipped)
+## 10. Post-trade attribution tier (Shipped)
 
 **Shipped 2026-09-17.** One table, `trade_attributions`, holds the nine-branch
 attribution of every closed trade: what the signal was, what the context was, what
@@ -1093,15 +1070,57 @@ Why this exists and why it is shaped this way:
 
 ---
 
-## 9. Migrations
+## 11. Options tier
+
+The options workflow stores imported datasets and the results of options backtests
+and forward runs. File paths point to the prepared bars and instrument metadata;
+run results are JSON snapshots owned by these records.
+
+```sql
+CREATE TABLE options_datasets (
+    dataset_id      VARCHAR(32) PRIMARY KEY,
+    user_id         VARCHAR(32) NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+    name            VARCHAR(128) NOT NULL,
+    bars_path       TEXT NOT NULL,
+    instruments_path TEXT NOT NULL,
+    bar_count       INTEGER NOT NULL,
+    symbol_count    INTEGER NOT NULL,
+    created_at      TIMESTAMP NOT NULL
+);
+
+CREATE TABLE options_backtest_runs (
+    run_id           VARCHAR(32) PRIMARY KEY,
+    user_id          VARCHAR(32) NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+    strategy_id      VARCHAR(32) NOT NULL REFERENCES strategies(strategy_id) ON DELETE CASCADE,
+    strategy_version INTEGER NOT NULL,
+    dataset_id       VARCHAR(32) NOT NULL REFERENCES options_datasets(dataset_id) ON DELETE RESTRICT,
+    status           VARCHAR(16) NOT NULL,
+    config           TEXT NOT NULL,
+    result           TEXT,
+    error            TEXT,
+    created_at       TIMESTAMP NOT NULL,
+    finished_at      TIMESTAMP
+);
+
+CREATE TABLE options_forward_runs (
+    run_id           VARCHAR(32) PRIMARY KEY,
+    user_id          VARCHAR(32) NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+    strategy_id      VARCHAR(32) NOT NULL REFERENCES strategies(strategy_id) ON DELETE CASCADE,
+    strategy_version INTEGER NOT NULL,
+    status           VARCHAR(16) NOT NULL,
+    config           TEXT NOT NULL,
+    snapshot         TEXT,
+    error            TEXT,
+    created_at       TIMESTAMP NOT NULL,
+    finished_at      TIMESTAMP
+);
+```
+
+## 12. Migrations
 
 `AppDatabase.prepare()` calls `create_all()`, which creates missing tables but
-**never alters an existing one**. That is adequate while the schema is only ever
-extended, and it is not adequate for a deployed instance once a column changes.
-
-The trading tier is the point at which that stops being hypothetical: `orders`,
-`order_events` and `strategy_versions` will hold records that must survive a schema
-change. Introducing a real migration tool is tracked in
-`docs/NEXT_STAGE_GAP_REPORT.md`; until it lands, any change to an existing table
-must be accompanied by an explicit note here and a manual `ALTER TABLE`, not by
-hoping `create_all` notices.
+**does not alter existing ones**. It then applies the specific additive columns
+listed in `AppDatabase.ADDITIVE_COLUMNS`; this is not a general migration system.
+Any schema change beyond those listed additions needs a documented migration plan
+before an existing database can use it. A full migration tool is tracked in
+`docs/NEXT_STAGE_GAP_REPORT.md`.

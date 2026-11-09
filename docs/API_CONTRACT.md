@@ -1,11 +1,14 @@
-# atr — API Contract
+# Forward — API Contract
 
 Companion to `docs/ARCHITECTURE.md`. Two parts:
 
 - **Part 1 — shipped.** The routes that exist today (legacy, unversioned) and the
   Phase 1 additions under `/api/v1`.
-- **Part 2 — specified.** The full target surface for Phases 2–4. Nothing in Part 2
-  is implemented; it is written down so the shape is agreed before the code exists.
+- **Part 2 — later phases.** It records shipped additions and the remaining
+  plan. Strategies, screener, backtests, paper trading, monitoring, risk,
+  reconciliation, post-trade analytics, and options backtest/paper workflows
+  have shipped. Remaining work is
+  called out in each section; it is not all waiting to be built.
 
 ## Conventions
 
@@ -17,9 +20,9 @@ a trade worth making. Part 1 marks which is which.
 
 | Credential | Header | Notes |
 |---|---|---|
-| Session cookie | `atr_session=<token>` | HttpOnly, SameSite=Lax, `Secure` when `env=live`. Subject to CSRF checks on unsafe methods. |
+| Session cookie | `forward_session=<token>` | HttpOnly, SameSite=Lax, `Secure` when `env=live`. Subject to CSRF checks on unsafe methods. |
 | Bearer token | `Authorization: Bearer <token>` | Same session token, for non-browser clients. No CSRF check (no ambient authority). |
-| API key | `X-API-Key: atr_<prefix>_<secret>` | Scoped to the key's own permission set. |
+| API key | `X-API-Key: forward_<prefix>_<secret>` | Scoped to the key's own permission set. |
 
 **Errors.** RFC-shaped and consistent:
 
@@ -39,6 +42,7 @@ change wording.
 | 409 | conflict (duplicate name, duplicate symbol in a watchlist) |
 | 422 | schema validation failure (FastAPI default) |
 | 429 | rate limited; `Retry-After` is set |
+| 502/503 | upstream broker failure, or a required service/state is unavailable |
 
 **The 404-not-403 rule is intentional.** Returning 403 for someone else's resource
 confirms that the resource exists. Every ownership failure returns 404.
@@ -105,6 +109,10 @@ than buried, because they are behaviour changes an existing client must know abo
 | WS | `/ws/ticks` | live tick stream |
 | GET | `/ticks/history`, `/ticks/vwap`, `/ticks/candles` | tick-derived series |
 
+`GET /ticks/vwap` returns `vwap: null`, `ticks_count: 0` and `total_qty: 0` when
+the requested window has no positive-size trade ticks. It never reports the last
+traded price as a VWAP.
+
 ### The three tightenings (2026-09-14)
 
 **`POST /orders` and `POST /trade-signals/{id}/execute` require an account.** They
@@ -112,7 +120,7 @@ used to be reachable without one, guarded only by loopback and `ENV != dev`, and
 they called the broker directly with no risk check and no event log. An order needs
 an owner — `orders.user_id` is a non-null foreign key — and an unattributed order
 is one nobody can be asked about. Both now route through
-`atr.services.execution.ExecutionService`, so the risk gate and the event log apply.
+`forward.services.execution.ExecutionService`, so the risk gate and the event log apply.
 
 ```json
 // 401 when no principal is present
@@ -134,6 +142,17 @@ from someone clearing it by accident. `400` with `code: "reason_required"` other
 The state itself is now **durable** (`system_state`): it was an in-process dict, so a
 restart silently re-armed trading and dropped the platform back to paper.
 
+### Market-data and risk-state failures (updated 2026-11-07)
+
+`GET /health` and the legacy risk status routes return `503 risk_state_unavailable`
+when durable risk state cannot be read. They do not report `paper` as a guessed
+safe state. `GET /candles` requires a valid broker session for broker history; an
+authentication failure is returned instead of silently switching to cached bars.
+
+`GET /api/v1/watchlists/{id}/quotes` requires complete live quote coverage by
+default. It returns an error when a symbol cannot be priced or the broker request
+fails. Use `?live=false` to choose the local cached quote path explicitly.
+
 ## 1.2 Phase 1 additions — `/api/v1`
 
 ### Authentication — `/api/v1/auth`
@@ -142,7 +161,7 @@ restart silently re-armed trading and dropped the platform back to paper.
 |---|---|---|---|
 | GET | `/bootstrap` | public | `{ needs_setup: bool }` — true when zero users exist. Drives the first-run screen. |
 | POST | `/bootstrap` | public, **only while zero users exist** | Creates the first user as `owner`. Returns a session. 409 once any user exists. |
-| POST | `/register` | public, **only when `atr_allow_signup` is on** | Creates a `viewer`. Off by default — a trading platform should not accept strangers. |
+| POST | `/register` | public, **only when `ALLOW_SIGNUP` is on** | Creates a `viewer`. Off by default — a trading platform should not accept strangers. |
 | POST | `/login` | public | `{ identifier, password, totp_code? }` → `{ token, expires_at, user }`. If the user has MFA on and no code is supplied, returns `202` with `{ mfa_required: true }` and no token. |
 | POST | `/logout` | authenticated | Revokes the current session. |
 | POST | `/logout-all` | authenticated | Revokes every session for the user. |
@@ -181,7 +200,7 @@ lets the client show the code field instead of an error.
 | PUT | `/{id}/items/order` | `watchlist:write` | `{ symbols: [...] }` — the complete new order. |
 | PUT | `/{id}/columns` | `watchlist:write` | The complete column config. Unknown keys rejected with the valid list. |
 | GET | `/columns/available` | `watchlist:read` | The column registry: key, label, group, whether it needs live data. |
-| GET | `/{id}/quotes` | `market:read` | Live rows for the watchlist — every column resolved. |
+| GET | `/{id}/quotes` | `market:read` | Requires complete live quote coverage by default; `?live=false` selects cached data. |
 
 `PUT .../items/order` takes the **whole list** rather than a move operation
 (`{symbol, new_index}`). A full-list PUT is idempotent, so a retry after a dropped
@@ -214,7 +233,7 @@ every caller's.
 
 ### Orders — `/api/v1/orders` (shipped 2026-09-14)
 
-Every route goes through `atr.services.orders.OrderService`, so every order in
+Every route goes through `forward.services.orders.OrderService`, so every order in
 this surface is risk-checked, logged as an append-only event sequence, and
 idempotent when asked. `orders.status` is a **projection** of the newest event;
 `GET /{id}/history` is the authoritative record.
@@ -280,7 +299,7 @@ that critical trains an operator to ignore the alarm.
 
 ```json
 { "severity": "warning", "mismatches": 4, "differences": 0, "critical": 0,
-  "error": "no active IIFL session — run `atr login`",
+  "error": "no active IIFL session — run `forward login`",
   "incomparable": [ { "scope": "orders", "reason": "the run failed before this scope was reached" } ] }
 ```
 
@@ -329,17 +348,20 @@ strategy implementation.
 **`POST /deployments` is the one route whose body is closed.** Its Pydantic model
 sets `extra="forbid"`, so the body is exactly
 `{ strategy_id, strategy_version, capital, mode, broker_account, config }` and a
-typo'd field is a 422 rather than a silently ignored key. **There is no top-level
+typo'd field is a 422 rather than a silently ignored key. `config` is required.
+**There is no top-level
 `symbols` or `exchange`** — both live inside `config`, because that column is what
 the runner reads and where a deployment's reproducibility comes from.
 
-**The runner reads its universe from `config.symbols` and nowhere else.**
-`RunnerConfig.from_deployment` reads `symbols`, `exchange`, `interval_seconds`,
-`order_value`, `lookback_days`, `max_open_positions`, `stop_loss_pct` and
-`take_profit_pct` out of that dict, upper-casing the symbols before matching them
-against the price cache. A universe *name* is not resolvable by the loop, so the
-deploy form resolves it client-side; a deployment whose config named one would be
-`RUNNING` and evaluating an empty list forever.
+**The runner requires a complete deployment config.** It must include a
+non-empty `symbols` list, `exchange`, `timeframe`, positive
+`max_open_positions`, and `signal_basis` (`closed_bar` or `live`). Optional
+`symbol_exchanges` maps listed symbols to exchange segments. Optional stop,
+target, and sizing fields are validated when supplied. The operational settings
+`interval_seconds` and `lookback_days` use documented platform defaults of 1
+second and 400 calendar days only when omitted. A universe *name* is not
+resolvable by the loop, so the deploy form resolves it client-side; a deployment
+whose config names a universe is rejected instead of running with no symbols.
 
 **A deployment's strategy *version* is the subject, not its id.** The runner reads
 `(strategy_id, strategy_version)` **by exact number, never "latest"**, and
@@ -492,10 +514,12 @@ Three fields carry the honesty of the `/effectiveness` surface:
 
 ---
 
-# Part 2 — Specified (Phases 2–4)
+# Part 2 — Later phases: shipped work and remaining plan
 
-Shapes are fixed here so the frontend can be built against them; none of it is
-implemented.
+This part records work delivered after the Phase 1 routes and the work that is
+still planned. A section marked **Shipped** describes an implemented surface.
+Only the items marked **Not implemented** or listed in the planned sections
+below remain future work.
 
 ## Strategies — `/api/v1/strategies` (Phase 2)
 
@@ -535,7 +559,7 @@ exists; the emitter can follow.
 ### Two fields that carry the honesty of the surface
 
 **`deployable`** on every version. It is computed by the *runner's own* resolver
-(`atr.strategy.definition.resolve_rules`), so a version marked deployable is one
+(`forward.strategy.definition.resolve_rules`), so a version marked deployable is one
 the live loop will actually trade, and one marked undeployable carries
 `not_deployable_reason`. This cannot drift from behaviour, which is the only
 reason it is worth showing: an unresolvable version produces a deployment that
@@ -548,13 +572,13 @@ indistinguishable from a quiet market.
 "statistical_validation": {
   "performed": false,
   "reason": "structural validation only: it says the definition will execute, not that it will make money. No out-of-sample result is implied.",
-  "how_to_measure": "POST /api/v1/backtests (out-of-sample walk-forward with deflated-Sharpe correction), or `atr research`"
+  "how_to_measure": "POST /api/v1/backtests (out-of-sample walk-forward with deflated-Sharpe correction), or `forward research`"
 }
 ```
 
 `ok: true` means "this will execute". It is not a finding, and the payload says so
 rather than letting a green tick be read as one. The same clause is on the CLI
-(`atr strategy validate`) for the same reason.
+(`forward strategy validate`) for the same reason.
 
 ### Validation codes
 
@@ -607,8 +631,8 @@ a bare registry key, and the runner reports that refusal on the status surface.
 
 ### The worked example
 
-`POST /seed` (and `atr strategy seed`) creates `Example breakout` and its version
-1 from `atr.strategy.example`: a breakout entry with a stop-loss **and** a
+`POST /seed` (and `forward strategy seed`) creates `Example breakout` and its version
+1 from `forward.strategy.example`: a breakout entry with a stop-loss **and** a
 take-profit exit. Both exits are set on purpose — a definition with no live exit
 rule opens positions and never closes one, which produces no closed trade and
 therefore no forward observation. It is idempotent, so it is safe in a setup
@@ -644,17 +668,28 @@ WS     /stream                 live results as events fire
 result. There is no result store behind it, and returning a stale result labelled
 "last results" would be worse than returning a fresh one.
 
-Condition trees are owned by `atr.screener.conditions`. A leaf is
+Condition trees are owned by `forward.screener.conditions`. A leaf is
 `{indicator, op, value|rhs_indicator, period?, rhs_period?, upper?}`; a group is
 `{match: "all"|"any", conditions: [...]}` and nests to 8 levels. The operator set
-is exactly `atr.screener.OPERATORS`.
+is exactly `forward.screener.OPERATORS`.
 
 Every returned row carries `why` (evidence for the leaves that passed) and
 `evidence` (all leaves, including failures), each with the measured value, the
 target, and a sentence. An indicator that could not be computed sets
 `unmeasurable: true` — distinct from `passed: false`.
 
-## Backtest — `/api/v1/backtests` (Phase 2)
+## Backtest — `/api/v1/backtests` (shipped 2026-09-14; extended since)
+
+The run, history, status, options, readiness, metrics, equity, trades, monthly,
+cancellation and Monte Carlo routes are implemented. `GET /{run_id}/equity`
+returns exposure with the equity and drawdown curves. `GET /{run_id}/options`,
+`GET /statuses`, `POST /readiness`, and `GET /{run_id}/hold-benchmark` are also
+implemented. The route module records their current contract.
+
+**Not implemented:** `POST /{run_id}/walk-forward`. The existing `/research`
+workflow performs walk-forward analysis with a deflated-Sharpe correction; a
+second result without that correction would give a weaker and potentially
+misleading measure.
 
 ```
 POST   /                       submit a run → { run_id, status }
@@ -717,7 +752,7 @@ says *flat* — and a monitor that reports an unmeasured day as ₹0 is teaching
 operator to distrust it. `today_since` names the boundary used, so the figure can
 be checked.
 
-## Live algos — `/api/v1/algos` (Phase 3)
+## Remaining plan: Live algos — `/api/v1/algos` (Phase 3)
 
 ```
 GET    /                       live deployments with status + P&L
@@ -729,7 +764,7 @@ GET    /{id}/signals           signal history
 GET    /{id}/execution-log     the latency-trace view
 ```
 
-## Orders / positions / portfolio (Phase 3)
+## Remaining plan: Orders / positions / portfolio (Phase 3)
 
 ```
 GET    /orders                 ?status=&strategy=&since=
@@ -742,15 +777,34 @@ GET    /portfolio              holdings, positions, margin, exposure
 GET    /portfolio/attribution  by strategy | symbol | sector | asset class
 ```
 
-## Options (Phase 4)
+## Options strategy, backtest, and paper workflows (Shipped 2026-11-08)
+
+Options strategies are stored as immutable configuration versions. The shared
+strategy service validates the same definition for backtests and forward paper
+runs. Dataset import accepts historical contract bars and explicit expiry
+metadata; the forward runner simulates fills from IIFL quotes and sends no broker
+orders.
 
 ```
-GET    /options/chain          ?underlying=&expiry=&strikes=
-GET    /options/expiries       ?underlying=
-POST   /options/strategies     build a multi-leg strategy → payoff + greeks + margin
-GET    /options/templates      the named templates
-POST   /options/backtest       options-specific backtest config
+GET    /api/v1/options/strategies
+POST   /api/v1/options/strategies
+POST   /api/v1/options/strategies/{strategy_id}/versions
+POST   /api/v1/options/validate
+POST   /api/v1/options/datasets
+GET    /api/v1/options/datasets
+POST   /api/v1/options/backtests
+GET    /api/v1/options/backtests/{run_id}
+POST   /api/v1/options/forward-runs
+GET    /api/v1/options/forward-runs
+GET    /api/v1/options/forward-runs/{run_id}
+POST   /api/v1/options/forward-runs/{run_id}/stop
+GET    /api/v1/options/contract-master
+POST   /api/v1/options/contract-master/refresh
 ```
+
+**Not implemented:** live option-chain/expiry browsing and named strategy
+templates. The app requires the IIFL contract master to provide explicit weekly
+and monthly expiry metadata; it does not infer the missing labels.
 
 ## Post-trade analytics & attribution (Shipped 2026-09-17)
 
@@ -793,7 +847,7 @@ comparison surface (`by-strategy`) reports every slice *with* its `n` and its
 
 **Shipped 2026-09-14 — see `/api/v1/risk` and `/api/v1/reconciliation` in Part 1 for the implemented surfaces.**
 
-## Alerts, journal, calendar, analytics (Phase 3/4)
+## Remaining plan: Alerts, journal, calendar and analytics (Phase 3/4)
 
 ```
 GET/POST/DELETE /alerts/rules
@@ -806,7 +860,7 @@ GET    /analytics/pnl          ?group_by=strategy|symbol|sector|asset_class
 GET    /analytics/regimes      regime classification over time
 ```
 
-## Developer platform (Phase 5)
+## Remaining plan: Developer platform (Phase 5)
 
 ```
 POST   /apikeys                create (returns secret once)

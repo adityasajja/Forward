@@ -1,7 +1,11 @@
-# atr — Technical Architecture
+# Forward — Historical Architecture Assessment
 
-Status: **Phase 1 in progress**. This document is the design of record. It is
-written against the repository as it actually exists, not against an ideal.
+This document records an assessment from September 2026. Its inventory and
+phase statements describe that snapshot and are not the current design of
+record. The app has since gained application storage adapters, strategy
+authoring, F&O backtests, and quote-driven F&O paper runs. See
+[`ARCHITECTURE_DECISIONS.md`](ARCHITECTURE_DECISIONS.md) for current decisions
+and [`README.md`](../README.md) for current setup and supported workflows.
 
 Companion documents:
 
@@ -30,7 +34,7 @@ the FastAPI process serves `web/dist` via `StaticFiles` and mounts `/assets`.
 
 ### 2. Current backend stack
 
-FastAPI + uvicorn, Python 3.12, **single 2,773-line module** `atr/api/main.py`
+FastAPI + uvicorn, Python 3.12, **single 2,773-line module** `forward/api/main.py`
 holding every route. No `APIRouter`, no dependency injection, no auth middleware.
 SQLAlchemy 2.0 **Core** (not declarative ORM) with an optional Postgres +
 TimescaleDB engine. `pydantic` v2 for request/response models, `pydantic-settings`
@@ -46,30 +50,26 @@ environment. This is a latent break for a clean install.
 
 Three tiers, only one of which is a database:
 
-- **Postgres + TimescaleDB** — optional, lazily connected, `atr/data/store.py`.
+- **Postgres + TimescaleDB** — optional, lazily connected, `forward/data/store.py`.
   Tables `instruments`, `bars`, `ticks`, `orders`, `fills`; hypertables and
   compression set up in `init_schema()`. No migrations (no Alembic) — schema is
   `metadata.create_all`.
 - **Parquet cache** — the tier actually in use. `data/iifl_daily/<EXCHANGE>/<SYM>.parquet`,
-  one file per symbol, written by `atr/data/history.py` from IIFL
+  one file per symbol, written by `forward/data/history.py` from IIFL
   `/marketdata/historicaldata`. ~2,654 files. A full read takes ~56s.
 - **JSON / JSONL side files** — `data/alerts/*.json`, `data/audit/audit.jsonl`,
   `data/trade_signals/{queue,settings}.json`, `data/paper_momentum/*.jsonl`.
 
 ### 4. Authentication
 
-**None at the application level.** `settings.api_token` exists and is never read.
-There is no user, session, role or login route. The only auth in the process is
-the *broker* session: `atr/brokers/iifl/auth.py` completes the IIFL OAuth handshake,
-derives a JWT and caches it to `.cache/iifl_session.json` until midnight IST. That
-protects nothing in `atr` itself — anyone who can reach the port can call
-`POST /orders` (subject only to the paper/live gate) and `POST /risk/kill-switch`.
-
-This is the single largest Phase 1 gap, and the reason it is first.
+Application users sign in through `forward/auth` and `/api/v1/auth`. Protected
+routes check permissions through `forward/api/deps.py`. IIFL broker login is a
+separate session used to access broker data and orders; it does not replace
+application sign-in.
 
 ### 5. Market-data infrastructure
 
-Real and reasonably good. `atr/data/base.py` defines a `DataFeed` ABC;
+Real and reasonably good. `forward/data/base.py` defines a `DataFeed` ABC;
 `csv_feed.py` provides `CsvFeed`/`ParquetFeed`; `history.py` bulk-downloads and
 caches; `aggregator.py` does rolling-window/timeframe aggregation; `hygiene.py`
 detects and removes corrupt bars (reuse it — the cache is known-bad on
@@ -80,7 +80,7 @@ no market calendar.
 
 ### 6. Broker integration
 
-Yes, and it is the best-designed part of the repo. `atr/brokers/base.py` defines a
+Yes, and it is the best-designed part of the repo. `forward/brokers/base.py` defines a
 `Broker` ABC (`place_order`, `modify_order`, `cancel_order`, `positions`,
 `open_orders`, `last_price`, `cancel_all`) and a `FillListener` ABC.
 `IiflBroker` implements it. The backtester uses `SimulatedBroker` through the same
@@ -138,7 +138,7 @@ reconciliation test.
 
 ### 10. Config and secrets
 
-`atr/config/settings.py` — pydantic-settings, reads `.env`, `lru_cache`d.
+`forward/config/settings.py` — pydantic-settings, reads `.env`, `lru_cache`d.
 Names in `.env.example`: APP_NAME, ENV, LOG_LEVEL, IIFL_APP_KEY, IIFL_APP_SECRET,
 IIFL_REDIRECT_URL, IIFL_BASE_URL, IIFL_CLIENT_ID, IIFL_TIMEOUT, IIFL_SESSION_CACHE,
 IIFL_DEFAULT_PRODUCT, IIFL_API_ORDER_SOURCE, IIFL_MARKET_PROTECTION_PERCENT,
@@ -164,7 +164,7 @@ the single-operator case.
                      └────────────────────┬──────────────────────┘
                                           │  fetch (relative URL)
                      ┌────────────────────▼──────────────────────┐
-                     │  atr/api/main.py   — 2,773 lines, 60+ routes│
+                     │  forward/api/main.py   — 2,773 lines, 60+ routes│
                      │  no APIRouter · no DI · no auth · CORS only│
                      └───┬───────┬───────┬───────┬───────┬───────┘
                          │       │       │       │       │
@@ -214,17 +214,17 @@ unlike a convention.
 
 ```
                           ┌──────────────────────────┐
-   transport  ───────────►│  atr/api/                │  routers, deps, middleware
+   transport  ───────────►│  forward/api/                │  routers, deps, middleware
                           │  no business logic       │  request-id, rate limit,
                           └────────────┬─────────────┘  CSRF, security headers
                                        │
                           ┌────────────▼─────────────┐
-   application ──────────►│  atr/services/           │  use cases, transactions,
+   application ──────────►│  forward/services/           │  use cases, transactions,
                           │  orchestrates, no SQL    │  authorization decisions
                           └──┬────────┬────────┬─────┘
                              │        │        │
         ┌────────────────────▼─┐ ┌────▼─────┐ ┌▼──────────────┐
-        │ atr/appdb/           │ │atr/data/ │ │atr/brokers/   │
+        │ forward/appdb/           │ │forward/data/ │ │forward/brokers/   │
         │ control-plane store  │ │market    │ │Broker ABC +   │
         │ users·sessions·      │ │data feeds│ │adapters       │
         │ watchlists·audit     │ │+history  │ │IIFL now,      │
@@ -232,21 +232,21 @@ unlike a convention.
         └──────────────────────┘ └──────────┘ │later          │
                                               └───────────────┘
 
-   domain (imported by everyone, imports nobody):  atr/core/  models·enums·events
-   compute (pure, no I/O):  atr/backtest/ · atr/research/ · atr/strategy/
-   decision:  atr/signals/ (shared eval_entry/eval_exit)  atr/execution/ (risk)
+   domain (imported by everyone, imports nobody):  forward/core/  models·enums·events
+   compute (pure, no I/O):  forward/backtest/ · forward/research/ · forward/strategy/
+   decision:  forward/signals/ (shared eval_entry/eval_exit)  forward/execution/ (risk)
 ```
 
 **Layering rule**, enforced by `tests/test_architecture.py`:
 
 | Layer | May import | May NOT import |
 |---|---|---|
-| `atr.core` | stdlib, pydantic | everything else in `atr` |
-| `atr.backtest`, `atr.research`, `atr.strategy` | `core`, `data`, `signals` | `api`, `appdb`, `brokers` (except via ABC) |
-| `atr.execution` | `core`, `brokers.base` | `api`, `appdb` |
-| `atr.appdb`, `atr.data`, `atr.brokers` | `core` | `api`, `services` |
-| `atr.services` | all of the above | `api` |
-| `atr.api` | `services`, `core` | direct `appdb` / `data` / `brokers` access |
+| `forward.core` | stdlib, pydantic | everything else in `forward` |
+| `forward.backtest`, `forward.research`, `forward.strategy` | `core`, `data`, `signals` | `api`, `appdb`, `brokers` (except via ABC) |
+| `forward.execution` | `core`, `brokers.base` | `api`, `appdb` |
+| `forward.appdb`, `forward.data`, `forward.brokers` | `core` | `api`, `services` |
+| `forward.services` | all of the above | `api` |
+| `forward.api` | `services`, `core` | direct `appdb` / `data` / `brokers` access |
 
 The last row is the one that pays for itself: a route may not touch SQL or a
 broker directly, so every action has exactly one place where authorization and
@@ -256,12 +256,12 @@ audit happen.
 
 | Logical service | Today | Target |
 |---|---|---|
-| Auth Service | **absent** | `atr/auth/` + `atr/services/auth.py` — **built in Phase 1** |
-| Market Data Service | `atr/data/` | keep; add `instruments/service.py` (**Phase 1**) and an option-chain provider |
+| Auth Service | **absent** | `forward/auth/` + `forward/services/auth.py` — **built in Phase 1** |
+| Market Data Service | `forward/data/` | keep; add `instruments/service.py` (**Phase 1**) and an option-chain provider |
 | Screener Service | `scanner*.py` + `signals/` | keep; wrap in `services/screener.py`, persist saved scans in `appdb` |
 | Strategy Service | `strategy/` + `STRATEGIES` | keep; add `appdb` strategy + version storage (**Phase 4**) |
 | Backtest Service | `backtest/` + `research/` | keep; move job execution off the request thread |
-| Paper Trading Engine | mode flag only | `services/paper.py` — `PaperVenue` + `PaperLedger` — **built 2026-09-14** |
+| Paper Trading Engine | mode flag only | `services/runner.py` + `brokers/paper_venue.py` + `services/paper_ledger.py` — **built 2026-09-14** |
 | Deployment Service | **absent** | `services/paper.py` — deployments + lifecycle, and `services/monitoring.py` — the read-only projection — **built 2026-09-15** |
 | Paper Runner | **absent** | `services/runner.py` — the clock. Consumes live ticks, calls `eval_entry`/`eval_exit`, and sequences risk → OMS → venue → fill. Contains no matching, no costing and no P&L arithmetic of its own — **built 2026-09-15** |
 | Trade Journal | **absent** | `services/journal.py` — one row per round trip, reconciled from the position fold — **built 2026-09-15** |
@@ -283,9 +283,10 @@ audit happen.
 ```
 route ──► services/execution.py ──► services/orders.py ──► execution/oms.py
                     │                        │
-                    │                        └──► appdb.repositories (order_events, order_intents)
-                    └──► Venue ──┬──► BrokerVenue    ──► IiflBroker (live)
-                                 └──► PaperVenue     ──► matching + Indian costs (paper)
+                    │                        └──► focused appdb order repositories
+                    └──► execution/venue.py (port)
+                                  ├──► brokers/venue.py + IiflBroker (live)
+                                  └──► brokers/paper_venue.py (paper matching + costs)
                                             │
                                             └──► PaperLedger folds order_events back
                                                  into backtest.portfolio.Portfolio
@@ -370,7 +371,7 @@ gate use, so there is one answer to "what does the platform hold" rather than th
 ### Non-functional targets
 
 - **Type-safe at the boundary.** Pydantic v2 request/response models on every
-  route; `mypy`-clean on `atr/services` and `atr/auth` if the team wants it
+  route; `mypy`-clean on `forward/services` and `forward/auth` if the team wants it
   (the repo is not currently type-checked, so this is aspirational, not claimed).
 - **Observable.** A request ID on every response and every log line; a
   `correlation_id` on every event and every order.
@@ -387,8 +388,8 @@ Full DDL and rationale in **`docs/DATA_MODEL.md`**. Summary of the split:
 
 | Tier | Store | Why |
 |---|---|---|
-| **Control plane** | `atr/appdb` — SQLite by default, Postgres by URL | users, sessions, API keys, watchlists, preferences, audit. Low volume, relational, must work with zero setup. |
-| **Market data** | `atr/data/store.py` — Postgres + TimescaleDB | high-volume time series, hypertables, compression, continuous aggregates. |
+| **Control plane** | `forward/appdb` — SQLite by default, Postgres by URL | users, sessions, API keys, watchlists, preferences, audit. Low volume, relational, must work with zero setup. |
+| **Market data** | `forward/data/store.py` — Postgres + TimescaleDB | high-volume time series, hypertables, compression, continuous aggregates. |
 | **Market data (cache)** | parquet under `data/` | what actually runs today; keep it as the read path for history. |
 | **Strategy + trading** | Postgres when available, `appdb` for definitions | definitions are relational and small; fills are time series. |
 
@@ -428,7 +429,7 @@ what matters.
 Market feed (MQTT / parquet replay)
         │
         ▼
-   Normalizer            ← atr/data/ (hygiene, timeframe aggregation, symbol canonicalisation)
+   Normalizer            ← forward/data/ (hygiene, timeframe aggregation, symbol canonicalisation)
         │
         ▼
    EventBus  ── typed, ordered, idempotent ──────────────────────────┐
@@ -493,21 +494,21 @@ can change a strategy, place an order or bypass the risk engine, and
 The chain, and the module that owns each link:
 
 ```
-LIVE MARKET      atr/services/runner.py      the deployment clock; ticks and bars
+LIVE MARKET      forward/services/runner.py      the deployment clock; ticks and bars
       ↓
-PAPER STRATEGY   atr/signals/rules.py        eval_entry / eval_exit — the SAME
+PAPER STRATEGY   forward/signals/rules.py        eval_entry / eval_exit — the SAME
                                              functions the backtester calls
       ↓
-PAPER ORDER      atr/services/orders.py      OrderRepository.create writes the order
+PAPER ORDER      forward/services/orders.py      OrderRepository.create writes the order
                                              and its NEW event, stamped with provenance
       ↓
-PAPER FILL       atr/services/paper.py       PaperVenue matches against the live price,
+PAPER FILL       forward/brokers/paper_venue.py  PaperVenue matches against the live price,
                                              with IndianDeliveryCosts and a slippage model
       ↓
-CLOSED TRADE     atr/services/journal.py     reconcile() folds order_events into positions
+CLOSED TRADE     forward/services/journal.py     reconcile() folds order_events into positions
                                              and opens/closes a trade_journal episode
       ↓
-LEARNING DATASET atr/services/learning.py    LearningDatasetBuilder normalises
+LEARNING DATASET forward/services/learning.py    LearningDatasetBuilder normalises
                                              backtest_trades + trade_journal + the paper
                                              ledger into one table, with entry-time
                                              features enriched point-in-time; journal
@@ -515,10 +516,10 @@ LEARNING DATASET atr/services/learning.py    LearningDatasetBuilder normalises
                                              order and recorded context
                                              (score/version/class) as recorded
       ↓
-DAILY ANALYSIS   atr/services/learning.py    DailyLearningReport + PerformanceAnalysis
+DAILY ANALYSIS   forward/services/learning.py    DailyLearningReport + PerformanceAnalysis
                                              + the drift comparison
       ↓
-READINESS        atr/services/learning.py    readiness(): per-strategy evidence
+READINESS        forward/services/learning.py    readiness(): per-strategy evidence
                        + research/              against the 10/30/50 gates, research
                          learning_readiness.py  states, weekly accumulation and
                                              data-quality flags — read-only
@@ -534,20 +535,18 @@ cannot disagree with the book, and it cannot be skipped.
 The first link has two halves and only one of them is a read:
 
 ```
-READING    atr/services/paper.py      live_tick_source → broadcaster.latest_price()
-BEING ON   atr/api/stream.py          ensure_symbols() → bridge.subscribe_feed()
+READING    forward/services/paper.py      live_tick_source → broadcaster.latest_price()
+BEING ON   forward/api/stream.py          ensure_symbols() → bridge.subscribe_feed()
 ```
 
-A symbol reaches the broadcaster's tick store only when somebody subscribes to
-it, and subscription used to be reachable from one place only — the browser
-path. So with no dashboard open the bridge was never connected, every
-`latest_price` returned `None`, and `default_price_source` fell through to the
-daily cache: the deployment was priced at yesterday's close, or not priced at
-all, while reporting itself as running. Either outcome is worse than an honest
-refusal, and both are silent.
+A symbol reaches the broadcaster's tick store only when something subscribes to
+it. The paper runner now subscribes its own server-side universe, even when no
+dashboard is open. Paper order fills use live ticks only; without a fresh tick,
+the runner reports `WAITING_FOR_TICKS` and skips evaluation rather than filling
+at a cached daily close.
 
 The runner therefore *states* its universe — `PaperRunner.sync_loops` →
-`ensure_live_symbols` → `TickBroadcaster.ensure_symbols` — on every pass, and the
+`TickBroadcaster.ensure_symbols` — on every pass, and the
 broadcaster keeps server-side subscriptions separate from browser ref counts so
 the two cannot unsubscribe each other. The statement is declarative (the delta
 against the previous statement is what reaches the bridge), retried when the
@@ -562,7 +561,7 @@ paper against real money is the point of having a paper engine.
 
 `evidence_grade` says **whether a finding may depend on it**: `forward` or
 `in_sample`. Every consumer that has to decide whether it may publish a number
-reads this one. Both are defined once, in `atr/research/learning_evidence.py`,
+reads this one. Both are defined once, in `forward/core/learning_evidence.py`,
 and the grade is derived from the class by `grade_of`, so a row cannot carry a
 grade that contradicts its class.
 
@@ -614,10 +613,10 @@ that context deterministically. It is an annotation layer: it never blocks a
 signal, changes a strategy parameter, or alters an order.
 
 ```
-LIVE / PAPER   atr/services/runner.py ──► signal_context/service.py ──► engine.py
+LIVE / PAPER   forward/services/runner.py ──► signal_context/service.py ──► engine.py
                      (after the order is placed, best-effort)              │
                                                                           ▼
-BACKTEST       atr/services/backtests.py ─► signal_context/service.py   signal_contexts
+BACKTEST       forward/services/backtests.py ─► signal_context/service.py   signal_contexts
                      (after the run completes, point-in-time)
                                                                           │
 SIGNAL EXPLORER  /api/v1/signal-context ──────────────────────────────────┘
@@ -653,12 +652,12 @@ multi-user, attributable or safe.
 
 | # | Workstream | Deliverable | Status |
 |---|---|---|---|
-| 1.1 | App persistence | `atr/appdb/` — engine, schema, repositories; SQLite default, Postgres-compatible | **shipped** |
-| 1.2 | Authentication | `atr/auth/` — scrypt passwords, opaque sessions, TOTP MFA, API keys | **shipped** |
+| 1.1 | App persistence | `forward/appdb/` — engine, schema, repositories; SQLite default, Postgres-compatible | **shipped** |
+| 1.2 | Authentication | `forward/auth/` — scrypt passwords, opaque sessions, TOTP MFA, API keys | **shipped** |
 | 1.3 | Authorization | RBAC roles + permission matrix, `require_permission` dependency | **shipped** |
 | 1.4 | Hardening | request ID, security headers, CSRF for cookie auth, rate limiting | **shipped** |
 | 1.5 | Audit | append to `appdb.audit_events`, keep writing the existing JSONL | **shipped** |
-| 1.6 | Instrument master | `atr/instruments/service.py` — search, resolve, metadata | **shipped** |
+| 1.6 | Instrument master | `forward/instruments/service.py` — search, resolve, metadata | **shipped** |
 | 1.7 | Watchlists | persisted watchlists: CRUD, reorder, custom columns | **shipped** |
 | 1.8 | API surface | `/api/v1/{auth,watchlists,instruments}` routers | **shipped** |
 | 1.9 | Frontend | auth gate + account panel + watchlist panel, nav wiring | **shipped** |
@@ -682,12 +681,12 @@ protects nothing.
 
 Ordered, with the reason each is where it is:
 
-1. **`atr/appdb`** — nothing else can store ownership without it.
-2. **`atr/auth`** — the largest gap; unblocks multi-user and attribution.
-3. **`atr/api/deps.py`** — one place to enforce every check.
-4. **`atr/api/middleware.py`** — rate limit and headers before any new route.
-5. **`atr/instruments/service.py`** — every screen, chart and watchlist needs it.
-6. **`atr/api/routers/*`** — the new surface, versioned.
+1. **`forward/appdb`** — nothing else can store ownership without it.
+2. **`forward/auth`** — the largest gap; unblocks multi-user and attribution.
+3. **`forward/api/deps.py`** — one place to enforce every check.
+4. **`forward/api/middleware.py`** — rate limit and headers before any new route.
+5. **`forward/instruments/service.py`** — every screen, chart and watchlist needs it.
+6. **`forward/api/routers/*`** — the new surface, versioned.
 7. **Wire into `main.py`** — include routers; do not rewrite existing routes.
 8. **Tests** — including a layering test, which is what keeps this honest.
 9. **Frontend gate + watchlist panel** — make it usable, not just correct.
