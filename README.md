@@ -1,4 +1,4 @@
-# atr — algorithmic trading backend
+# Forward
 
 A Python backend for systematic trading on **IIFL Capital** (NSE/BSE equity, F&O,
 currency, commodity). Backtest-first: the same strategy class, portfolio, and
